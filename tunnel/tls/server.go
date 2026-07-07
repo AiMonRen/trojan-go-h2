@@ -20,6 +20,7 @@ import (
 	"github.com/voidluo/trojan-go/common"
 	"github.com/voidluo/trojan-go/config"
 	"github.com/voidluo/trojan-go/internal/database"
+	"github.com/voidluo/trojan-go/internal/nodesync"
 	"github.com/voidluo/trojan-go/internal/webserver"
 	"github.com/voidluo/trojan-go/log"
 	"github.com/voidluo/trojan-go/redirector"
@@ -401,7 +402,13 @@ func NewServer(ctx context.Context, underlay tunnel.Server) (*Server, error) {
 				muxEnabled = muxCfg.Mux.Enabled
 			}
 
-			server.adminServer = webserver.New(db, cfg.Admin.Username, cfg.Admin.Password, cfg.Admin.Path, cfg.Admin.Port, wsEnabled, wsPath, muxEnabled)
+			isNode := false
+			if nodeCfgAny := config.FromContext(ctx, nodesync.Name); nodeCfgAny != nil {
+				nodeCfg := nodeCfgAny.(*nodesync.Config)
+				isNode = nodeCfg.Node.Enabled
+			}
+
+			server.adminServer = webserver.New(db, cfg.Admin.Username, cfg.Admin.Password, cfg.Admin.Path, cfg.Admin.Port, wsEnabled, wsPath, muxEnabled, isNode)
 			server.adminPath = cfg.Admin.Path
 			log.Infof("admin panel enabled on https://[domain]%s (user: %s)", cfg.Admin.Path, cfg.Admin.Username)
 		}

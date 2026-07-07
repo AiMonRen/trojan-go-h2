@@ -171,6 +171,7 @@
 let token = localStorage.getItem('token');
 let currentUsers = [];
 let searchText = '';
+let isNode = false;
 const API = '/api';
 
 let isTimeoutTriggered = false;
@@ -217,7 +218,7 @@ async function api(method, path, body = null) {
     
     try {
         const res = await fetch(API + path, options);
-        if (res.status === 401) { triggerSessionTimeout(); return null; }
+        if (res.status === 401 && path !== '/login') { triggerSessionTimeout(); return null; }
         const data = await res.json();
         if (data && data.error) throw new Error(data.error);
         return data;
@@ -345,7 +346,7 @@ function renderUserTableHtml() {
     return `
     <div class="header-bar">
         <h1>用户管理</h1>
-        <button class="btn btn-primary" onclick="showUserModal()">+ 新增接入用户</button>
+        ${isNode ? '' : '<button class="btn btn-primary" onclick="showUserModal()">+ 新增接入用户</button>'}
     </div>
     
     <div class="action-container">
@@ -382,8 +383,10 @@ function renderUserTableHtml() {
                         <td style="text-align:right">
                             <div style="display:inline-flex; gap:10px">
                                 <button class="btn" onclick="shareUser(${u.id})">💾 下发</button>
+                                ${isNode ? '' : `
                                 <button class="btn btn-primary" onclick="showEditUserModal(${u.id})">⚙️ 编辑</button>
                                 <button class="btn btn-red" onclick="deleteUser(${u.id})">🗑 删除</button>
+                                `}
                             </div>
                         </td>
                     </tr>
@@ -457,14 +460,41 @@ async function router() {
     const app = document.getElementById('app');
     if (path === '/login') { app.innerHTML = component.render(); return; }
 
+    // 在渲染菜单前，同步拉取系统设置以获取最新的 is_node 状态和站点标题
+    if (token) {
+        const s = await api('GET', '/settings');
+        if (s) {
+            isNode = (s.is_node === "true");
+            const t = s.site_title || 'Trojan-Go';
+            document.title = t;
+            const el = document.getElementById('navTitle');
+            if (el) el.textContent = t;
+            if (s.session_timeout) {
+                localStorage.setItem('session_timeout', s.session_timeout);
+            }
+        }
+    }
+
+    // 动态拼接侧边栏菜单
+    let sidebarMenuHtml = `
+        <a class="menu-item ${path==='/dashboard'?'active':''}" onclick="navigate('/dashboard')">📊 系统概览</a>
+        <a class="menu-item ${path==='/service'?'active':''}" onclick="navigate('/service')">🖥 服务监控</a>
+        <a class="menu-item ${path==='/users'?'active':''}" onclick="navigate('/users')">👥 接入用户</a>
+    `;
+    if (!isNode) {
+        sidebarMenuHtml += `
+            <a class="menu-item ${path==='/nodes'?'active':''}" onclick="navigate('/nodes')">📡 节点管理</a>
+        `;
+    }
+    sidebarMenuHtml += `
+        <a class="menu-item ${path==='/settings'?'active':''}" onclick="navigate('/settings')">⚙ 系统设置</a>
+    `;
+
     const sidebar = `
     <aside>
         <div class="sidebar-header"><span class="logo" id="navTitle" onclick="navigate('/dashboard')">Trojan-Go</span></div>
         <div class="sidebar-menu">
-            <a class="menu-item ${path==='/dashboard'?'active':''}" onclick="navigate('/dashboard')">📊 系统概览</a>
-            <a class="menu-item ${path==='/service'?'active':''}" onclick="navigate('/service')">🖥 服务监控</a>
-            <a class="menu-item ${path==='/users'?'active':''}" onclick="navigate('/users')">👥 接入用户</a>
-            <a class="menu-item ${path==='/settings'?'active':''}" onclick="navigate('/settings')">⚙ 系统设置</a>
+            ${sidebarMenuHtml}
         </div>
         <div class="sidebar-footer">
             <button class="btn" style="width:100%; border-color:var(--border)" onclick="logout()">➔ 系统注销</button>
@@ -545,15 +575,21 @@ const SettingsPage = {
         const s = await api('GET', '/settings');
         if (!s) return '<div style="padding:20px;text-align:center;color:var(--text2)">加载中...</div>';
         
+        let wsConfig = '';
         const wsRes = await api('GET', '/settings/websocket');
-        const wsConfig = wsRes ? wsRes.config : '';
+        wsConfig = wsRes ? wsRes.config : '';
         s.websocket_config = wsConfig;
+        
+        let masterConfig = null;
+        if (isNode) {
+            masterConfig = await api('GET', '/node/master-config');
+        }
         
         window.currentSettingsCached = s;
         
         const fullYaml = `# rules:\n${s.clash_rules||''}\n\n# rule-providers:\n${s.clash_rule_providers||''}`;
         
-        return `
+        let htmlContent = `
         <div style="max-width: 800px; margin: 0 auto; padding-bottom: 40px;">
             <div class="header-bar"><h1>系统设置</h1></div>
             
@@ -597,22 +633,27 @@ const SettingsPage = {
                     <button class="btn btn-primary" onclick="saveAdminCreds()">修改密码</button>
                 </div>
             </div>
-            
-            <!-- WebSocket 伪装设置 -->
-            <div id="card-ws" class="card shadow-lg" style="margin-bottom: 32px;">
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 12px;">
-                    <h3 style="font-size: 16px; display:flex; align-items:center; gap:8px; margin:0"><span>🌐</span> WebSocket 伪装设置</h3>
-                    <button class="btn btn-primary card-edit-btn" onclick="toggleEditCard('card-ws', true)">✏️ 修改配置</button>
-                </div>
-                <p style="font-size: 12px; color: var(--text2); margin-bottom: 20px; line-height: 1.6">
-                    开启后可通过 CDN 中转，提升极端环境抗封锁能力。修改后需要重启代理服务生效。请按照 YAML 语法进行配置。
-                </p>
-                <textarea id="setWsEditor" class="editor" disabled style="height: 160px; font-family: monospace;">${wsConfig}</textarea>
-                <div class="card-save-area" style="display:none; justify-content:flex-end; gap:12px; margin-top:24px">
-                    <button class="btn btn-primary" onclick="saveWsConfig()">保存并重启生效</button>
-                </div>
-            </div>
+        `;
 
+        htmlContent += `
+        <!-- WebSocket 伪装设置 -->
+        <div id="card-ws" class="card shadow-lg" style="margin-bottom: 32px;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 12px;">
+                <h3 style="font-size: 16px; display:flex; align-items:center; gap:8px; margin:0"><span>🌐</span> WebSocket 伪装设置</h3>
+                <button class="btn btn-primary card-edit-btn" onclick="toggleEditCard('card-ws', true)">✏️ 修改配置</button>
+            </div>
+            <p style="font-size: 12px; color: var(--text2); margin-bottom: 20px; line-height: 1.6">
+                开启后可通过 CDN 中转，提升极端环境抗封锁能力。修改后需要重启代理服务生效。请按照 YAML 语法进行配置。
+            </p>
+            <textarea id="setWsEditor" class="editor" disabled style="height: 160px; font-family: monospace;">${wsConfig}</textarea>
+            <div class="card-save-area" style="display:none; justify-content:flex-end; gap:12px; margin-top:24px">
+                <button class="btn btn-primary" onclick="saveWsConfig()">保存并重启生效</button>
+            </div>
+        </div>
+        `;
+
+        if (!isNode) {
+            htmlContent += `
             <!-- Clash 订阅规则模板 -->
             <div id="card-clash" class="card shadow-lg" style="margin-bottom: 32px;">
                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 12px;">
@@ -637,11 +678,217 @@ const SettingsPage = {
                     <button class="btn" style="justify-content:center; border-color:var(--border); height:42px; font-size:13px; flex:1" onclick="triggerRestoreUpload()">📤 导入本地备份</button>
                 </div>
             </div>
-        </div>`;
+            `;
+        }
+
+        if (isNode && masterConfig) {
+            htmlContent += `
+            <!-- 主节点同步配置 -->
+            <div id="card-master" class="card shadow-lg" style="margin-bottom: 32px;">
+                <h3 style="margin-bottom: 12px; font-size: 16px; display:flex; align-items:center; gap:8px"><span>🔗</span> 主节点同步配置</h3>
+                <p style="font-size: 12px; color: var(--text2); margin-bottom: 24px; line-height: 1.6">
+                    本节点作为从节点运行。下列参数配置在核心的配置文件 config.yaml 中，将定期与主节点同步用户数据。
+                </p>
+                <div class="form-group">
+                    <label>主节点同步接口 URL</label>
+                    <input type="text" readonly value="${masterConfig.master_url||''}">
+                </div>
+                <div class="form-group">
+                    <label>从节点通信密钥 (Secret)</label>
+                    <div style="position:relative; display:flex; align-items:center;">
+                        <input id="mstSecret" type="password" readonly style="padding-right:40px; width:100%" value="${masterConfig.secret||''}">
+                        <span onclick="togglePasswordVisibility('mstSecret', this)" style="position:absolute; right:12px; cursor:pointer; font-size:16px; user-select:none;">👁️</span>
+                    </div>
+                </div>
+                <div style="display:flex; justify-content:flex-end; margin-top:24px">
+                    <button class="btn btn-primary" onclick="testMasterConnection(this)">⚡ 测试主节点连通性</button>
+                </div>
+            </div>
+            `;
+        }
+
+        htmlContent += `</div>`;
+        return htmlContent;
     }
 };
 
-const routes = { '/login': Login, '/dashboard': Dashboard, '/service': ServiceAdmin, '/users': UserList, '/settings': SettingsPage };
+const NodeList = {
+    render: async () => {
+        const nodes = await api('GET', '/nodes');
+        if (!nodes) return '数据拉取中...';
+        window.currentNodes = nodes;
+        return renderNodeTableHtml();
+    }
+};
+
+function renderNodeTableHtml() {
+    const nodes = window.currentNodes || [];
+    const now = Date.now();
+    return `
+    <div class="header-bar">
+        <h1>节点管理</h1>
+        <button class="btn btn-primary" onclick="showNodeModal()">+ 新增代理节点</button>
+    </div>
+
+    <div class="table-container">
+        <table>
+            <thead>
+                <tr>
+                    <th>节点名称</th>
+                    <th>节点地址:端口</th>
+                    <th>传输协议</th>
+                    <th>流量倍率</th>
+                    <th>通信密钥 (Secret)</th>
+                    <th>心跳状态</th>
+                    <th style="text-align:right">管理操作</th>
+                </tr>
+            </thead>
+            <tbody>
+                ${nodes.map(n => {
+                    const wsInfo = n.ws_enabled ? `<span style="color:var(--primary)">WS (${n.ws_path})</span>` : '<span style="opacity:0.5">TCP</span>';
+                    const isOnline = n.last_heartbeat ? (now - Date.parse(n.last_heartbeat) < 90 * 1000) : false;
+                    const statusBadge = `<span class="badge ${isOnline?'badge-green':'badge-red'}">${isOnline?'在线':'离线'}</span>`;
+                    return `
+                    <tr>
+                        <td style="font-weight:700">${n.name}</td>
+                        <td style="font-family:monospace; color:var(--text2)">${n.address}:${n.port}</td>
+                        <td>${wsInfo}</td>
+                        <td style="font-weight:600">${n.traffic_rate} x</td>
+                        <td>
+                            ${n.id === 999999 ? '<span style="opacity:0.5">-</span>' : `
+                            <div style="display:flex; gap:6px; align-items:center">
+                                <input type="password" id="sec-${n.id}" value="${n.secret}" readonly style="width:140px; padding:4px 8px; font-size:12px; height:28px; background:var(--surface2); border:1px solid var(--border); color:#fff; border-radius:6px; outline:none">
+                                <button class="btn" style="padding:4px 8px; font-size:12px" onclick="togglePasswordVisibility('sec-${n.id}', this)">👁️</button>
+                                <button class="btn" style="padding:4px 8px; font-size:12px" onclick="copyText('${n.secret}')">复制</button>
+                            </div>
+                            `}
+                        </td>
+                        <td>${statusBadge}</td>
+                        <td style="text-align:right">
+                            ${n.id === 999999 ? `
+                            <div style="display:inline-flex; gap:10px">
+                                <button class="btn btn-primary" onclick="showEditNodeModal(${n.id})">⚙️ 编辑</button>
+                            </div>
+                            ` : `
+                            <div style="display:inline-flex; gap:10px">
+                                <button class="btn" style="border-color:var(--border)" onclick="testNodePing(${n.id}, this)">⚡ 测试连通性</button>
+                                <button class="btn btn-primary" onclick="showEditNodeModal(${n.id})">⚙️ 编辑</button>
+                                <button class="btn btn-red" onclick="deleteNode(${n.id})">🗑 删除</button>
+                            </div>
+                            `}
+                        </td>
+                    </tr>
+                    `;
+                }).join('')}
+                ${nodes.length === 0 ? '<tr><td colspan="7" style="text-align:center; padding:40px; color:var(--text2)">暂无代理节点，请点击右上角添加。</td></tr>' : ''}
+            </tbody>
+        </table>
+    </div>
+    `;
+}
+
+window.showNodeModal = function() {
+    showModal('添加代理节点', `
+        <div class="form-group"><label>节点名称</label><input id="nName" type="text" placeholder="例如：香港 BGP 01"></div>
+        <div class="form-group"><label>节点对外地址 (域名/IP)</label><input id="nAddr" type="text" placeholder="hk01.example.com"></div>
+        <div class="form-group"><label>节点对外端口</label><input id="nPort" type="number" value="443"></div>
+        <div class="form-group"><label>流量倍率</label><input id="nRate" type="number" step="0.1" value="1.0"></div>
+        <div class="form-group">
+            <label>WebSocket 传输</label>
+            <select id="nWsEnabled" onchange="document.getElementById('nWsPathGroup').style.display = this.value==='true'?'block':'none'">
+                <option value="false">关闭</option>
+                <option value="true">开启</option>
+            </select>
+        </div>
+        <div class="form-group" id="nWsPathGroup" style="display:none">
+            <label>WebSocket 路径</label>
+            <input id="nWsPath" type="text" value="/trojan-go">
+        </div>
+        <div class="form-group">
+            <label>节点密钥 (留空则由主节点自动生成随机密钥)</label>
+            <input id="nSecret" type="text" placeholder="通信鉴权密钥">
+        </div>
+    `, async () => {
+        const payload = {
+            name: document.getElementById('nName').value,
+            address: document.getElementById('nAddr').value,
+            port: parseInt(document.getElementById('nPort').value) || 443,
+            traffic_rate: parseFloat(document.getElementById('nRate').value) || 1.0,
+            ws_enabled: document.getElementById('nWsEnabled').value === 'true',
+            ws_path: document.getElementById('nWsPath').value,
+            secret: document.getElementById('nSecret').value
+        };
+        if (await api('POST', '/nodes', payload)) {
+            closeModal();
+            router();
+        }
+    });
+};
+
+window.showEditNodeModal = function(id) {
+    const n = window.currentNodes.find(node => node.id === id);
+    if (!n) return;
+    if (id === 999999) {
+        showModal('编辑主节点', `
+            <div class="form-group"><label>节点名称 (同时作为站点标题)</label><input id="enName" type="text" value="${n.name}"></div>
+            <div class="form-group"><label>节点对外地址 (主节点不支持从后台修改)</label><input readonly type="text" value="${n.address}"></div>
+            <div class="form-group"><label>节点对外端口 (主节点不支持从后台修改)</label><input readonly type="number" value="${n.port}"></div>
+        `, async () => {
+            const payload = {
+                name: document.getElementById('enName').value
+            };
+            if (await api('PUT', `/nodes/${id}`, payload)) {
+                closeModal();
+                router();
+            }
+        });
+        return;
+    }
+    showModal('编辑代理节点', `
+        <div class="form-group"><label>节点名称</label><input id="enName" type="text" value="${n.name}"></div>
+        <div class="form-group"><label>节点对外地址 (域名/IP)</label><input id="enAddr" type="text" value="${n.address}"></div>
+        <div class="form-group"><label>节点对外端口</label><input id="enPort" type="number" value="${n.port}"></div>
+        <div class="form-group"><label>流量倍率</label><input id="enRate" type="number" step="0.1" value="${n.traffic_rate}"></div>
+        <div class="form-group">
+            <label>WebSocket 传输</label>
+            <select id="enWsEnabled" onchange="document.getElementById('enWsPathGroup').style.display = this.value==='true'?'block':'none'">
+                <option value="false" ${!n.ws_enabled?'selected':''}>关闭</option>
+                <option value="true" ${n.ws_enabled?'selected':''}>开启</option>
+            </select>
+        </div>
+        <div class="form-group" id="enWsPathGroup" style="display:${n.ws_enabled?'block':'none'}">
+            <label>WebSocket 路径</label>
+            <input id="enWsPath" type="text" value="${n.ws_path || '/trojan-go'}">
+        </div>
+        <div class="form-group">
+            <label>节点通信密钥 (Secret)</label>
+            <input id="enSecret" type="text" value="${n.secret}">
+        </div>
+    `, async () => {
+        const payload = {
+            name: document.getElementById('enName').value,
+            address: document.getElementById('enAddr').value,
+            port: parseInt(document.getElementById('enPort').value) || 443,
+            traffic_rate: parseFloat(document.getElementById('enRate').value) || 1.0,
+            ws_enabled: document.getElementById('enWsEnabled').value === 'true',
+            ws_path: document.getElementById('enWsPath').value,
+            secret: document.getElementById('enSecret').value
+        };
+        if (await api('PUT', `/nodes/${id}`, payload)) {
+            closeModal();
+            router();
+        }
+    });
+};
+
+window.deleteNode = async function(id) {
+    if (confirm('确定要删除该代理节点吗？删除后此节点将无法再上报流量和同步用户。')) {
+        await api('DELETE', `/nodes/${id}`);
+        router();
+    }
+};
+
+const routes = { '/login': Login, '/dashboard': Dashboard, '/service': ServiceAdmin, '/users': UserList, '/nodes': NodeList, '/settings': SettingsPage };
 
 window.toggleEditCard = function(cardId, isEditing) {
     const card = document.getElementById(cardId);
@@ -970,6 +1217,48 @@ function togglePasswordVisibility(inputId, btnEl) {
         btnEl.textContent = '👁️';
     }
 }
+
+window.testMasterConnection = async function(btn) {
+    const origText = btn.innerText;
+    btn.innerText = '⏳ 正在测试...';
+    btn.disabled = true;
+    try {
+        const res = await api('POST', '/node/test-sync');
+        if (res) {
+            if (res.status === 'ok') {
+                alert('✅ ' + res.message);
+            } else {
+                alert('❌ 连通测试失败：' + res.error);
+            }
+        }
+    } catch(e) {
+        alert('❌ 网络请求失败：' + e);
+    } finally {
+        btn.innerText = origText;
+        btn.disabled = false;
+    }
+};
+
+window.testNodePing = async function(id, btn) {
+    const origText = btn.innerText;
+    btn.innerText = '⏳ 测速中...';
+    btn.disabled = true;
+    try {
+        const res = await api('POST', `/nodes/${id}/ping`);
+        if (res) {
+            if (res.status === 'ok') {
+                alert('✅ ' + res.message);
+            } else {
+                alert('❌ 测速失败：' + res.error);
+            }
+        }
+    } catch(e) {
+        alert('❌ 网络探测失败：' + e);
+    } finally {
+        btn.innerText = origText;
+        btn.disabled = false;
+    }
+};
 
 window.onhashchange = router;
 if(!location.hash) location.hash = '#/dashboard';

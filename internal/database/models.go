@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/glebarez/sqlite"
+	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
@@ -14,7 +15,7 @@ type User struct {
 	ID          uint      `gorm:"primaryKey" json:"id"`               // ID 必须显式标记为 id 供前端调用
 	CreatedAt   time.Time `json:"created_at"`
 	Username    string    `json:"username"`                           // 用户名/备注，方便管理区别人
-	Hash        string    `gorm:"uniqueIndex;not null" json:"hash"`   // Trojan 密码的 SHA224 哈希值
+	Hash        string    `gorm:"uniqueIndex;not null;size:255" json:"hash"`   // Trojan 密码的 SHA224 哈希值
 	Password    string    `json:"password"`                           // 明文密码（方便管理端查看和分发）
 	Quota       int64     `gorm:"default:-1" json:"quota"`            // 流量限额 (字节, -1 为无限)
 	Used        int64     `gorm:"default:0" json:"used"`              // 已用总流量
@@ -27,22 +28,53 @@ type User struct {
 
 // Config 全局管理配置模型
 type Config struct {
-	Key   string `gorm:"primaryKey"`
+	Key   string `gorm:"primaryKey;size:255"`
 	Value string
+}
+
+// Node 代理节点模型
+type Node struct {
+	ID            uint       `gorm:"primaryKey" json:"id"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
+	Name          string     `gorm:"size:255;not null" json:"name"`       // 节点名称，如 "香港 01"
+	Address       string     `gorm:"size:255;not null" json:"address"`    // 节点对外地址 (域名/IP)
+	Port          int        `gorm:"default:443" json:"port"`             // 对外端口
+	Secret        string     `gorm:"size:255;not null;uniqueIndex" json:"secret"` // 节点通信密钥
+	Status        int        `gorm:"default:0" json:"status"`             // 0: 离线, 1: 在线
+	LastHeartbeat *time.Time `json:"last_heartbeat"`                      // 上次心跳时间
+	TrafficRate   float64    `gorm:"default:1.0" json:"traffic_rate"`     // 流量结算倍率
+
+	// Clash 订阅所需参数
+	WSEnabled     bool       `gorm:"default:false" json:"ws_enabled"`     // 是否启用 Websocket
+	WSPath        string     `gorm:"size:255;default:'/trojan-go'" json:"ws_path"` // Websocket 路径
 }
 
 // InitDb 初始化数据库
 func InitDb(dbPath string) (*gorm.DB, error) {
-	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{
+	var dialector gorm.Dialector
+	isMySQL := strings.HasPrefix(dbPath, "mysql:")
+	if isMySQL {
+		dsn := strings.TrimPrefix(dbPath, "mysql:")
+		dialector = mysql.Open(dsn)
+	} else {
+		dialector = sqlite.Open(dbPath)
+	}
+
+	db, err := gorm.Open(dialector, &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
 	if err != nil {
 		return nil, err
 	}
-	// 开启 WAL 模式以支持多进程高频读写安全
-	db.Exec("PRAGMA journal_mode=WAL;")
+
+	if !isMySQL {
+		// 开启 WAL 模式以支持多进程高频读写安全（仅限于 SQLite）
+		db.Exec("PRAGMA journal_mode=WAL;")
+	}
+
 	// 自动迁移模型
-	err = db.AutoMigrate(&User{}, &Config{})
+	err = db.AutoMigrate(&User{}, &Config{}, &Node{})
 	if err != nil {
 		return nil, err
 	}

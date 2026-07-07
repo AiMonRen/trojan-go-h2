@@ -9,6 +9,7 @@ import (
 
 	"github.com/voidluo/trojan-go/common"
 	"github.com/voidluo/trojan-go/internal/database"
+	"gopkg.in/yaml.v3"
 )
 
 var dbPath = "/etc/trojan-go/trojan-go.db"
@@ -18,8 +19,55 @@ func SetDBPath(path string) {
 	dbPath = path
 }
 
+// loadDBPathFromConfig 尝试从系统的 web_config.yaml 或 config.yaml 中加载配置的数据库路径
+func loadDBPathFromConfig() {
+	// 如果用户通过环境变量设置了，我们尊重环境变量，不作覆盖
+	if os.Getenv("TROJAN_DB") != "" {
+		return
+	}
+
+	// 尝试读取 /etc/trojan-go/web_config.yaml
+	data, err := os.ReadFile("/etc/trojan-go/web_config.yaml")
+	if err != nil {
+		// 尝试读取 /etc/trojan-go/config.yaml
+		data, err = os.ReadFile("/etc/trojan-go/config.yaml")
+		if err != nil {
+			return
+		}
+	}
+
+	var cfg map[string]any
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return
+	}
+
+	adminVal, ok := cfg["admin"]
+	if !ok {
+		return
+	}
+
+	var admin map[string]any
+	if adminMap, ok := adminVal.(map[string]any); ok {
+		admin = adminMap
+	} else if adminAny, ok2 := adminVal.(map[any]any); ok2 {
+		admin = make(map[string]any)
+		for k, v := range adminAny {
+			if ks, ok3 := k.(string); ok3 {
+				admin[ks] = v
+			}
+		}
+	} else {
+		return
+	}
+
+	if dbVal, ok := admin["db"].(string); ok && dbVal != "" {
+		dbPath = dbVal
+	}
+}
+
 // UserList 列出所有用户
 func UserList() {
+	loadDBPathFromConfig()
 	db, err := database.InitDb(dbPath)
 	if err != nil {
 		fmt.Printf("\033[31m数据库连接失败: %v\033[0m\n", err)
@@ -51,6 +99,7 @@ func UserList() {
 
 // UserAdd 添加用户（交互输入）
 func UserAdd() {
+	loadDBPathFromConfig()
 	reader := bufio.NewReader(os.Stdin)
 	fmt.Print("请输入新用户的密码 (必填): ")
 	password, _ := reader.ReadString('\n')
@@ -98,6 +147,7 @@ func UserAdd() {
 
 // UserDelete 删除用户（交互输入 ID）
 func UserDelete() {
+	loadDBPathFromConfig()
 	fmt.Print("请输入要删除的用户 ID: ")
 	var id uint
 	fmt.Scan(&id)
@@ -117,6 +167,7 @@ func UserDelete() {
 
 // ChangeAdminPassword 修改 Web 控制台管理员密码
 func ChangeAdminPassword() {
+	loadDBPathFromConfig()
 	reader := bufio.NewReader(os.Stdin)
 	fmt.Print("请输入新的 Web 控制台 admin 密码 (留空取消): ")
 	password, _ := reader.ReadString('\n')

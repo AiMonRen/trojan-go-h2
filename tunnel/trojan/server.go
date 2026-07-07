@@ -10,6 +10,7 @@ import (
 	"github.com/voidluo/trojan-go/api"
 	"github.com/voidluo/trojan-go/common"
 	"github.com/voidluo/trojan-go/config"
+	"github.com/voidluo/trojan-go/internal/nodesync"
 	"github.com/voidluo/trojan-go/internal/webserver"
 	"github.com/voidluo/trojan-go/log"
 	"github.com/voidluo/trojan-go/redirector"
@@ -237,6 +238,17 @@ func NewServer(ctx context.Context, underlay tunnel.Server) (*Server, error) {
 	// 尝试从 underlay 链中获取 AdminServer，将数据库用户同步到认证器
 	// underlay 可能是 TLS Server（直接），也可能是 WebSocket Server（间接）
 	syncAdminAuth(underlay, auth)
+
+	// 如果开启了多节点从节点模式，将 authenticator 注册到节点同步管理器中
+	if nodeCfgAny := config.FromContext(ctx, nodesync.Name); nodeCfgAny != nil {
+		nodeCfg := nodeCfgAny.(*nodesync.Config)
+		if nodeCfg.Node.Enabled {
+			if mgr := nodesync.GetManager(); mgr != nil {
+				mgr.AddAuthenticator(auth)
+				log.Info("node sync manager: registered proxy authenticator")
+			}
+		}
+	}
 
 	if cfg.API.Enabled {
 		go api.RunService(ctx, Name+"_SERVER", auth)

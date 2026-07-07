@@ -10,6 +10,7 @@ import (
 
 	"github.com/voidluo/trojan-go/common"
 	"github.com/voidluo/trojan-go/config"
+	"github.com/voidluo/trojan-go/internal/nodesync"
 	"github.com/voidluo/trojan-go/log"
 	"github.com/voidluo/trojan-go/tunnel"
 )
@@ -198,5 +199,17 @@ func NewProxyFromConfigData(data []byte, isJSON bool) (*Proxy, error) {
 		}
 		log.SetOutput(file)
 	}
+
+	// 初始化从节点同步管理器
+	if nodeCfgAny := config.FromContext(ctx, nodesync.Name); nodeCfgAny != nil {
+		nodeCfg := nodeCfgAny.(*nodesync.Config)
+		if nodeCfg.Node.Enabled {
+			nodesync.InitManager(nodeCfg.Node.MasterURL, nodeCfg.Node.Secret, nodeCfg.Node.SyncInterval)
+			if mgr := nodesync.GetManager(); mgr != nil {
+				mgr.Start(ctx)
+			}
+		}
+	}
+
 	return create(ctx)
 }

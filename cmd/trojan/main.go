@@ -40,7 +40,8 @@ func main() {
 		Title: menu.L{"安装管理", "Installation Management"},
 		Items: []menu.Item{
 			{Label: menu.L{"申请SSL证书", "Apply SSL Certificate"}, Action: actions.ApplyCert},
-			{Label: menu.L{"首次部署 (交互式)", "First-time Deployment (Interactive)"}, Action: actions.FirstTimeDeploy},
+			{Label: menu.L{"初始化部署（主节点）", "Initial Deployment (Master Node)"}, Action: actions.InitDeployMaster},
+			{Label: menu.L{"初始化部署（从节点）", "Initial Deployment (Worker Node)"}, Action: actions.InitDeployWorker},
 		},
 	}
 

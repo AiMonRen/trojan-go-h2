@@ -1,12 +1,17 @@
 package webserver
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
 	"net/url"
+	"math/rand"
+	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -21,12 +26,15 @@ import (
 	psnet "github.com/shirou/gopsutil/v3/net"
 	"github.com/voidluo/trojan-go/common"
 	"github.com/voidluo/trojan-go/internal/database"
+	"github.com/voidluo/trojan-go/internal/nodesync"
 	"github.com/voidluo/trojan-go/internal/webui"
 	"github.com/voidluo/trojan-go/log"
 	"github.com/voidluo/trojan-go/statistic"
 	"gopkg.in/yaml.v3"
 	"gorm.io/gorm"
 )
+
+var WebConfigPath string
 
 // AdminServer 管理面板服务器，复用 TLS 层已建立的连接
 type AdminServer struct {
@@ -48,6 +56,8 @@ type AdminServer struct {
 	wsEnabled  bool
 	wsPath     string
 	muxEnabled bool
+
+	isNode     bool // 是否处于从节点模式
 }
 
 // SetAuth 绑定代理核心认证器，并将数据库中已有的用户同步到认证器中。
@@ -78,7 +88,7 @@ func (s *AdminServer) SetAuth(auth statistic.Authenticator) {
 }
 
 // New 创建管理面板服务器
-func New(db *gorm.DB, username, password, mountPath string, port int, wsEnabled bool, wsPath string, muxEnabled bool) *AdminServer {
+func New(db *gorm.DB, username, password, mountPath string, port int, wsEnabled bool, wsPath string, muxEnabled bool, isNode bool) *AdminServer {
 	srv := &AdminServer{
 		db:         db,
 		connChan:   make(chan net.Conn, 64),
@@ -89,6 +99,13 @@ func New(db *gorm.DB, username, password, mountPath string, port int, wsEnabled 
 		wsEnabled:  wsEnabled,
 		wsPath:     wsPath,
 		muxEnabled: muxEnabled,
+		isNode:     isNode,
+	}
+
+	if isNode {
+		if mgr := nodesync.GetManager(); mgr != nil {
+			mgr.SetDB(db)
+		}
 	}
 
 	gin.SetMode(gin.ReleaseMode)
@@ -133,6 +150,7 @@ func New(db *gorm.DB, username, password, mountPath string, port int, wsEnabled 
 
 	// ─── 登录（无需鉴权） ──────────────────────────────
 	apiGroup.POST("/login", srv.handleLogin)
+	apiGroup.POST("/node/sync", srv.handleNodeSync)
 
 	// ─── 需要鉴权的管理 API ──────────────────────────────
 	auth := apiGroup.Group("/", func(c *gin.Context) {
@@ -140,6 +158,16 @@ func New(db *gorm.DB, username, password, mountPath string, port int, wsEnabled 
 		if c.Request.URL.Path == "/api/login" {
 			c.Next()
 			return
+		}
+
+		// 如果请求头带有合法的从节点 Secret，则直接放行
+		nodeSecret := c.GetHeader("X-Node-Secret")
+		if nodeSecret != "" {
+			var node database.Node
+			if srv.db.Where("secret = ?", nodeSecret).First(&node).Error == nil {
+				c.Next()
+				return
+			}
 		}
 
 		// 检查 Token
@@ -152,7 +180,7 @@ func New(db *gorm.DB, username, password, mountPath string, port int, wsEnabled 
 		token, _ := jwt.Parse(ts, func(t *jwt.Token) (any, error) {
 			effPass := password
 			var cfgP database.Config
-			if srv.db.Where("key = ?", "admin_password").First(&cfgP).Error == nil {
+			if srv.db.Where("`key` = ?", "admin_password").First(&cfgP).Error == nil {
 				effPass = cfgP.Value
 			}
 			return []byte(effPass), nil
@@ -199,6 +227,13 @@ func New(db *gorm.DB, username, password, mountPath string, port int, wsEnabled 
 		auth.PUT("/users/:id", srv.handleUpdateUser)
 		auth.DELETE("/users/:id", srv.handleDeleteUser)
 
+		// ─── 节点管理 ──────────────────────────────
+		auth.GET("/nodes", srv.handleListNodes)
+		auth.POST("/nodes", srv.handleAddNode)
+		auth.PUT("/nodes/:id", srv.handleUpdateNode)
+		auth.DELETE("/nodes/:id", srv.handleDeleteNode)
+		auth.POST("/nodes/:id/ping", srv.handlePingNode)
+
 		// ─── 流量限额 ──────────────────────────────
 		auth.POST("/users/:id/quota", srv.handleUpdateQuota)
 		auth.DELETE("/users/:id/data", srv.handleClearTraffic)
@@ -210,7 +245,9 @@ func New(db *gorm.DB, username, password, mountPath string, port int, wsEnabled 
 		// ─── 分享链接 ──────────────────────────────
 		auth.GET("/users/:id/share", srv.handleShare)
 
-		// ─── 系统运维 ──────────────────────────────
+		// ─── 从节点测试与配置接口 ─────────────────────
+		auth.GET("/node/master-config", srv.handleGetMasterConfig)
+		auth.POST("/node/test-sync", srv.handleTestSync)
 		auth.GET("/logs", srv.handleGetLogs)
 		auth.POST("/service", srv.handleServiceControl)
 		auth.POST("/restart", srv.handleRestart)
@@ -254,10 +291,10 @@ func (s *AdminServer) handleLogin(c *gin.Context) {
 
 	effUser, effPass := s.configUser, s.configPass
 	var cfgU, cfgP database.Config
-	if s.db.Where("key = ?", "admin_username").First(&cfgU).Error == nil {
+	if s.db.Where("`key` = ?", "admin_username").First(&cfgU).Error == nil {
 		effUser = cfgU.Value
 	}
-	if s.db.Where("key = ?", "admin_password").First(&cfgP).Error == nil {
+	if s.db.Where("`key` = ?", "admin_password").First(&cfgP).Error == nil {
 		effPass = cfgP.Value
 	}
 
@@ -279,6 +316,10 @@ func (s *AdminServer) handleLogin(c *gin.Context) {
 
 func (s *AdminServer) handleGetWebSocket(c *gin.Context) {
 	paths := []string{"config.yaml", "config.yml", "/etc/trojan-go/config.yaml"}
+	if WebConfigPath != "" {
+		dir := filepath.Dir(WebConfigPath)
+		paths = append([]string{filepath.Join(dir, "config.yaml"), filepath.Join(dir, "config.yml")}, paths...)
+	}
 	var data []byte
 	var err error
 	for _, p := range paths {
@@ -335,6 +376,10 @@ func (s *AdminServer) handleUpdateWebSocket(c *gin.Context) {
 	}
 
 	paths := []string{"config.yaml", "config.yml", "/etc/trojan-go/config.yaml"}
+	if WebConfigPath != "" {
+		dir := filepath.Dir(WebConfigPath)
+		paths = append([]string{filepath.Join(dir, "config.yaml"), filepath.Join(dir, "config.yml")}, paths...)
+	}
 	var targetPath string
 	var data []byte
 	var err error
@@ -418,6 +463,7 @@ func (s *AdminServer) handleGetSettings(c *gin.Context) {
 	if _, ok := res["admin_username"]; !ok {
 		res["admin_username"] = s.configUser
 	}
+	res["is_node"] = strconv.FormatBool(s.isNode)
 	c.JSON(http.StatusOK, res)
 }
 
@@ -459,7 +505,7 @@ func (s *AdminServer) handleBackup(c *gin.Context) {
 	token, _ := jwt.Parse(tStr, func(t *jwt.Token) (any, error) {
 		effPass := s.configPass
 		var cfgP database.Config
-		if s.db.Where("key = ?", "admin_password").First(&cfgP).Error == nil {
+		if s.db.Where("`key` = ?", "admin_password").First(&cfgP).Error == nil {
 			effPass = cfgP.Value
 		}
 		return []byte(effPass), nil
@@ -525,6 +571,69 @@ func (s *AdminServer) handleGetServerInfo(c *gin.Context) {
 	})
 }
 
+func (s *AdminServer) getMainNodeInfo() (string, int, bool, string) {
+	// 默认回退值
+	domain := ""
+	port := 443
+	wsEnabled := s.wsEnabled
+	wsPath := s.wsPath
+
+	paths := []string{"config.yaml", "config.yml", "/etc/trojan-go/config.yaml"}
+	if WebConfigPath != "" {
+		dir := filepath.Dir(WebConfigPath)
+		paths = append([]string{filepath.Join(dir, "config.yaml"), filepath.Join(dir, "config.yml")}, paths...)
+	}
+
+	var data []byte
+	var err error
+	for _, p := range paths {
+		data, err = os.ReadFile(p)
+		if err == nil {
+			break
+		}
+	}
+	if err == nil {
+		var cfg map[string]any
+		if err := yaml.Unmarshal(data, &cfg); err == nil {
+			// 1. 读取端口
+			if lp, ok := cfg["local_port"].(int); ok {
+				port = lp
+			} else if lpFloat, ok := cfg["local_port"].(float64); ok {
+				port = int(lpFloat)
+			}
+
+			// 2. 读取 SNI 域名
+			if sslVal, ok := cfg["ssl"].(map[string]any); ok {
+				if sni, ok2 := sslVal["sni"].(string); ok2 && sni != "" {
+					domain = sni
+				}
+			} else if sslAny, ok := cfg["ssl"].(map[any]any); ok {
+				if sni, ok2 := sslAny["sni"].(string); ok2 && sni != "" {
+					domain = sni
+				}
+			}
+
+			// 3. 读取 WebSocket 状态
+			if wsVal, ok := cfg["websocket"].(map[string]any); ok {
+				if en, ok2 := wsVal["enabled"].(bool); ok2 {
+					wsEnabled = en
+				}
+				if path, ok2 := wsVal["path"].(string); ok2 {
+					wsPath = path
+				}
+			} else if wsAny, ok := cfg["websocket"].(map[any]any); ok {
+				if en, ok2 := wsAny["enabled"].(bool); ok2 {
+					wsEnabled = en
+				}
+				if path, ok2 := wsAny["path"].(string); ok2 {
+					wsPath = path
+				}
+			}
+		}
+	}
+	return domain, port, wsEnabled, wsPath
+}
+
 func (s *AdminServer) handleSub(c *gin.Context) {
 	token := c.Query("token")
 	if token == "" {
@@ -544,18 +653,323 @@ func (s *AdminServer) handleSub(c *gin.Context) {
 	if domain == "" {
 		domain = c.Request.Host
 	}
+
+	mainDomain, mainPort, mainWs, mainWsPath := s.getMainNodeInfo()
+	if mainDomain == "" {
+		mainDomain = domain
+	}
+
 	c.Header("Content-Type", "text/yaml; charset=utf-8")
 	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=clash-%s.yaml", user.Username))
-	c.String(http.StatusOK, generateClashConfig(s.db, []database.User{user}, domain, 443, s.wsEnabled, s.wsPath, s.muxEnabled))
+	
+	// 拉取全部节点生成订阅
+	var nodes []database.Node
+	s.db.Find(&nodes)
+	c.String(http.StatusOK, generateClashConfigMultiNode(s.db, user, nodes, mainDomain, mainPort, mainWs, mainWsPath, s.muxEnabled))
+}
+
+// ─── 节点管理 API 处理器 ──────────────────────────────
+
+func (s *AdminServer) handleListNodes(c *gin.Context) {
+	var nodes []database.Node
+	s.db.Find(&nodes)
+
+	// 如果当前不是从节点（即为主节点），则将主节点自身作为虚拟节点加入列表头部
+	if !s.isNode {
+		mainNodeName := "主节点"
+		var cfgTitle database.Config
+		if s.db.Where("`key` = ?", "site_title").First(&cfgTitle).Error == nil && cfgTitle.Value != "" {
+			mainNodeName = cfgTitle.Value
+		}
+
+		host := c.Request.Host
+		domain, _, err := net.SplitHostPort(host)
+		if err != nil {
+			domain = host
+		}
+
+		mainDomain, mainPort, mainWs, mainWsPath := s.getMainNodeInfo()
+		if mainDomain == "" {
+			mainDomain = domain
+		}
+
+		now := time.Now()
+		mainNode := database.Node{
+			ID:            999999, // 使用特殊的大ID标识系统内置主节点
+			Name:          mainNodeName,
+			Address:       mainDomain,
+			Port:          mainPort,
+			Secret:        "MasterNodeSecretKey",
+			TrafficRate:   1.0,
+			WSEnabled:     mainWs,
+			WSPath:        mainWsPath,
+			LastHeartbeat: &now,
+		}
+		nodes = append([]database.Node{mainNode}, nodes...)
+	}
+
+	c.JSON(http.StatusOK, nodes)
+}
+
+func (s *AdminServer) handleAddNode(c *gin.Context) {
+	var node database.Node
+	if err := c.ShouldBindJSON(&node); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的参数"})
+		return
+	}
+	if node.Name == "" || node.Address == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "节点名称和地址不能为空"})
+		return
+	}
+	// 自动生成随机 16 位 Secret
+	if node.Secret == "" {
+		r := rand.New(rand.NewSource(time.Now().UnixNano()))
+		const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+		b := make([]byte, 16)
+		for i := range b {
+			b[i] = letters[r.Intn(len(letters))]
+		}
+		node.Secret = string(b)
+	}
+	if err := s.db.Create(&node).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, node)
+}
+
+func (s *AdminServer) handleUpdateNode(c *gin.Context) {
+	id := c.Param("id")
+	if id == "999999" {
+		var req struct {
+			Name string `json:"name"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		if req.Name != "" {
+			var cfg database.Config
+			if err := s.db.Where("`key` = ?", "site_title").Assign(database.Config{Value: req.Name}).FirstOrCreate(&cfg, database.Config{Key: "site_title"}).Error; err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+		}
+		c.JSON(http.StatusOK, gin.H{"message": "主节点名称更新成功"})
+		return
+	}
+
+	var req struct {
+		Name        string   `json:"name"`
+		Address     string   `json:"address"`
+		Port        *int     `json:"port"`
+		Secret      string   `json:"secret"`
+		TrafficRate *float64 `json:"traffic_rate"`
+		WSEnabled   *bool    `json:"ws_enabled"`
+		WSPath      string   `json:"ws_path"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	var node database.Node
+	if err := s.db.First(&node, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "节点不存在"})
+		return
+	}
+	updates := map[string]interface{}{}
+	if req.Name != "" {
+		updates["name"] = req.Name
+	}
+	if req.Address != "" {
+		updates["address"] = req.Address
+	}
+	if req.Port != nil {
+		updates["port"] = *req.Port
+	}
+	if req.Secret != "" {
+		updates["secret"] = req.Secret
+	}
+	if req.TrafficRate != nil {
+		updates["traffic_rate"] = *req.TrafficRate
+	}
+	if req.WSEnabled != nil {
+		updates["ws_enabled"] = *req.WSEnabled
+	}
+	if req.WSPath != "" {
+		path := req.WSPath
+		if !strings.HasPrefix(path, "/") {
+			path = "/" + path
+		}
+		updates["ws_path"] = path
+	}
+	s.db.Model(&node).Updates(updates)
+	c.JSON(http.StatusOK, gin.H{"message": "更新成功"})
+}
+
+func (s *AdminServer) handleDeleteNode(c *gin.Context) {
+	var node database.Node
+	if s.db.First(&node, c.Param("id")).Error == nil {
+		s.db.Delete(&node)
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "已删除"})
+}
+
+// ─── 从节点心跳与数据同步接口 ───────────────────────────
+
+func (s *AdminServer) handleNodeSync(c *gin.Context) {
+	secret := c.GetHeader("X-Node-Secret")
+	if secret == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "缺少通信密钥"})
+		return
+	}
+	var node database.Node
+	if err := s.db.Where("secret = ?", secret).First(&node).Error; err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "无效的通信密钥"})
+		return
+	}
+	now := time.Now()
+	node.LastHeartbeat = &now
+	node.Status = 1
+	clientIP := c.ClientIP()
+	if clientIP != "" && clientIP != "::1" && clientIP != "127.0.0.1" {
+		node.Address = clientIP
+	}
+	s.db.Save(&node)
+
+	var req struct {
+		Traffic map[string]struct {
+			Up   uint64 `json:"up"`
+			Down uint64 `json:"down"`
+		} `json:"traffic"`
+	}
+	if err := c.ShouldBindJSON(&req); err == nil && len(req.Traffic) > 0 {
+		s.db.Transaction(func(tx *gorm.DB) error {
+			for hash, t := range req.Traffic {
+				total := int64((t.Up + t.Down))
+				if node.TrafficRate != 1.0 {
+					total = int64(float64(total) * node.TrafficRate)
+				}
+				tx.Model(&database.User{}).Where("hash = ?", hash).Updates(map[string]interface{}{
+					"upload":   gorm.Expr("upload + ?", int64(t.Up)),
+					"download": gorm.Expr("download + ?", int64(t.Down)),
+					"used":     gorm.Expr("used + ?", total),
+				})
+			}
+			return nil
+		})
+	}
+
+	var users []database.User
+	s.db.Where("status = ?", 0).Find(&users)
+	validHashes := []string{}
+	for _, u := range users {
+		if u.ExpiryTime != nil && !u.ExpiryTime.IsZero() && u.ExpiryTime.Before(now) {
+			continue
+		}
+		if u.Quota > 0 && u.Used >= u.Quota {
+			continue
+		}
+		if u.Hash != "" {
+			validHashes = append(validHashes, u.Hash)
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"users": validHashes})
+}
+
+// ─── 多节点 Clash 订阅配置文件生成器 ─────────────────────
+
+func generateClashConfigMultiNode(db *gorm.DB, u database.User, nodes []database.Node, defaultDomain string, defaultPort int, defaultWS bool, defaultWSPath string, defaultMux bool) string {
+	var sb strings.Builder
+	var cfgRules, cfgProviders database.Config
+	rulesStr := ""
+	if db.Where("`key` = ?", "clash_rules").First(&cfgRules).Error == nil {
+		rulesStr = cfgRules.Value
+	}
+	providersStr := ""
+	if db.Where("`key` = ?", "clash_rule_providers").First(&cfgProviders).Error == nil {
+		providersStr = cfgProviders.Value
+	}
+
+	sb.WriteString("port: 7890\nsocks-port: 7891\nallow-lan: true\nmode: rule\nlog-level: info\n\n")
+	sb.WriteString("dns:\n  enable: true\n  ipv6: false\n  listen: 0.0.0.0:53\n  enhanced-mode: fake-ip\n  fake-ip-range: 198.18.0.1/16\n  nameserver:\n    - 223.5.5.5\n    - 119.29.29.29\n  fallback:\n    - 8.8.8.8\n    - 1.1.1.1\n    - https://dns.google/dns-query\n  nameserver-policy:\n    'geosite:cn': 223.5.5.5\n    'github.com': 8.8.8.8\n    'cdn.jsdelivr.net': 119.29.29.29\n\n")
+	sb.WriteString("tun:\n  enable: true\n  stack: gvisor\n  auto-route: true\n  auto-detect-interface: true\n\n")
+
+	if providersStr != "" {
+		if !strings.Contains(providersStr, "rule-providers:") {
+			sb.WriteString("rule-providers:\n")
+		}
+		sb.WriteString(providersStr)
+		sb.WriteString("\n\n")
+	}
+
+	sb.WriteString("proxies:\n")
+	
+	// 1. 永远先生成主节点代理配置
+	mainNodeName := "主节点"
+	var cfgTitle database.Config
+	if db.Where("`key` = ?", "site_title").First(&cfgTitle).Error == nil && cfgTitle.Value != "" {
+		mainNodeName = cfgTitle.Value
+	}
+	sb.WriteString(fmt.Sprintf("  - name: \"%s\"\n    type: trojan\n    server: %s\n    port: %d\n    password: %s\n    udp: true\n    sni: %s\n    skip-cert-verify: true\n", 
+		mainNodeName, defaultDomain, defaultPort, u.Password, defaultDomain))
+	if defaultWS {
+		sb.WriteString(fmt.Sprintf("    network: ws\n    ws-opts:\n      path: \"%s\"\n      headers:\n        Host: %s\n", defaultWSPath, defaultDomain))
+	}
+	sb.WriteString("\n")
+
+	// 2. 依次生成从节点代理配置
+	for _, node := range nodes {
+		nodeName := node.Name
+		if nodeName == "" {
+			nodeName = node.Address
+		}
+		sb.WriteString(fmt.Sprintf("  - name: \"%s\"\n    type: trojan\n    server: %s\n    port: %d\n    password: %s\n    udp: true\n    sni: %s\n    skip-cert-verify: true\n", 
+			nodeName, node.Address, node.Port, u.Password, node.Address))
+		if node.WSEnabled {
+			sb.WriteString(fmt.Sprintf("    network: ws\n    ws-opts:\n      path: \"%s\"\n      headers:\n        Host: %s\n", node.WSPath, node.Address))
+		}
+		sb.WriteString("\n")
+	}
+
+	sb.WriteString("proxy-groups:\n  - name: \"PROXY\"\n    type: select\n    proxies:\n")
+	sb.WriteString(fmt.Sprintf("      - \"%s\"\n", mainNodeName))
+	for _, node := range nodes {
+		nodeName := node.Name
+		if nodeName == "" {
+			nodeName = node.Address
+		}
+		sb.WriteString(fmt.Sprintf("      - \"%s\"\n", nodeName))
+	}
+
+	if rulesStr != "" {
+		sb.WriteString("\n")
+		if !strings.Contains(rulesStr, "rules:") {
+			sb.WriteString("rules:\n")
+		}
+		sb.WriteString(rulesStr)
+	} else {
+		sb.WriteString("\nrules:\n  - GEOIP,CN,DIRECT\n  - MATCH,PROXY")
+	}
+	sb.WriteString("\n")
+	return sb.String()
 }
 
 func (s *AdminServer) handleListUsers(c *gin.Context) {
+	if s.isNode {
+		s.proxyToMaster(c)
+		return
+	}
 	var users []database.User
 	s.db.Find(&users)
 	c.JSON(http.StatusOK, users)
 }
 
 func (s *AdminServer) handleAddUser(c *gin.Context) {
+	if s.isNode {
+		s.proxyToMaster(c)
+		return
+	}
 	var user database.User
 	if err := c.ShouldBindJSON(&user); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的参数"})
@@ -584,6 +998,10 @@ func (s *AdminServer) handleAddUser(c *gin.Context) {
 }
 
 func (s *AdminServer) handleUpdateUser(c *gin.Context) {
+	if s.isNode {
+		s.proxyToMaster(c)
+		return
+	}
 	id := c.Param("id")
 	var req struct {
 		Username   string  `json:"username"`
@@ -674,6 +1092,10 @@ func (s *AdminServer) handleUpdateUser(c *gin.Context) {
 }
 
 func (s *AdminServer) handleDeleteUser(c *gin.Context) {
+	if s.isNode {
+		s.proxyToMaster(c)
+		return
+	}
 	var user database.User
 	if s.db.First(&user, c.Param("id")).Error == nil {
 		if len(s.auths) > 0 && user.Hash != "" {
@@ -698,6 +1120,10 @@ func (s *AdminServer) handleUpdateQuota(c *gin.Context) {
 }
 
 func (s *AdminServer) handleClearTraffic(c *gin.Context) {
+	if s.isNode {
+		s.proxyToMaster(c)
+		return
+	}
 	s.db.Model(&database.User{}).Where("id = ?", c.Param("id")).Updates(map[string]interface{}{
 		"used": 0, "upload": 0, "download": 0,
 	})
@@ -722,6 +1148,10 @@ func (s *AdminServer) handleCancelExpire(c *gin.Context) {
 }
 
 func (s *AdminServer) handleShare(c *gin.Context) {
+	if s.isNode {
+		s.proxyToMaster(c)
+		return
+	}
 	var user database.User
 	if err := s.db.First(&user, c.Param("id")).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "用户不存在"})
@@ -835,14 +1265,14 @@ func (s *AdminServer) resetTrafficWorker() {
 		select {
 		case <-ticker.C:
 			var cfg database.Config
-			if s.db.Where("key = ?", "traffic_reset_day").First(&cfg).Error == nil {
+			if s.db.Where("`key` = ?", "traffic_reset_day").First(&cfg).Error == nil {
 				resetDay := 0
 				fmt.Sscanf(cfg.Value, "%d", &resetDay)
 				if resetDay > 0 && time.Now().Day() == resetDay {
 					// 检查本月是否已重置过，防止一天内重置多次
 					lastResetMonth := ""
 					var cfgLast database.Config
-					if s.db.Where("key = ?", "last_reset_month").First(&cfgLast).Error == nil {
+					if s.db.Where("`key` = ?", "last_reset_month").First(&cfgLast).Error == nil {
 						lastResetMonth = cfgLast.Value
 					}
 					currentMonth := time.Now().Format("2006-01")
@@ -917,11 +1347,11 @@ func generateClashConfig(db *gorm.DB, users []database.User, domain string, port
 	// 从数据库获取自定义规则
 	var cfgRules, cfgProviders database.Config
 	rulesStr := ""
-	if db.Where("key = ?", "clash_rules").First(&cfgRules).Error == nil {
+	if db.Where("`key` = ?", "clash_rules").First(&cfgRules).Error == nil {
 		rulesStr = cfgRules.Value
 	}
 	providersStr := ""
-	if db.Where("key = ?", "clash_rule_providers").First(&cfgProviders).Error == nil {
+	if db.Where("`key` = ?", "clash_rule_providers").First(&cfgProviders).Error == nil {
 		providersStr = cfgProviders.Value
 	}
 
@@ -948,7 +1378,7 @@ func generateClashConfig(db *gorm.DB, users []database.User, domain string, port
 		if name == "" {
 			name = fmt.Sprintf("Trojan-%d", i+1)
 		}
-		sb.WriteString(fmt.Sprintf("  - name: \"%s\"\n    type: trojan\n    server: %s\n    port: %d\n    password: %s\n    udp: %t\n    sni: %s\n    skip-cert-verify: true\n    alpn:\n      - http/1.1\n", name, domain, port, u.Password, mux, domain))
+		sb.WriteString(fmt.Sprintf("  - name: \"%s\"\n    type: trojan\n    server: %s\n    port: %d\n    password: %s\n    udp: true\n    sni: %s\n    skip-cert-verify: true\n", name, domain, port, u.Password, domain))
 		if ws {
 			sb.WriteString(fmt.Sprintf("    network: ws\n    ws-opts:\n      path: \"%s\"\n      headers:\n        Host: %s\n", wsPath, domain))
 		}
@@ -1001,6 +1431,11 @@ func FormatBytes(bytes uint64) string {
 }
 // RunStandalone 以外挂模式启动 Web 管理后台
 func RunStandalone(configPath string) error {
+	if abs, err := filepath.Abs(configPath); err == nil {
+		WebConfigPath = abs
+	} else {
+		WebConfigPath = configPath
+	}
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		return fmt.Errorf("读取配置文件失败: %v", err)
@@ -1015,6 +1450,9 @@ func RunStandalone(configPath string) error {
 			DBPath   string `yaml:"db"`
 			Path     string `yaml:"path"`
 		} `yaml:"admin"`
+		Node struct {
+			Enabled bool `yaml:"enabled"`
+		} `yaml:"node"`
 	}
 
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
@@ -1032,7 +1470,7 @@ func RunStandalone(configPath string) error {
 	}
 
 	log.Infof("启动独立 Web 管理后台, 监听端口: %d", cfg.Admin.Port)
-	srv := New(db, cfg.Admin.Username, cfg.Admin.Password, cfg.Admin.Path, cfg.Admin.Port, false, "", false)
+	srv := New(db, cfg.Admin.Username, cfg.Admin.Password, cfg.Admin.Path, cfg.Admin.Port, false, "", false, cfg.Node.Enabled)
 	
 	// 这里我们需要一个不会自动退出的方式运行
 	// New 内部已经启动了 http.Server (如果 port > 0)
@@ -1041,4 +1479,168 @@ func RunStandalone(configPath string) error {
 	case <-srv.done:
 	}
 	return nil
+}
+
+func (s *AdminServer) getMasterNodeSyncConfig() (string, string) {
+	masterURL := ""
+	secret := ""
+	paths := []string{"config.yaml", "config.yml", "/etc/trojan-go/config.yaml"}
+	if WebConfigPath != "" {
+		dir := filepath.Dir(WebConfigPath)
+		paths = append([]string{filepath.Join(dir, "config.yaml"), filepath.Join(dir, "config.yml")}, paths...)
+	}
+	var data []byte
+	var err error
+	for _, p := range paths {
+		data, err = os.ReadFile(p)
+		if err == nil {
+			break
+		}
+	}
+	if err == nil {
+		var cfg map[string]any
+		if err := yaml.Unmarshal(data, &cfg); err == nil {
+			if nodeVal, ok := cfg["node"].(map[string]any); ok {
+				masterURL, _ = nodeVal["master_url"].(string)
+				secret, _ = nodeVal["secret"].(string)
+			} else if nodeAny, ok := cfg["node"].(map[any]any); ok {
+				masterURL, _ = nodeAny["master_url"].(string)
+				secret, _ = nodeAny["secret"].(string)
+			}
+		}
+	}
+	return masterURL, secret
+}
+
+func (s *AdminServer) proxyToMaster(c *gin.Context) {
+	masterURL, secret := s.getMasterNodeSyncConfig()
+	if masterURL == "" {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "从节点未配置主节点同步 URL，无法同步操作"})
+		return
+	}
+	u, err := url.Parse(masterURL)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "主节点 URL 解析失败"})
+		return
+	}
+
+	targetURL := u.Scheme + "://" + u.Host + c.Request.URL.Path
+	if c.Request.URL.RawQuery != "" {
+		targetURL += "?" + c.Request.URL.RawQuery
+	}
+
+	var body io.Reader
+	if c.Request.Body != nil {
+		body = c.Request.Body
+	}
+
+	req, err := http.NewRequest(c.Request.Method, targetURL, body)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建转发请求失败: " + err.Error()})
+		return
+	}
+
+	// 拷贝原有请求头，并覆盖通信鉴权 Key
+	for k, vv := range c.Request.Header {
+		for _, v := range vv {
+			req.Header.Add(k, v)
+		}
+	}
+	req.Header.Set("X-Node-Secret", secret)
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "转发请求到主节点失败: " + err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+
+	// 把主节点的返回头和状态码拷给当前响应
+	for k, vv := range resp.Header {
+		for _, v := range vv {
+			c.Header(k, v)
+		}
+	}
+	c.Status(resp.StatusCode)
+	io.Copy(c.Writer, resp.Body)
+}
+
+func (s *AdminServer) handleGetMasterConfig(c *gin.Context) {
+	masterURL, secret := s.getMasterNodeSyncConfig()
+	c.JSON(http.StatusOK, gin.H{
+		"master_url": masterURL,
+		"secret":     secret,
+	})
+}
+
+func (s *AdminServer) handleTestSync(c *gin.Context) {
+	masterURL, secret := s.getMasterNodeSyncConfig()
+	if masterURL == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "从节点未配置主节点同步 URL"})
+		return
+	}
+
+	if _, err := url.Parse(masterURL); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "URL 格式错误: " + err.Error()})
+		return
+	}
+
+	var reqBody struct {
+		Traffic map[string]any `json:"traffic"`
+	}
+	reqBody.Traffic = make(map[string]any)
+
+	bodyData, _ := json.Marshal(reqBody)
+	req, err := http.NewRequest("POST", masterURL, bytes.NewBuffer(bodyData))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建探测请求失败: " + err.Error()})
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Node-Secret", secret)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{"status": "fail", "error": "连接主节点失败: " + err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		c.JSON(http.StatusOK, gin.H{"status": "fail", "error": fmt.Sprintf("主节点返回异常状态码: %d", resp.StatusCode)})
+		return
+	}
+
+	var respBody struct {
+		Users []string `json:"users"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&respBody); err != nil {
+		c.JSON(http.StatusOK, gin.H{"status": "fail", "error": "解析主节点响应失败: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":  "ok",
+		"message": fmt.Sprintf("主节点连接成功！同步心跳响应正常，目前主节点下发有效用户数: %d 个。", len(respBody.Users)),
+	})
+}
+
+func (s *AdminServer) handlePingNode(c *gin.Context) {
+	id := c.Param("id")
+	var node database.Node
+	if err := s.db.First(&node, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "节点不存在"})
+		return
+	}
+
+	addr := fmt.Sprintf("%s:%d", node.Address, node.Port)
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{"status": "fail", "error": "TCP 连接失败: " + err.Error()})
+		return
+	}
+	conn.Close()
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "message": "节点代理端口探测成功，网络握手正常！"})
 }
