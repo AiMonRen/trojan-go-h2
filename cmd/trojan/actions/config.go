@@ -72,15 +72,14 @@ func ToggleWebSocket() {
 
 	enabled, _ := ws["enabled"].(bool)
 	nextState := !enabled
-	ws["enabled"] = nextState
 
-	out, err := yaml.Marshal(cfg)
+	newContent, err := modifyYamlField(string(data), "websocket", "enabled", nextState)
 	if err != nil {
 		fmt.Printf("\033[31m生成配置文件失败: %v\033[0m\n", err)
 		return
 	}
 
-	if err := os.WriteFile(targetPath, out, 0644); err != nil {
+	if err := os.WriteFile(targetPath, []byte(newContent), 0644); err != nil {
 		fmt.Printf("\033[31m写入配置文件失败: %v\033[0m\n", err)
 		return
 	}
@@ -107,4 +106,49 @@ func ToggleWebSocket() {
 	}
 }
 
+// modifyYamlField 在不破坏排版和注释的前提下，修改指定 parent 节下的 key 字段值
+func modifyYamlField(content, parentKey, key string, value any) (string, error) {
+	lines := strings.Split(content, "\n")
+	var newLines []string
+	inParent := false
+	modified := false
 
+	valStr := fmt.Sprintf("%v", value)
+	if s, ok := value.(string); ok {
+		if !strings.HasPrefix(s, "\"") {
+			valStr = fmt.Sprintf("\"%s\"", s)
+		}
+	}
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		if strings.HasPrefix(trimmed, parentKey+":") {
+			inParent = true
+			newLines = append(newLines, line)
+			continue
+		}
+
+		if inParent {
+			if len(line) > 0 && !strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t") && !strings.HasPrefix(trimmed, "#") {
+				inParent = false
+			} else if strings.HasPrefix(trimmed, key+":") && !modified {
+				parts := strings.SplitN(line, ":", 2)
+				leadingSpace := parts[0]
+
+				lineComment := ""
+				if len(parts) > 1 && strings.Contains(parts[1], "#") {
+					cParts := strings.SplitN(parts[1], "#", 2)
+					lineComment = " #" + cParts[1]
+				}
+
+				line = fmt.Sprintf("%s: %s%s", leadingSpace, valStr, strings.TrimRight(lineComment, "\r\n"))
+				modified = true
+			}
+		}
+
+		newLines = append(newLines, line)
+	}
+
+	return strings.Join(newLines, "\n"), nil
+}

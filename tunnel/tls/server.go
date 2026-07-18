@@ -7,6 +7,7 @@ import (
 	stdtls "crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"fmt"
 	"io"
 
 	"net"
@@ -25,10 +26,10 @@ import (
 	"github.com/voidluo/trojan-go/log"
 	"github.com/voidluo/trojan-go/redirector"
 	"github.com/voidluo/trojan-go/tunnel"
+	"github.com/voidluo/trojan-go/tunnel/mux"
 	"github.com/voidluo/trojan-go/tunnel/tls/fingerprint"
 	"github.com/voidluo/trojan-go/tunnel/transport"
 	"github.com/voidluo/trojan-go/tunnel/websocket"
-	"github.com/voidluo/trojan-go/tunnel/mux"
 )
 
 // Server is a tls server
@@ -49,6 +50,8 @@ type Server struct {
 	wsChan             chan tunnel.Conn
 	adminServer        *webserver.AdminServer
 	adminPath          string
+	subPath            string
+	unauthRedirect     string
 	redir              *redirector.Redirector
 	ctx                context.Context
 	cancel             context.CancelFunc
@@ -87,7 +90,7 @@ func (s *Server) acceptLoop() {
 			select {
 			case <-s.ctx.Done():
 			default:
-				log.Fatal(common.NewError("transport accept error" + err.Error()))
+				log.Error(common.NewError("transport accept error").Base(err))
 			}
 			return
 		}
@@ -102,6 +105,9 @@ func (s *Server) acceptLoop() {
 				GetCertificate: func(hello *stdtls.ClientHelloInfo) (*stdtls.Certificate, error) {
 					s.keyPairLock.RLock()
 					defer s.keyPairLock.RUnlock()
+					if len(s.keyPair) == 0 || s.keyPair[0].Leaf == nil {
+						return nil, fmt.Errorf("tls: no valid certificate configured")
+					}
 					sni := s.keyPair[0].Leaf.Subject.CommonName
 					dnsNames := s.keyPair[0].Leaf.DNSNames
 					if s.sni != "" {
@@ -148,7 +154,7 @@ func (s *Server) acceptLoop() {
 				}
 				return
 			}
-			
+
 			// 握手结束后，必须停止 TLS 握手层缓冲以防内存泄露
 			handshakeRewindConn.StopBuffering()
 
@@ -164,21 +170,26 @@ func (s *Server) acceptLoop() {
 			rewindConn.Rewind()
 			// HTTP 嗅探后也必须停止缓冲，否则后续 Web 面板数据会塞满内存
 			rewindConn.StopBuffering()
-			
+
 			if err != nil {
 				// this is not a http request. pass it to trojan protocol layer for further inspection
 				s.connChan <- &transport.Conn{
 					Conn: rewindConn,
 				}
 			} else {
-				if s.adminServer != nil && (strings.HasPrefix(httpReq.URL.Path, s.adminPath) || httpReq.URL.Path == "/sub") {
+				if s.adminServer != nil && (s.subPath != "" && httpReq.URL.Path == s.subPath || s.adminPath != "" && strings.HasPrefix(httpReq.URL.Path, s.adminPath)) {
 					log.Debug("incoming http request, routing to admin panel")
 					s.adminServer.ServeConn(rewindConn)
 					return
 				}
 				if atomic.LoadInt32(&s.nextHTTP) != 1 {
-					// there is no websocket layer waiting for connections, redirect it
-					if s.fallbackAddress != nil {
+					// there is no websocket layer waiting for connections, redirect/camouflage it
+					if s.unauthRedirect != "" {
+						log.Debug("incoming http request, redirecting to unauth_redirect target:", s.unauthRedirect)
+						resp := fmt.Sprintf("HTTP/1.1 302 Found\r\nLocation: %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", s.unauthRedirect)
+						rewindConn.Write([]byte(resp))
+						rewindConn.Close()
+					} else if s.fallbackAddress != nil {
 						log.Error("incoming http request, but no websocket server is listening, redirecting")
 						s.redir.Redirect(&redirector.Redirection{
 							InboundConn: rewindConn,
@@ -315,7 +326,14 @@ func loadKeyPair(keyPath string, certPath string, password string) (*stdtls.Cert
 
 // NewServer creates a tls layer server
 func NewServer(ctx context.Context, underlay tunnel.Server) (*Server, error) {
-	cfg := config.FromContext(ctx, Name).(*Config)
+	cfgAny := config.FromContext(ctx, Name)
+	if cfgAny == nil {
+		return nil, common.NewError("tls server configuration not found")
+	}
+	cfg, ok := cfgAny.(*Config)
+	if !ok {
+		return nil, common.NewError("invalid tls server configuration type")
+	}
 
 	var fallbackAddress *tunnel.Address
 	var httpResp []byte
@@ -382,6 +400,8 @@ func NewServer(ctx context.Context, underlay tunnel.Server) (*Server, error) {
 		cipherSuite:        cipherSuite,
 		ctx:                ctx,
 		cancel:             cancel,
+		subPath:            cfg.Admin.SubPath,
+		unauthRedirect:     cfg.Admin.UnauthRedirect,
 	}
 
 	if cfg.Admin.Enabled {
@@ -408,7 +428,12 @@ func NewServer(ctx context.Context, underlay tunnel.Server) (*Server, error) {
 				isNode = nodeCfg.Node.Enabled
 			}
 
-			server.adminServer = webserver.New(db, cfg.Admin.Username, cfg.Admin.Password, cfg.Admin.Path, cfg.Admin.Port, wsEnabled, wsPath, muxEnabled, isNode)
+			serverDomain := cfg.TLS.SNI
+			if serverDomain == "" {
+				serverDomain = cfg.RemoteHost
+			}
+
+			server.adminServer = webserver.New(db, cfg.Admin.Username, cfg.Admin.Password, cfg.Admin.Path, cfg.Admin.Port, wsEnabled, wsPath, muxEnabled, isNode, cfg.Admin.MaskHtmlPath, cfg.Admin.SubPath, serverDomain)
 			server.adminPath = cfg.Admin.Path
 			log.Infof("admin panel enabled on https://[domain]%s (user: %s)", cfg.Admin.Path, cfg.Admin.Username)
 		}

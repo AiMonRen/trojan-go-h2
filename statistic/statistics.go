@@ -52,7 +52,9 @@ var (
 )
 
 func RegisterAuthenticatorCreator(name string, creator Creator) {
-	authCreators[name] = creator
+	createdAuthLock.Lock()
+	defer createdAuthLock.Unlock()
+	authCreators[strings.ToUpper(name)] = creator
 }
 
 func NewAuthenticator(ctx context.Context, name string) (Authenticator, error) {
@@ -73,4 +75,32 @@ func NewAuthenticator(ctx context.Context, name string) (Authenticator, error) {
 	}
 	createdAuth[ctx] = auth
 	return auth, err
+}
+
+// DeregisterAuthenticator 释放由指定 Context 注册的全局认证器引用，
+// 避免 GC Root 强引用导致的内存泄漏。调用方应在 Context 生命周期结束时调用。
+func DeregisterAuthenticator(ctx context.Context) {
+	createdAuthLock.Lock()
+	defer createdAuthLock.Unlock()
+	delete(createdAuth, ctx)
+}
+
+// CloseAuthenticator removes and closes the authenticator owned by ctx.
+// The external Close call happens after releasing the registry lock.
+func CloseAuthenticator(ctx context.Context) error {
+	createdAuthLock.Lock()
+	auth := createdAuth[ctx]
+	delete(createdAuth, ctx)
+	createdAuthLock.Unlock()
+	if auth == nil {
+		return nil
+	}
+	return auth.Close()
+}
+
+// AuthenticatorCount reports the number of cached authenticators.
+func AuthenticatorCount() int {
+	createdAuthLock.Lock()
+	defer createdAuthLock.Unlock()
+	return len(createdAuth)
 }

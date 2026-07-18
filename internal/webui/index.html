@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Trojan-Go 管理面板</title>
+    <title>System Control Panel</title>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Outfit:wght@400;500;600;700&display=swap');
         :root {
@@ -172,7 +172,7 @@ let token = localStorage.getItem('token');
 let currentUsers = [];
 let searchText = '';
 let isNode = false;
-const API = '/api';
+const API = '/admin/api';
 
 let isTimeoutTriggered = false;
 function triggerSessionTimeout() {
@@ -465,7 +465,7 @@ async function router() {
         const s = await api('GET', '/settings');
         if (s) {
             isNode = (s.is_node === "true");
-            const t = s.site_title || 'Trojan-Go';
+            const t = s.site_title || 'System Admin';
             document.title = t;
             const el = document.getElementById('navTitle');
             if (el) el.textContent = t;
@@ -492,7 +492,7 @@ async function router() {
 
     const sidebar = `
     <aside>
-        <div class="sidebar-header"><span class="logo" id="navTitle" onclick="navigate('/dashboard')">Trojan-Go</span></div>
+        <div class="sidebar-header"><span class="logo" id="navTitle" onclick="navigate('/dashboard')">System Admin</span></div>
         <div class="sidebar-menu">
             ${sidebarMenuHtml}
         </div>
@@ -539,7 +539,7 @@ function logout() {
 
 async function updateTitle() {
     const s = await api('GET','/settings'); if (!s) return;
-    const t = s.site_title || 'Trojan-Go'; document.title = t;
+    const t = s.site_title || 'System Admin'; document.title = t;
     const el = document.getElementById('navTitle'); if (el) el.textContent = t;
     if (s.session_timeout) {
         localStorage.setItem('session_timeout', s.session_timeout);
@@ -727,7 +727,10 @@ function renderNodeTableHtml() {
     return `
     <div class="header-bar">
         <h1>节点管理</h1>
-        <button class="btn btn-primary" onclick="showNodeModal()">+ 新增代理节点</button>
+        <div style="display:flex;gap:12px">
+            <button class="btn" style="border-color:var(--border)" onclick="showNodeSyncUrlModal()">🔗 同步接口URL</button>
+            <button class="btn btn-primary" onclick="showNodeModal()">+ 新增代理节点</button>
+        </div>
     </div>
 
     <div class="table-container">
@@ -785,6 +788,23 @@ function renderNodeTableHtml() {
         </table>
     </div>
     `;
+}
+
+window.showNodeSyncUrlModal = function() {
+    const domain = window.location.hostname;
+    const syncUrl = `https://${domain}/admin/api/node/sync`;
+    showModal('从节点同步接口 URL', `
+        <div class="form-group">
+            <label>从节点同步接口 URL (写进从节点配置文件)</label>
+            <div style="display:flex;gap:8px">
+                <input readonly id="shSyncUrl" value="${syncUrl}" style="flex:1; padding:8px 12px; font-family:monospace; background:var(--surface2); border:1px solid var(--border); color:#fff; border-radius:6px; outline:none">
+                <button class="btn btn-primary" onclick="copyText('${syncUrl}')">复制</button>
+            </div>
+        </div>
+        <p style="font-size:12px;color:var(--text2);margin-top:8px">
+            提示：请将此 URL 填入从节点一键部署或从节点配置文件中的 <code>node_sync.node.master_url</code> 配置项中。
+        </p>
+    `, null, true);
 }
 
 window.showNodeModal = function() {
@@ -1155,7 +1175,7 @@ async function shareUser(id) {
     }
     showModal('快速接入信息', `
         <div class="form-group">
-            <label>通用 Trojan 链接 (直连专用)</label>
+            <label>通用代理链接 (直连专用)</label>
             <div style="display:flex;gap:8px">
                 <input readonly id="shLink" value="${data.link}" style="flex:1">
                 <button class="btn" onclick="copyText('${data.link}')">复制</button>

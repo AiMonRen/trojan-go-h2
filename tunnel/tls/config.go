@@ -12,14 +12,17 @@ type Config struct {
 	Admin      AdminConfig     `json:"admin" yaml:"admin"`
 }
 
-// AdminConfig 管理面板配置（复用 443 端口和证书，无需额外端口）
+// AdminConfig 管理面板配置（独立端口或复用）
 type AdminConfig struct {
-	Enabled  bool   `json:"enabled" yaml:"enabled"`
-	Username string `json:"username" yaml:"username"` // Web 登录用户名，默认 admin
-	Password string `json:"password" yaml:"password"` // Web 登录密码，默认 trojan@123
-	Path     string `json:"path" yaml:"path"`         // 管理面板挂载路径，默认 /
-	DbPath   string `json:"db" yaml:"db"`             // Sqlite 数据库路径，默认 /etc/trojan-go/trojan-go.db
-	Port     int    `json:"port" yaml:"port"`         // Web 管理面板监听端口，0 为复用 443
+	Enabled        bool   `json:"enabled" yaml:"enabled"`
+	Username       string `json:"username" yaml:"username"`               // Web 登录用户名，默认 admin
+	Password       string `json:"password" yaml:"password"`               // Web 登录密码，默认 trojan@123
+	Path           string `json:"path" yaml:"path"`                       // 管理面板挂载路径，默认 /admin/
+	DbPath         string `json:"db" yaml:"db"`                           // Sqlite 数据库路径，默认 /etc/trojan-go/trojan-go.db
+	Port           int    `json:"port" yaml:"port"`                       // Web 管理面板监听端口，默认 8080
+	SubPath        string `json:"sub_path" yaml:"sub_path"`               // 混淆后的安全订阅下载路径，如果为空，系统启动将自动生成
+	UnauthRedirect string `json:"unauth_redirect" yaml:"unauth_redirect"` // 仅用于未认证请求 302 外部重定向跳转到的 URL
+	MaskHtmlPath   string `json:"mask_html_path" yaml:"mask_html_path"`   // 自定义本地网页伪装文件路径
 }
 
 type WebsocketConfig struct {
@@ -56,11 +59,14 @@ func init() {
 				ALPN:           []string{"http/1.1"},
 			},
 			Admin: AdminConfig{
-				Username: "admin",
-				Password: "trojan@123",
-				Path:     "/",
-				DbPath:   "/etc/trojan-go/trojan-go.db",
-				Port:     0,
+				Username:       "admin",
+				Password:       "trojan@123",
+				Path:           "/admin/",
+				DbPath:         "/etc/trojan-go/trojan-go.db",
+				Port:           8080,
+				SubPath:        "",
+				UnauthRedirect: "",
+				MaskHtmlPath:   "",
 			},
 		}
 	})

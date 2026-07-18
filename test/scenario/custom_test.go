@@ -2,12 +2,20 @@ package scenario
 
 import (
 	"fmt"
+	"os"
 	"testing"
 
 	"github.com/voidluo/trojan-go/common"
 	_ "github.com/voidluo/trojan-go/proxy/custom"
 	"github.com/voidluo/trojan-go/test/util"
+	_ "github.com/voidluo/trojan-go/tunnel/adapter"
 )
+
+func init() {
+	// Custom scenarios instantiate both Shadowsocks peers in one process. The
+	// upstream replay filter is process-global, unlike production deployments.
+	_ = os.Setenv("SHADOWSOCKS_SF_CAPACITY", "-1")
+}
 
 func TestCustom1(t *testing.T) {
 	serverPort := common.PickPort("tcp", "127.0.0.1")

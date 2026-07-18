@@ -2,13 +2,15 @@ package proxy
 
 import (
 	"bufio"
+	"context"
 	"flag"
 	"fmt"
 	"io"
-
 	"os"
+	"os/signal"
 	"runtime"
 	"strings"
+	"syscall"
 
 	"github.com/voidluo/trojan-go/common"
 	"github.com/voidluo/trojan-go/log"
@@ -20,9 +22,7 @@ type Option struct {
 	path *string
 }
 
-func (o *Option) Name() string {
-	return Name
-}
+func (o *Option) Name() string { return Name }
 
 func detectAndReadConfig(file string) ([]byte, bool, error) {
 	isJSON := false
@@ -30,67 +30,58 @@ func detectAndReadConfig(file string) ([]byte, bool, error) {
 	case strings.HasSuffix(file, ".json"):
 		isJSON = true
 	case strings.HasSuffix(file, ".yaml"), strings.HasSuffix(file, ".yml"):
-		isJSON = false
 	default:
-		log.Fatalf("unsupported config format: %s. use .yaml or .json instead.", file)
+		return nil, false, common.NewError("unsupported config format: " + file)
 	}
-
 	data, err := os.ReadFile(file)
-	if err != nil {
-		return nil, false, err
+	return data, isJSON, err
+}
+
+// RunWithSignals runs the proxy and closes it on process termination.
+func RunWithSignals(p *Proxy) error {
+	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	done := make(chan error, 1)
+	go func() { done <- p.Run() }()
+	select {
+	case err := <-done:
+		return err
+	case <-signalCtx.Done():
+		_ = p.Close()
+		return <-done
 	}
-	return data, isJSON, nil
 }
 
 func (o *Option) Handle() error {
-	defaultConfigPath := []string{
-		"config.json",
-		"config.yml",
-		"config.yaml",
-	}
-
+	paths := []string{"config.json", "config.yml", "config.yaml"}
 	isJSON := false
 	var data []byte
 	var err error
-
-	switch *o.path {
-	case "":
-		log.Warn("no specified config file, use default path to detect config file")
-		for _, file := range defaultConfigPath {
-			log.Warn("try to load config from default path:", file)
-			data, isJSON, err = detectAndReadConfig(file)
-			if err != nil {
-				log.Warn(err)
-				continue
+	if *o.path == "" {
+		for _, path := range paths {
+			data, isJSON, err = detectAndReadConfig(path)
+			if err == nil {
+				break
 			}
-			break
 		}
-	default:
+	} else {
 		data, isJSON, err = detectAndReadConfig(*o.path)
-		if err != nil {
-			log.Fatal(err)
-		}
 	}
-
-	if data != nil {
-		log.Info("trojan-go", version.Version, "initializing")
-		proxy, err := NewProxyFromConfigData(data, isJSON)
-		if err != nil {
-			log.Fatal(err)
-		}
-		err = proxy.Run()
-		if err != nil {
-			log.Fatal(err)
-		}
+	if err != nil {
+		return err
 	}
-
-	log.Fatal("no valid config")
-	return nil
+	if data == nil {
+		return common.NewError("no valid config")
+	}
+	log.Info("trojan-go", version.Version, "initializing")
+	p, err := NewProxyFromConfigData(data, isJSON)
+	if err != nil {
+		return err
+	}
+	return RunWithSignals(p)
 }
 
-func (o *Option) Priority() int {
-	return -1
-}
+func (o *Option) Priority() int { return -1 }
 
 func init() {
 	option.RegisterHandler(&Option{
@@ -107,52 +98,38 @@ type StdinOption struct {
 	suppressHint *bool
 }
 
-func (o *StdinOption) Name() string {
-	return Name + "_STDIN"
-}
+func (o *StdinOption) Name() string { return Name + "_STDIN" }
 
 func (o *StdinOption) Handle() error {
-	isJSON, e := o.isFormatJson()
-	if e != nil {
-		return e
+	isJSON, err := o.isFormatJSON()
+	if err != nil {
+		return err
 	}
-
 	if o.suppressHint == nil || !*o.suppressHint {
 		fmt.Printf("Trojan-Go %s (%s/%s)\n", version.Version, runtime.GOOS, runtime.GOARCH)
-		if isJSON {
-			fmt.Println("Reading JSON configuration from stdin.")
-		} else {
-			fmt.Println("Reading YAML configuration from stdin.")
-		}
 	}
-
-	data, e := io.ReadAll(bufio.NewReader(os.Stdin))
-	if e != nil {
-		log.Fatalf("Failed to read from stdin: %s", e.Error())
-	}
-
-	proxy, err := NewProxyFromConfigData(data, isJSON)
+	data, err := io.ReadAll(bufio.NewReader(os.Stdin))
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
-	err = proxy.Run()
+	p, err := NewProxyFromConfigData(data, isJSON)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
-
-	return nil
+	return RunWithSignals(p)
 }
 
-func (o *StdinOption) Priority() int {
-	return 0
-}
+func (o *StdinOption) Priority() int { return 0 }
 
-func (o *StdinOption) isFormatJson() (isJson bool, e error) {
+func (o *StdinOption) isFormatJSON() (bool, error) {
 	if o.format == nil {
 		return false, common.NewError("format specifier is nil")
 	}
 	if *o.format == "disabled" {
 		return false, common.NewError("reading from stdin is disabled")
 	}
-	return strings.ToLower(*o.format) == "json", nil
+	return strings.EqualFold(*o.format, "json"), nil
 }
+
+var _ option.Handler = (*Option)(nil)
+var _ option.Handler = (*StdinOption)(nil)

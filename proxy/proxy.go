@@ -7,11 +7,14 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/voidluo/trojan-go/common"
 	"github.com/voidluo/trojan-go/config"
 	"github.com/voidluo/trojan-go/internal/nodesync"
 	"github.com/voidluo/trojan-go/log"
+	"github.com/voidluo/trojan-go/statistic"
 	"github.com/voidluo/trojan-go/tunnel"
 )
 
@@ -27,27 +30,47 @@ type Proxy struct {
 	sink    tunnel.Client
 	ctx     context.Context
 	cancel  context.CancelFunc
+
+	authCtx   context.Context
+	closeOnce sync.Once
+	workers   sync.WaitGroup
 }
 
 func (p *Proxy) Run() error {
 	p.relayConnLoop()
 	p.relayPacketLoop()
-	<-p.ctx.Done()
-	return nil
+	select {
+	case <-p.ctx.Done():
+	case <-common.ShutdownContext().Done():
+		log.Info("proxy shutting down via global signal")
+	}
+	return p.Close()
 }
 
 func (p *Proxy) Close() error {
-	p.cancel()
-	p.sink.Close()
-	for _, source := range p.sources {
-		source.Close()
+	p.closeOnce.Do(func() {
+		p.cancel()
+		if p.sink != nil {
+			_ = p.sink.Close()
+		}
+		for _, source := range p.sources {
+			_ = source.Close()
+		}
+	})
+	p.workers.Wait()
+	if p.authCtx != nil {
+		if err := statistic.CloseAuthenticator(p.authCtx); err != nil {
+			log.Warn("failed to close proxy authenticator:", err)
+		}
 	}
 	return nil
 }
 
 func (p *Proxy) relayConnLoop() {
 	for _, source := range p.sources {
+		p.workers.Add(1)
 		go func(source tunnel.Server) {
+			defer p.workers.Done()
 			for {
 				inbound, err := source.AcceptConn(nil)
 				if err != nil {
@@ -58,6 +81,11 @@ func (p *Proxy) relayConnLoop() {
 					default:
 					}
 					log.Error(common.NewError("failed to accept connection").Base(err))
+					select {
+					case <-time.After(100 * time.Millisecond):
+					case <-p.ctx.Done():
+						return
+					}
 					continue
 				}
 				go func(inbound tunnel.Conn) {
@@ -69,7 +97,10 @@ func (p *Proxy) relayConnLoop() {
 					}
 					defer outbound.Close()
 					errChan := make(chan error, 2)
+					var wg sync.WaitGroup
+					wg.Add(2)
 					copyConn := func(a, b net.Conn) {
+						defer wg.Done()
 						buf := common.GetBuffer()
 						defer common.PutBuffer(buf)
 						_, err := io.CopyBuffer(a, b, buf)
@@ -84,8 +115,10 @@ func (p *Proxy) relayConnLoop() {
 						}
 					case <-p.ctx.Done():
 						log.Debug("shutting down conn relay")
-						return
 					}
+					inbound.Close()
+					outbound.Close()
+					wg.Wait() // 确保 copyConn goroutine 完成 buffer 归还
 					log.Debug("conn relay ends")
 				}(inbound)
 			}
@@ -95,7 +128,9 @@ func (p *Proxy) relayConnLoop() {
 
 func (p *Proxy) relayPacketLoop() {
 	for _, source := range p.sources {
+		p.workers.Add(1)
 		go func(source tunnel.Server) {
+			defer p.workers.Done()
 			for {
 				inbound, err := source.AcceptPacket(nil)
 				if err != nil {
@@ -106,6 +141,11 @@ func (p *Proxy) relayPacketLoop() {
 					default:
 					}
 					log.Error(common.NewError("failed to accept packet").Base(err))
+					select {
+					case <-time.After(100 * time.Millisecond):
+					case <-p.ctx.Done():
+						return
+					}
 					continue
 				}
 				go func(inbound tunnel.PacketConn) {
@@ -117,7 +157,10 @@ func (p *Proxy) relayPacketLoop() {
 					}
 					defer outbound.Close()
 					errChan := make(chan error, 2)
+					var wg sync.WaitGroup
+					wg.Add(2)
 					copyPacket := func(a, b tunnel.PacketConn) {
+						defer wg.Done()
 						buf := common.GetBuffer()
 						defer common.PutBuffer(buf)
 						for {
@@ -147,6 +190,9 @@ func (p *Proxy) relayPacketLoop() {
 					case <-p.ctx.Done():
 						log.Debug("shutting down packet relay")
 					}
+					inbound.Close()
+					outbound.Close()
+					wg.Wait() // 确保 copyPacket goroutine 完成 buffer 归还
 					log.Debug("packet relay ends")
 				}(inbound)
 			}
@@ -160,6 +206,7 @@ func NewProxy(ctx context.Context, cancel context.CancelFunc, sources []tunnel.S
 		sink:    sink,
 		ctx:     ctx,
 		cancel:  cancel,
+		authCtx: ctx,
 	}
 }
 
@@ -186,7 +233,14 @@ func NewProxyFromConfigData(data []byte, isJSON bool) (*Proxy, error) {
 			return nil, err
 		}
 	}
-	cfg := config.FromContext(ctx, Name).(*Config)
+	cfgAny := config.FromContext(ctx, Name)
+	if cfgAny == nil {
+		return nil, common.NewError("proxy configuration not found in context")
+	}
+	cfg, ok := cfgAny.(*Config)
+	if !ok {
+		return nil, common.NewError("invalid proxy configuration type")
+	}
 	create, ok := creators[strings.ToUpper(cfg.RunType)]
 	if !ok {
 		return nil, common.NewError("unknown proxy type: " + cfg.RunType)
@@ -202,8 +256,7 @@ func NewProxyFromConfigData(data []byte, isJSON bool) (*Proxy, error) {
 
 	// 初始化从节点同步管理器
 	if nodeCfgAny := config.FromContext(ctx, nodesync.Name); nodeCfgAny != nil {
-		nodeCfg := nodeCfgAny.(*nodesync.Config)
-		if nodeCfg.Node.Enabled {
+		if nodeCfg, ok := nodeCfgAny.(*nodesync.Config); ok && nodeCfg.Node.Enabled {
 			nodesync.InitManager(nodeCfg.Node.MasterURL, nodeCfg.Node.Secret, nodeCfg.Node.SyncInterval)
 			if mgr := nodesync.GetManager(); mgr != nil {
 				mgr.Start(ctx)

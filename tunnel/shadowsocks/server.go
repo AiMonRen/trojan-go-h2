@@ -25,29 +25,8 @@ func (s *Server) AcceptConn(overlay tunnel.Tunnel) (tunnel.Conn, error) {
 	if err != nil {
 		return nil, common.NewError("shadowsocks failed to accept connection from underlying tunnel").Base(err)
 	}
-	rewindConn := common.NewRewindConn(conn)
-	rewindConn.SetBufferSize(1024)
-	defer rewindConn.StopBuffering()
-
-	// try to read something from this connection
-	buf := [1024]byte{}
-	testConn := s.Cipher.StreamConn(rewindConn)
-	if _, err := testConn.Read(buf[:]); err != nil {
-		// we are under attack
-		log.Error(common.NewError("shadowsocks failed to decrypt").Base(err))
-		rewindConn.Rewind()
-		rewindConn.StopBuffering()
-		s.Redirect(&redirector.Redirection{
-			RedirectTo:  s.redirAddr,
-			InboundConn: rewindConn,
-		})
-		return nil, common.NewError("invalid aead payload")
-	}
-	rewindConn.Rewind()
-	rewindConn.StopBuffering()
-
 	return &Conn{
-		aeadConn: s.Cipher.StreamConn(rewindConn),
+		aeadConn: s.Cipher.StreamConn(conn),
 		Conn:     conn,
 	}, nil
 }

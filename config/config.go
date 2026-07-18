@@ -4,50 +4,39 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-
+	"fmt"
+	"math/rand"
 	"reflect"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
 var creators = make(map[string]Creator)
 
-// Creator creates default config struct for a module
+// Creator creates a config struct for a module.
 type Creator func() any
 
-// 用于全局配置清洗的接口
+// normalizer is implemented by configs that need post-processing.
 type normalizer interface {
 	Normalize()
 }
 
-// RegisterConfigCreator registers a config struct for parsing
+// RegisterConfigCreator registers a config struct for parsing.
 func RegisterConfigCreator(name string, creator Creator) {
-	name += "_CONFIG"
-	creators[name] = creator
+	creators[name+"_CONFIG"] = creator
 }
 
 func compatConfigData(data []byte, isJSON bool) []byte {
-	if isJSON {
-		data = bytes.ReplaceAll(data, []byte(`"run-type"`), []byte(`"run_type"`))
-		data = bytes.ReplaceAll(data, []byte(`"log-level"`), []byte(`"log_level"`))
-		data = bytes.ReplaceAll(data, []byte(`"log-file"`), []byte(`"log_file"`))
-		data = bytes.ReplaceAll(data, []byte(`"local-addr"`), []byte(`"local_addr"`))
-		data = bytes.ReplaceAll(data, []byte(`"local-port"`), []byte(`"local_port"`))
-		data = bytes.ReplaceAll(data, []byte(`"remote-addr"`), []byte(`"remote_addr"`))
-		data = bytes.ReplaceAll(data, []byte(`"remote-port"`), []byte(`"remote_port"`))
-		data = bytes.ReplaceAll(data, []byte(`"disable-http-check"`), []byte(`"disable_http_check"`))
-		data = bytes.ReplaceAll(data, []byte(`"udp-timeout"`), []byte(`"udp_timeout"`))
-	} else {
-		data = bytes.ReplaceAll(data, []byte("run-type:"), []byte("run_type:"))
-		data = bytes.ReplaceAll(data, []byte("log-level:"), []byte("log_level:"))
-		data = bytes.ReplaceAll(data, []byte("log-file:"), []byte("log_file:"))
-		data = bytes.ReplaceAll(data, []byte("local-addr:"), []byte("local_addr:"))
-		data = bytes.ReplaceAll(data, []byte("local-port:"), []byte("local_port:"))
-		data = bytes.ReplaceAll(data, []byte("remote-addr:"), []byte("remote_addr:"))
-		data = bytes.ReplaceAll(data, []byte("remote-port:"), []byte("remote_port:"))
-		data = bytes.ReplaceAll(data, []byte("disable-http-check:"), []byte("disable_http_check:"))
-		data = bytes.ReplaceAll(data, []byte("udp-timeout:"), []byte("udp_timeout:"))
+	keys := []string{"run-type", "log-level", "log-file", "local-addr", "local-port", "remote-addr", "remote-port", "disable-http-check", "udp-timeout"}
+	for _, key := range keys {
+		underscore := strings.ReplaceAll(key, "-", "_")
+		if isJSON {
+			data = bytes.ReplaceAll(data, []byte(`"`+key+`"`), []byte(`"`+underscore+`"`))
+		} else {
+			data = bytes.ReplaceAll(data, []byte(key+":"), []byte(underscore+":"))
+		}
 	}
 	return data
 }
@@ -56,12 +45,12 @@ func parseJSON(data []byte) (map[string]any, error) {
 	data = compatConfigData(data, true)
 	result := make(map[string]any)
 	for name, creator := range creators {
-		config := creator()
-		if err := json.Unmarshal(data, config); err != nil {
+		cfg := creator()
+		if err := json.Unmarshal(data, cfg); err != nil {
 			return nil, err
 		}
-		normalizeConfig(config)
-		result[name] = config
+		normalizeConfig(cfg)
+		result[name] = cfg
 	}
 	return result, nil
 }
@@ -70,59 +59,72 @@ func parseYAML(data []byte) (map[string]any, error) {
 	data = compatConfigData(data, false)
 	result := make(map[string]any)
 	for name, creator := range creators {
-		config := creator()
-		if err := yaml.Unmarshal(data, config); err != nil {
+		cfg := creator()
+		if err := yaml.Unmarshal(data, cfg); err != nil {
 			return nil, err
 		}
-		normalizeConfig(config)
-		result[name] = config
+		normalizeConfig(cfg)
+		result[name] = cfg
 	}
 	return result, nil
 }
 
 func WithJSONConfig(ctx context.Context, data []byte) (context.Context, error) {
-	var configs map[string]any
-	var err error
-	configs, err = parseJSON(data)
+	configs, err := parseJSON(data)
 	if err != nil {
 		return ctx, err
 	}
-	for name, config := range configs {
-		ctx = context.WithValue(ctx, name, config)
+	for name, cfg := range configs {
+		ctx = context.WithValue(ctx, name, cfg)
 	}
 	return ctx, nil
 }
 
 func WithYAMLConfig(ctx context.Context, data []byte) (context.Context, error) {
-	var configs map[string]any
-	var err error
-	configs, err = parseYAML(data)
+	configs, err := parseYAML(data)
 	if err != nil {
 		return ctx, err
 	}
-	for name, config := range configs {
-		ctx = context.WithValue(ctx, name, config)
+	for name, cfg := range configs {
+		ctx = context.WithValue(ctx, name, cfg)
 	}
 	return ctx, nil
 }
 
 func WithConfig(ctx context.Context, name string, cfg any) context.Context {
-	name += "_CONFIG"
-	return context.WithValue(ctx, name, cfg)
+	return context.WithValue(ctx, name+"_CONFIG", cfg)
 }
 
-// FromContext extracts config from a context
+// FromContext extracts a config from a context.
 func FromContext(ctx context.Context, name string) any {
+	if ctx == nil {
+		return nil
+	}
 	return ctx.Value(name + "_CONFIG")
 }
 
-// normalizeConfig 深度遍历结构体，强制补齐 WebSocket 路径
+// Require returns a non-nil configuration of the requested type.
+func Require[T any](ctx context.Context, name string) (*T, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("%s configuration context is nil", name)
+	}
+	value := FromContext(ctx, name)
+	if value == nil {
+		return nil, fmt.Errorf("%s configuration is missing", name)
+	}
+	cfg, ok := value.(*T)
+	if !ok || cfg == nil {
+		return nil, fmt.Errorf("%s configuration has type %T, want *%T", name, value, new(T))
+	}
+	return cfg, nil
+}
+
+// normalizeConfig recursively normalizes a configuration.
 func normalizeConfig(cfg any) {
 	if cfg == nil {
 		return
 	}
-	val := reflect.ValueOf(cfg)
-	normalizeValue(val)
+	normalizeValue(reflect.ValueOf(cfg))
 }
 
 func normalizeValue(val reflect.Value) {
@@ -138,36 +140,36 @@ func normalizeValue(val reflect.Value) {
 		for i := 0; i < val.NumField(); i++ {
 			field := val.Field(i)
 			fieldName := val.Type().Field(i).Name
-			
-			// 1. 如果是 Websocket 结构体，继续深入
-			// 2. 如果字段名是 Path 且属于某个叫 Websocket 的结构或父级
-			if fieldName == "Path" && field.Kind() == reflect.String {
+			structName := val.Type().Name()
+			if structName == "AdminConfig" {
+				if fieldName == "Path" && field.Kind() == reflect.String && field.CanSet() {
+					field.SetString("/admin/")
+				}
+				if fieldName == "SubPath" && field.Kind() == reflect.String && field.CanSet() {
+					subPath := field.String()
+					if subPath == "" {
+						const letters = "abcdefghijklmnopqrstuvwxyz0123456789"
+						r := rand.New(rand.NewSource(time.Now().UnixNano()))
+						chars := make([]byte, 8)
+						for j := range chars {
+							chars[j] = letters[r.Intn(len(letters))]
+						}
+						subPath = "/sub-" + string(chars)
+					}
+					if !strings.HasPrefix(subPath, "/") {
+						subPath = "/" + subPath
+					}
+					field.SetString(subPath)
+				}
+			} else if fieldName == "Path" && field.Kind() == reflect.String && field.CanSet() {
 				path := field.String()
-				// 如果是管理面板路径且为空，给一个默认的特殊路径，避免与 Websocket 冲突
-				structName := val.Type().Name()
-				if path == "" && structName == "AdminConfig" {
-					path = "/trojan-go-admin/"
-				}
-				if !strings.HasPrefix(path, "/") {
-					path = "/" + path
-				}
-				// 对于管理面板这类挂载路径，强制以 / 结尾以配合重定向逻辑
-				if structName == "AdminConfig" && !strings.HasSuffix(path, "/") {
-					path += "/"
-				}
-				if field.CanSet() {
-					field.SetString(path)
+				if path != "" && !strings.HasPrefix(path, "/") {
+					field.SetString("/" + path)
 				}
 			}
-			
-			// 递归处理子字段
-			if field.Kind() == reflect.Struct || field.Kind() == reflect.Ptr {
+			if field.CanSet() && (field.Kind() == reflect.Struct || field.Kind() == reflect.Ptr || field.Kind() == reflect.Slice || field.Kind() == reflect.Array) {
 				normalizeValue(field)
 			}
-		}
-	case reflect.Map:
-		for _, key := range val.MapKeys() {
-			normalizeValue(val.MapIndex(key))
 		}
 	case reflect.Slice, reflect.Array:
 		for i := 0; i < val.Len(); i++ {
@@ -175,3 +177,5 @@ func normalizeValue(val reflect.Value) {
 		}
 	}
 }
+
+var _ normalizer

@@ -18,31 +18,31 @@ type Metadata struct {
 	*Address
 }
 
-func (r *Metadata) ReadFrom(rr io.Reader) error {
+func (r *Metadata) ReadFrom(rr io.Reader) (int64, error) {
 	byteBuf := [1]byte{}
 	_, err := io.ReadFull(rr, byteBuf[:])
 	if err != nil {
-		return err
+		return 0, err
 	}
 	r.Command = Command(byteBuf[0])
 	r.Address = new(Address)
-	err = r.Address.ReadFrom(rr)
+	n, err := r.Address.ReadFrom(rr)
 	if err != nil {
-		return common.NewError("failed to marshal address").Base(err)
+		return 0, common.NewError("failed to marshal address").Base(err)
 	}
-	return nil
+	return 1 + n, nil
 }
 
-func (r *Metadata) WriteTo(w io.Writer) error {
+func (r *Metadata) WriteTo(w io.Writer) (int64, error) {
 	buf := bytes.NewBuffer(make([]byte, 0, 64))
 	buf.WriteByte(byte(r.Command))
-	if err := r.Address.WriteTo(buf); err != nil {
-		return err
+	if _, err := r.Address.WriteTo(buf); err != nil {
+		return 0, err
 	}
 	// use tcp by default
 	r.Address.NetworkType = "tcp"
-	_, err := w.Write(buf.Bytes())
-	return err
+	n, err := w.Write(buf.Bytes())
+	return int64(n), err
 }
 
 func (r *Metadata) Network() string {
@@ -136,41 +136,46 @@ func NewAddressFromHostPort(network string, host string, port int) *Address {
 	}
 }
 
-func (a *Address) ReadFrom(r io.Reader) error {
+func (a *Address) ReadFrom(r io.Reader) (int64, error) {
 	byteBuf := [1]byte{}
 	_, err := io.ReadFull(r, byteBuf[:])
 	if err != nil {
-		return common.NewError("unable to read ATYP").Base(err)
+		return 0, common.NewError("unable to read ATYP").Base(err)
 	}
 	a.AddressType = AddressType(byteBuf[0])
+	var n int64 = 1 // ATYP byte
 	switch a.AddressType {
 	case IPv4:
 		var buf [6]byte
 		_, err := io.ReadFull(r, buf[:])
 		if err != nil {
-			return common.NewError("failed to read IPv4").Base(err)
+			return 0, common.NewError("failed to read IPv4").Base(err)
 		}
 		a.IP = buf[0:4]
 		a.Port = int(binary.BigEndian.Uint16(buf[4:6]))
+		n += 6
 	case IPv6:
 		var buf [18]byte
 		_, err := io.ReadFull(r, buf[:])
 		if err != nil {
-			return common.NewError("failed to read IPv6").Base(err)
+			return 0, common.NewError("failed to read IPv6").Base(err)
 		}
 		a.IP = buf[0:16]
 		a.Port = int(binary.BigEndian.Uint16(buf[16:18]))
+		n += 18
 	case DomainName:
 		_, err := io.ReadFull(r, byteBuf[:])
 		length := byteBuf[0]
 		if err != nil {
-			return common.NewError("failed to read domain name length")
+			return 0, common.NewError("failed to read domain name length")
 		}
+		n += 1 // length byte
 		buf := make([]byte, length+2)
 		_, err = io.ReadFull(r, buf)
 		if err != nil {
-			return common.NewError("failed to read domain name")
+			return 0, common.NewError("failed to read domain name")
 		}
+		n += int64(length) + 2
 		// the fucking browser uses IP as a domain name sometimes
 		host := buf[0:length]
 		if ip := net.ParseIP(string(host)); ip != nil {
@@ -185,32 +190,39 @@ func (a *Address) ReadFrom(r io.Reader) error {
 		}
 		a.Port = int(binary.BigEndian.Uint16(buf[length : length+2]))
 	default:
-		return common.NewError("invalid ATYP " + strconv.FormatInt(int64(a.AddressType), 10))
+		return 0, common.NewError("invalid ATYP " + strconv.FormatInt(int64(a.AddressType), 10))
 	}
-	return nil
+	return n, nil
 }
 
-func (a *Address) WriteTo(w io.Writer) error {
-	_, err := w.Write([]byte{byte(a.AddressType)})
-	if err != nil {
-		return err
+func (a *Address) WriteTo(w io.Writer) (int64, error) {
+	var n int64 = 1 // ATYP byte
+	if _, err := w.Write([]byte{byte(a.AddressType)}); err != nil {
+		return 0, err
 	}
+	var addrLen int
+	var err error
 	switch a.AddressType {
 	case DomainName:
 		w.Write([]byte{byte(len(a.DomainName))})
 		_, err = w.Write([]byte(a.DomainName))
+		addrLen = 1 + len(a.DomainName) // length byte + domain
 	case IPv4:
 		_, err = w.Write(a.IP.To4())
+		addrLen = 4
 	case IPv6:
 		_, err = w.Write(a.IP.To16())
+		addrLen = 16
 	default:
-		return common.NewError("invalid ATYP " + strconv.FormatInt(int64(a.AddressType), 10))
+		return 0, common.NewError("invalid ATYP " + strconv.FormatInt(int64(a.AddressType), 10))
 	}
 	if err != nil {
-		return err
+		return 0, err
 	}
+	n += int64(addrLen)
 	port := [2]byte{}
 	binary.BigEndian.PutUint16(port[:], uint16(a.Port))
 	_, err = w.Write(port[:])
-	return err
+	n += 2
+	return n, err
 }

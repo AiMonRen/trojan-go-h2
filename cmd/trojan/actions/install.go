@@ -12,6 +12,32 @@ import (
 	"github.com/voidluo/trojan-go/cmd/trojan/menu"
 )
 
+const nginxWelcome = `<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+<style>
+    body {
+        width: 35em;
+        margin: 0 auto;
+        font-family: Tahoma, Verdana, Arial, sans-serif;
+    }
+</style>
+</head>
+<body>
+<h1>Welcome to nginx!</h1>
+<p>If you see this page, the nginx web server is successfully installed and
+working. Further configuration is required.</p>
+
+<p>For online documentation and support please refer to
+<a href="http://nginx.org/">nginx.org</a>.<br/>
+Commercial support is available at
+<a href="http://nginx.com/">nginx.com</a>.</p>
+
+<p><em>Thank you for using nginx.</em></p>
+</body>
+</html>`
+
 // InitDeployMaster 初始化部署（主节点）一键化流程
 func InitDeployMaster() {
 	// 动态生成 6 位随机字符组成 websocket 路径
@@ -21,7 +47,14 @@ func InitDeployMaster() {
 	for i := range randChars {
 		randChars[i] = letters[r.Intn(len(letters))]
 	}
-	wsPath := "/stream-v2-" + string(randChars)
+	wsPath := "/stream-" + string(randChars)
+
+	// 动态生成 8 位随机字符组成订阅混淆路径
+	subChars := make([]byte, 8)
+	for i := range subChars {
+		subChars[i] = letters[r.Intn(len(letters))]
+	}
+	subPath := "/sub-" + string(subChars)
 
 	if os.Geteuid() != 0 {
 		msg := "错误：安装操作需要 sudo 权限！"
@@ -102,8 +135,8 @@ func InitDeployMaster() {
 	}
 
 	// 6. 管理面板监听端口
-	adminPortStr := getStdin("6. 设置管理面板监听端口 (推荐 80): ", "6. Set admin port (recommended 80): ")
-	adminPort := 80
+	adminPortStr := getStdin("6. 设置管理面板监听端口 (推荐 8080): ", "6. Set admin port (recommended 8080): ")
+	adminPort := 8080
 	if adminPortStr != "" {
 		fmt.Sscanf(adminPortStr, "%d", &adminPort)
 	}
@@ -242,51 +275,159 @@ func InitDeployMaster() {
 	fmt.Println("\n[2/5] 正在生成配置文件...")
 	
 	// 代理专用配置模板 (config.yaml)
-	proxyTmpl := `run_type: server
+	proxyTmpl := `# =================================================================
+# Trojan-Go Core Proxy Configuration File (config.yaml)
+# Trojan-Go 核心代理配置文件 (config.yaml)
+# =================================================================
+
+# [Core Configuration] The run type of the service (server or client)
+# [核心配置] 服务运行类型 (server 或 client)
+run_type: server
+
+# [Core Configuration] The local IP address to listen on
+# [核心配置] 本地监听 IP 地址
 local_addr: 0.0.0.0
+
+# [Core Configuration] The local port to listen on
+# [核心配置] 本地监听端口
 local_port: {{.LocalPort}}
+
+# [Core Configuration] The destination server address to route connection (optional)
+# [核心配置] 目标代理转发目标地址（备用）
 remote_addr: 127.0.0.1
+
+# [Core Configuration] The destination server port to route connection (optional)
+# [核心配置] 目标代理转发目标端口（备用）
 remote_port: {{.AdminPort}}
 
+# [TLS Configuration] SSL settings
+# [TLS配置] SSL 证书与安全设定
 ssl:
+# [TLS Configuration] The certificate file path
+# [TLS配置] SSL 证书文件路径
   cert: {{.CertPath}}
-  key: {{.KeyPath}}
-  sni: {{.Domain}}         # 预设 of SNI 域名
-  verify: false             # 设置为 false 提高浏览器直接访问的兼容性
-  verify_hostname: false    # 设置为 false 解决 SNI 不匹配导致的协议错误
 
-  # 回落机制：将普通网页请求转发至本地 80 端口的管理后台
-  fallback_addr: 127.0.0.1
-  fallback_port: {{.AdminPort}}
-  # 备选首页：当回落目标不可用时展示的备选页面
+# [TLS Configuration] The private key file path
+# [TLS配置] SSL 私钥文件路径
+  key: {{.KeyPath}}
+
+# [TLS Configuration] The server SNI (Server Name Indication)
+# [TLS配置] 预设的 SNI 证书匹配域名
+  sni: {{.Domain}}
+
+# [TLS Configuration] Whether to verify the client cert (false to improve compatibility)
+# [TLS配置] 是否验证客户端证书（设为 false 可提高兼容性）
+  verify: false
+
+# [TLS Configuration] Whether to verify host name in certificate
+# [TLS配置] 是否验证证书中的域名匹配（防 SNI 阻断）
+  verify_hostname: false
+
+# [TLS Configuration] The fallback address of plaintext http server (uncomment to use Nginx fallback)
+# [TLS配置] 原生 Fallback 本地反代地址（如果结合 Nginx 伪装则取消下面两行注释）
+#   fallback_addr: 127.0.0.1
+# [TLS Configuration] The fallback port of plaintext http server
+# [TLS配置] 原生 Fallback 本地反代端口
+#   fallback_port: 80
+
+# [TLS Configuration] The static HTML fallback webpage when no fallback port is configured
+# [TLS配置] 无 Nginx 情况下，未认证流量直接回送的本地静态网页（字节流形式）
   plain_http_response: {{.DeployPath}}/index.html
 
-mux:                # 开启多路复用，提高小文件传输效率
+# [Multiplexing] Mux configuration
+# [多路复用] Mux 配置段，提高多小文件并发下的传输效率
+mux:
+# [Multiplexing] Whether to enable multiplexing
+# [多路复用] 是否开启多路复用
   enabled: true
+
+# [WebSocket] WebSocket transport settings
+# [WebSocket] WebSocket 传输层协议伪装设置
 websocket:
+# [WebSocket] Whether to enable WebSocket camouflage
+# [WebSocket] 是否启用 WebSocket 伪装
   enabled: true
-  # 【警告】千万不要用 /ws、/trojan 等常见词汇。用随机生成的字符串最安全。
+
+# [WebSocket] The path to listen on (Random path is recommended to bypass firewall)
+# [WebSocket] WebSocket 挂载路径（千万不要用 /ws 等常见词，模板使用随机路径）
   path: "{{.WSPath}}"
+
+# [WebSocket] The SNI host to match
+# [WebSocket] WebSocket 域名头匹配
   host: "{{.Domain}}"
+
+# [Control Plane] Web admin server settings
+# [管理控制面] Web 管理后台与订阅接口配置
 admin:
+# [Control Plane] Whether to enable admin panel server
+# [管理控制面] 是否启用 Web 管理服务
   enabled: true
+
+# [Control Plane] The login username of admin panel
+# [管理控制面] 管理面板的登录用户名
   username: "{{.User}}"
+
+# [Control Plane] The login password of admin panel
+# [管理控制面] 管理面板的登录密码
   password: "{{.Pass}}"
-  port: 0
+
+# [Control Plane] The standalone port to listen on (default 8080 to avoid nginx conflicts)
+# [管理控制面] 管理面板监听的本地独立端口（默认为 127.0.0.1 独立监听）
+  port: {{.AdminPort}}
+
+# [Control Plane] The SQLite database file path or MySQL DSN
+# [管理控制面] 存储用户与节点数据的数据库路径或 DSN 链接
   db: "{{.DbPath}}"
+
+# [Control Plane] The routing mount path of web UI
+# [管理控制面] 管理主界面的网页挂载路径，系统将强制清洗为 "/admin/"
   path: /admin
 
+# [Control Plane] The dynamic obfuscated subscription path to download clash config
+# [管理控制面] 自定义加密订阅混淆路径（主节点），系统运行后将随机自动生成
+  sub_path: "{{.SubPath}}"
+
+# [Advanced Config] The redirect URL of unauthenticated http request
+# [高级配置] 未认证的 302 外部重定向跳转地址
+#   unauth_redirect: "https://your-redirect-domain.com"
+
+# [Advanced Config] The custom mask HTML file path for standalone admin port
+# [高级配置] 独立端口收到非 admin 访问时的本地伪装网页路径
+#   mask_html_path: "{{.DeployPath}}/index.html"
+
+# [Routing Policy] Custom router settings
+# [路由策略] 自定义路由策略（如果您需要绕过局域网和国内流量可取消下面注释）
+# router:
+# [Routing Policy] Whether to enable custom router
+# [路由策略] 是否启用自定义路由分流
+#   enabled: true
+# [Routing Policy] The bypass rules list
+# [路由策略] 默认直连的域名和 IP 段
+#   bypass:
+#     - geosite:cn
+#     - geoip:private
+
+# [Logging] System logs settings
+# [系统日志] 访问和错误日志配置文件路径
 log:
-  level: 1  # 设为 1 或 0 (TRACE)
+# [Logging] Log level (0: TRACE, 1: INFO, 2: WARN, 3: ERROR)
+# [系统日志] 日志级别记录
+  level: 1
+
+# [Logging] Access log output path
+# [系统日志] 访问日志输出文件路径
   access: {{.DeployPath}}/log/trojan-go/access.log
+
+# [Logging] Error log output path
+# [系统日志] 错误日志输出文件路径
   error: {{.DeployPath}}/log/trojan-go/error.log
 `
 
 	// Web 专用配置模板 (web_config.yaml)
 	webTmpl := `# =================================================================
-# Trojan-Go Web 管理后台配置文件 (Web / 80)
+# Trojan-Go Web Management Backend Configuration (web_config.yaml)
+# Trojan-Go Web 管理后台配置文件 (web_config.yaml)
 # =================================================================
-# 此进程独立运行于 80 端口，专门处理管理面板逻辑。
 
 run_type: server
 
@@ -294,9 +435,10 @@ admin:
   enabled: true
   username: "{{.User}}"    # 面板登录用户名
   password: "{{.Pass}}"    # 面板登录密码
-  port: {{.AdminPort}}     # 服务真正在 80 端口监听
+  port: {{.AdminPort}}     # 服务真正在独立端口监听
   db: "{{.DbPath}}"        # 数据库路径或 DSN
-  path: "/"                # 面板挂载根路径
+  path: "/admin/"          # 面板挂载根路径
+  sub_path: "{{.SubPath}}" # 安全订阅下载路径
 `
 
 	os.MkdirAll(deployPath, 0755)
@@ -313,12 +455,14 @@ admin:
 	proxyContent = strings.ReplaceAll(proxyContent, "{{.DbPath}}", dbPath)
 	proxyContent = strings.ReplaceAll(proxyContent, "{{.User}}", adminUser)
 	proxyContent = strings.ReplaceAll(proxyContent, "{{.Pass}}", adminPwd)
+	proxyContent = strings.ReplaceAll(proxyContent, "{{.SubPath}}", subPath)
 
 	webContent := webTmpl
 	webContent = strings.ReplaceAll(webContent, "{{.User}}", adminUser)
 	webContent = strings.ReplaceAll(webContent, "{{.Pass}}", adminPwd)
 	webContent = strings.ReplaceAll(webContent, "{{.AdminPort}}", fmt.Sprintf("%d", adminPort))
 	webContent = strings.ReplaceAll(webContent, "{{.DbPath}}", dbPath)
+	webContent = strings.ReplaceAll(webContent, "{{.SubPath}}", subPath)
 
 	if err := os.WriteFile(configPath, []byte(proxyContent), 0644); err != nil {
 		fmt.Printf("\033[31m❌ 写入 config.yaml 失败: %v\033[0m\n", err)
@@ -329,8 +473,33 @@ admin:
 		return
 	}
 
-	// 创建内置首页
-	os.WriteFile(filepath.Join(deployPath, "index.html"), []byte("<h1>Welcome to Trojan-Go Modern Suite</h1>"), 0644)
+	// 创建内置首页 (防探测，使用逼真的标准 Nginx 测试页面)
+	nginxWelcome := `<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+<style>
+    body {
+        width: 35em;
+        margin: 0 auto;
+        font-family: Tahoma, Verdana, Arial, sans-serif;
+    }
+</style>
+</head>
+<body>
+<h1>Welcome to nginx!</h1>
+<p>If you see this page, the nginx web server is successfully installed and
+working. Further configuration is required.</p>
+
+<p>For online documentation and support please refer to
+<a href="http://nginx.org/">nginx.org</a>.<br/>
+Commercial support is available at
+<a href="http://nginx.com/">nginx.com</a>.</p>
+
+<p><em>Thank you for using nginx.</em></p>
+</body>
+</html>`
+	os.WriteFile(filepath.Join(deployPath, "index.html"), []byte(nginxWelcome), 0644)
 	fmt.Println("\033[32m✓ 配置文件已生成\033[0m")
 
 	// ─── 步骤 3: 自动安装二进制文件 ────────────────────────────
@@ -433,11 +602,14 @@ WantedBy=multi-user.target
 	}
 
 	fmt.Println("\n\033[32m=== 初始化部署成功 ! ===\033[0m")
-	fmt.Printf("1. 双服务已就绪: trojan-go (443) 和 trojan-web (80)\n")
-	fmt.Printf("2. 访问方式:\n")
-	fmt.Printf("   - https://%s/ (通过 443 回落至后台)\n", domain)
-	fmt.Printf("   - http://%s/  (直连 80 端口后台)\n", domain)
-	fmt.Printf("3. 检查状态: trojan status\n")
+	fmt.Printf("1. 双服务已就绪: trojan-go (主端口: %d) 和 trojan-web (管理端口: %d)\n", localPort, adminPort)
+	fmt.Printf("2. 安全订阅链接 (443 TLS 加密保护):\n")
+	fmt.Printf("   - https://%s%s?token=[用户UUID]\n", domain, subPath)
+	fmt.Printf("3. 管理后台访问方式 (独立端口):\n")
+	fmt.Printf("   - 本地端口转发：在客户端建立 SSH 隧道：\n")
+	fmt.Printf("     ssh -L %d:127.0.0.1:%d ubuntu@%s\n", adminPort, adminPort, domain)
+	fmt.Printf("     然后访问：http://127.0.0.1:%d/admin/\n", adminPort)
+	fmt.Printf("4. 检查状态: trojan status\n")
 }
 
 // 简单的命令执行工具
@@ -506,7 +678,7 @@ func InitDeployWorker() {
 	// 4. 主节点同步接口 URL (必填)
 	masterURL := ""
 	for {
-		masterURL = getStdin("4. 请输入主节点同步接口 URL (必填，如 https://master.com/api/node/sync): ", "4. Enter master sync URL (required): ")
+		masterURL = getStdin("4. 节点同步接口 URL (必填，如 https://master.com/admin/api/node/sync): ", "4. Enter master sync URL (required): ")
 		if masterURL != "" {
 			break
 		}
@@ -524,26 +696,25 @@ func InitDeployWorker() {
 	}
 
 	// 6. 是否启用 WebSocket 伪装
+	// 默认先生成一个随机的 wsPath
+	const wsLetters = "abcdefghijklmnopqrstuvwxyz0123456789"
+	wsRandChars := make([]byte, 6)
+	for i := range wsRandChars {
+		wsRandChars[i] = wsLetters[r.Intn(len(wsLetters))]
+	}
+	wsPath := "/stream-" + string(wsRandChars)
+
 	wsEnabled := false
-	wsPath := ""
 	wsAns := getStdin("6. 是否启用 WebSocket 伪装？(y/n, 默认 n): ", "6. Enable WebSocket masquerade? (y/n, default n): ")
 	if wsAns == "y" || wsAns == "Y" {
 		wsEnabled = true
-		for {
-			wsPath = getStdin("   请输入 WebSocket 伪装路径 (回车自动随机生成): ", "   Enter WebSocket path (enter for random): ")
-			if wsPath == "" {
-				const letters = "abcdefghijklmnopqrstuvwxyz0123456789"
-				randChars := make([]byte, 6)
-				for i := range randChars {
-					randChars[i] = letters[r.Intn(len(letters))]
-				}
-				wsPath = "/stream-v2-" + string(randChars)
-				break
+		inputPath := getStdin("   请输入 WebSocket 伪装路径 (直接回车使用随机路径): ", "   Enter WebSocket path (enter for random): ")
+		inputPath = strings.TrimSpace(inputPath)
+		if inputPath != "" {
+			if !strings.HasPrefix(inputPath, "/") {
+				inputPath = "/" + inputPath
 			}
-			if !strings.HasPrefix(wsPath, "/") {
-				wsPath = "/" + wsPath
-			}
-			break
+			wsPath = inputPath
 		}
 	}
 
@@ -560,14 +731,21 @@ func InitDeployWorker() {
 	}
 
 	// 9. 管理面板监听端口
-	adminPortStr := getStdin("9. 设置管理面板监听端口 (推荐 80): ", "9. Set admin port (recommended 80): ")
-	adminPort := 80
+	adminPortStr := getStdin("9. 设置管理面板监听端口 (推荐 8080): ", "9. Set admin port (recommended 8080): ")
+	adminPort := 8080
 	if adminPortStr != "" {
 		fmt.Sscanf(adminPortStr, "%d", &adminPort)
 	}
 
 	// SQLite 作为本地缓存库，路径定为 deployPath/trojan-go.db
 	dbPath := filepath.Join(deployPath, "trojan-go.db")
+
+	// 10. 动态生成 8 位随机字符组成订阅混淆路径
+	subChars := make([]byte, 8)
+	for i := range subChars {
+		subChars[i] = wsLetters[r.Intn(len(wsLetters))]
+	}
+	subPath := "/sub-" + string(subChars)
 
 	// 开始执行操作
 	fmt.Println("\n\033[36m=== 开始执行从节点初始化部署 ===\033[0m")
@@ -632,6 +810,7 @@ admin:
   port: 0
   db: "%s"
   path: /admin
+  sub_path: "%s"
 
 node:
   enabled: true
@@ -643,7 +822,7 @@ log:
   level: 1
   access: %s/log/trojan-go/access.log
   error: %s/log/trojan-go/error.log
-`, localPort, adminPort, crtPath, keyPath, domain, adminPort, deployPath, wsEnabledStr, wsPath, domain, adminUser, adminPwd, dbPath, masterURL, nodeSecret, deployPath, deployPath)
+`, localPort, adminPort, crtPath, keyPath, domain, adminPort, deployPath, wsEnabledStr, wsPath, domain, adminUser, adminPwd, dbPath, subPath, masterURL, nodeSecret, deployPath, deployPath)
 
 	// 从节点网页配置
 	webContent := fmt.Sprintf(`# =================================================================
@@ -657,10 +836,11 @@ admin:
   password: "%s"
   port: %d
   db: "%s"
-  path: "/"
+  path: "/admin/"
+  sub_path: "%s"
 node:
   enabled: true
-`, adminUser, adminPwd, adminPort, dbPath)
+`, adminUser, adminPwd, adminPort, dbPath, subPath)
 
 	os.MkdirAll(deployPath, 0755)
 	if err := os.WriteFile(configPath, []byte(proxyContent), 0644); err != nil {
@@ -672,8 +852,8 @@ node:
 		return
 	}
 
-	// 创建内置首页
-	os.WriteFile(filepath.Join(deployPath, "index.html"), []byte("<h1>Welcome to Trojan-Go Worker Node</h1>"), 0644)
+	// 创建内置首页 (防探测，使用逼真标准 Nginx 测试页面)
+	os.WriteFile(filepath.Join(deployPath, "index.html"), []byte(nginxWelcome), 0644)
 	fmt.Println("\033[32m✓ 配置文件已生成\033[0m")
 
 	// ─── 步骤 3: 自动安装二进制文件 ────────────────────────────

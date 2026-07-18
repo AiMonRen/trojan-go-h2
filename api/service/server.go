@@ -43,10 +43,12 @@ func (s *ServerAPI) GetUsers(stream TrojanServerService_GetUsersServer) error {
 		}
 		valid, user := s.auth.AuthUser(req.User.Hash)
 		if !valid {
-			stream.Send(&GetUsersResponse{
+			if err := stream.Send(&GetUsersResponse{
 				Success: false,
 				Info:    "invalid user: " + req.User.Hash,
-			})
+			}); err != nil {
+				return err
+			}
 			continue
 		}
 		downloadTraffic, uploadTraffic := user.GetTraffic()
@@ -57,7 +59,7 @@ func (s *ServerAPI) GetUsers(stream TrojanServerService_GetUsersServer) error {
 		err = stream.Send(&GetUsersResponse{
 			Success: true,
 			Status: &UserStatus{
-				User: req.User,
+				User: &User{Hash: req.User.Hash},
 				TrafficTotal: &Traffic{
 					UploadTraffic:   uploadTraffic,
 					DownloadTraffic: downloadTraffic,

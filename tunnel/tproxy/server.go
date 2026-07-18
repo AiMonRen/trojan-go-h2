@@ -41,7 +41,7 @@ func (s *Server) AcceptConn(tunnel.Tunnel) (tunnel.Conn, error) {
 		select {
 		case <-s.ctx.Done():
 		default:
-			log.Fatal(common.NewError("tproxy failed to accept connection").Base(err))
+			log.Error(common.NewError("tproxy failed to accept connection").Base(err))
 		}
 		return nil, common.NewError("tproxy failed to accept conn")
 	}
@@ -76,16 +76,20 @@ func (s *Server) packetDispatchLoop() {
 				select {
 				case <-s.ctx.Done():
 				default:
-					log.Fatal(common.NewError("tproxy failed to read from udp socket").Base(err))
+					log.Error(common.NewError("tproxy failed to read from udp socket").Base(err))
 				}
 				s.Close()
 				return
 			}
 			log.Debug("udp packet from", src, "metadata", dst, "size", n)
-			packetQueue <- &tproxyPacketInfo{
+			select {
+			case packetQueue <- &tproxyPacketInfo{
 				src:     src,
 				dst:     dst,
 				payload: buf[:n],
+			}:
+			case <-s.ctx.Done():
+				return
 			}
 		}
 	}()
@@ -119,7 +123,12 @@ func (s *Server) packetDispatchLoop() {
 			s.mappingLock.Unlock()
 
 			log.Info("new tproxy udp session from", info.src.String(), "metadata", info.dst.String())
-			s.packetChan <- conn
+			select {
+			case s.packetChan <- conn:
+			case <-s.ctx.Done():
+				_ = conn.Close()
+				return
+			}
 
 			go func(conn *PacketConn) {
 				defer conn.Close()

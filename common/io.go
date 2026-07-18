@@ -20,22 +20,35 @@ type RewindReader struct {
 
 func (r *RewindReader) Read(p []byte) (int, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	if r.rewound {
 		if len(r.buf) > r.bufReadIdx {
 			n := copy(p, r.buf[r.bufReadIdx:])
 			r.bufReadIdx += n
+			r.mu.Unlock()
 			return n, nil
 		}
 		r.rewound = false // all buffering content has been read
 	}
+	buffering := r.buffering
+	r.mu.Unlock()
+
+	// 真正执行网络/底层的耗时阻塞读时，完全释放互斥锁
 	n, err := r.rawReader.Read(p)
-	if r.buffering {
-		r.buf = append(r.buf, p[:n]...)
-		if len(r.buf) > r.bufferSize*2 {
-			log.Debug("read too many bytes!")
+
+	if buffering && n > 0 {
+		r.mu.Lock()
+		// 重新确认结构体真实缓冲状态，防止在 rawReader.Read 阻塞期间被 StopBuffering() 并发调用
+		if r.buffering {
+			if len(r.buf)+n > 1024*1024 {
+				r.mu.Unlock()
+				return n, NewError("RewindReader buffer size exceeded 1MB limit")
+			}
+			r.buf = append(r.buf, p[:n]...)
+			if len(r.buf) > r.bufferSize*2 {
+				log.Debug("read too many bytes!")
+			}
 		}
+		r.mu.Unlock()
 	}
 	return n, err
 }
@@ -47,20 +60,26 @@ func (r *RewindReader) ReadByte() (byte, error) {
 }
 
 func (r *RewindReader) Discard(n int) (int, error) {
-	buf := [128]byte{}
-	if n < 128 {
-		return r.Read(buf[:n])
+	if n < 0 {
+		return 0, io.ErrUnexpectedEOF
 	}
-	for discarded := 0; discarded+128 < n; discarded += 128 {
-		_, err := r.Read(buf[:])
+	buf := [128]byte{}
+	discarded := 0
+	for discarded < n {
+		want := n - discarded
+		if want > len(buf) {
+			want = len(buf)
+		}
+		read, err := r.Read(buf[:want])
+		discarded += read
 		if err != nil {
 			return discarded, err
 		}
+		if read == 0 {
+			return discarded, io.ErrUnexpectedEOF
+		}
 	}
-	if rest := n % 128; rest != 0 {
-		return r.Read(buf[:rest])
-	}
-	return n, nil
+	return discarded, nil
 }
 
 func (r *RewindReader) Rewind() {

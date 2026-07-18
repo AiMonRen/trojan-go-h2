@@ -39,6 +39,7 @@ type Node struct {
 	UpdatedAt     time.Time  `json:"updated_at"`
 	Name          string     `gorm:"size:255;not null" json:"name"`       // 节点名称，如 "香港 01"
 	Address       string     `gorm:"size:255;not null" json:"address"`    // 节点对外地址 (域名/IP)
+	DetectedIP    string     `gorm:"size:64" json:"detected_ip"`          // 自动检测到的心跳来源 IP
 	Port          int        `gorm:"default:443" json:"port"`             // 对外端口
 	Secret        string     `gorm:"size:255;not null;uniqueIndex" json:"secret"` // 节点通信密钥
 	Status        int        `gorm:"default:0" json:"status"`             // 0: 离线, 1: 在线

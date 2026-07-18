@@ -51,14 +51,20 @@ func (s *Server) acceptConnLoop() {
 		if buf[0] == 5 && s.nextSocks {
 			s.socksLock.RUnlock()
 			log.Debug("socks5 connection")
-			s.socksConn <- &freedom.Conn{
-				Conn: rewindConn,
+			select {
+			case s.socksConn <- &freedom.Conn{Conn: rewindConn}:
+			case <-s.ctx.Done():
+				_ = rewindConn.Close()
+				return
 			}
 		} else {
 			s.socksLock.RUnlock()
 			log.Debug("http connection")
-			s.httpConn <- &freedom.Conn{
-				Conn: rewindConn,
+			select {
+			case s.httpConn <- &freedom.Conn{Conn: rewindConn}:
+			case <-s.ctx.Done():
+				_ = rewindConn.Close()
+				return
 			}
 		}
 	}

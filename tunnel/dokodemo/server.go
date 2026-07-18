@@ -36,7 +36,7 @@ func (s *Server) dispatchLoop() {
 			select {
 			case <-s.ctx.Done():
 			default:
-				log.Fatal(common.NewError("dokodemo failed to read from udp socket").Base(err))
+				log.Error(common.NewError("dokodemo failed to read from udp socket").Base(err))
 			}
 			return
 		}
@@ -60,8 +60,18 @@ func (s *Server) dispatchLoop() {
 		s.mapping[addr.String()] = conn
 		s.mappingLock.Unlock()
 
-		conn.input <- buf[:n]
-		s.packetChan <- conn
+		select {
+		case conn.input <- buf[:n]:
+		case <-s.ctx.Done():
+			_ = conn.Close()
+			return
+		}
+		select {
+		case s.packetChan <- conn:
+		case <-s.ctx.Done():
+			_ = conn.Close()
+			return
+		}
 
 		go func(conn *PacketConn) {
 			for {
@@ -91,14 +101,12 @@ func (s *Server) dispatchLoop() {
 func (s *Server) AcceptConn(tunnel.Tunnel) (tunnel.Conn, error) {
 	conn, err := s.tcpListener.Accept()
 	if err != nil {
-		log.Fatal(common.NewError("dokodemo failed to accept connection").Base(err))
+		if s.ctx.Err() != nil {
+			return nil, common.NewError("dokodemo server closed")
+		}
+		return nil, common.NewError("dokodemo failed to accept connection").Base(err)
 	}
-	return &Conn{
-		Conn: conn,
-		targetMetadata: &tunnel.Metadata{
-			Address: s.targetAddr,
-		},
-	}, nil
+	return &Conn{Conn: conn, targetMetadata: &tunnel.Metadata{Address: s.targetAddr}}, nil
 }
 
 func (s *Server) AcceptPacket(tunnel.Tunnel) (tunnel.PacketConn, error) {

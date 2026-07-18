@@ -14,19 +14,22 @@ func main() {
 		actions.SetDBPath(dbPath)
 	}
 
-	// ─── 二级菜单：trojan 管理 ────────────────────────────
-	trojanMenu := &menu.Menu{
-		Title: menu.L{"trojan管理", "Trojan Management"},
+	// ─── 二级菜单：服务运维与部署 ────────────────────────────
+	opsMenu := &menu.Menu{
+		Title: menu.L{"服务运维与部署", "Service Ops & Deployment"},
 		Items: []menu.Item{
 			{Label: menu.L{"启动服务", "Start Service"}, Action: actions.TrojanStart},
 			{Label: menu.L{"停止服务", "Stop Service"}, Action: actions.TrojanStop},
 			{Label: menu.L{"重启服务", "Restart Service"}, Action: actions.TrojanRestart},
 			{Label: menu.L{"查看状态", "Check Status"}, Action: actions.TrojanStatus},
+			{Label: menu.L{"申请 SSL 证书", "Apply SSL Certificate"}, Action: actions.ApplyCert},
+			{Label: menu.L{"初始化一键部署（主节点）", "Initial Deployment (Master Node)"}, Action: actions.InitDeployMaster},
+			{Label: menu.L{"初始化一键部署（从节点）", "Initial Deployment (Worker Node)"}, Action: actions.InitDeployWorker},
 		},
 	}
 
-	// ─── 二级菜单：用户管理 ────────────────────────────────
-	userMenu := &menu.Menu{
+	// ─── 二级子菜单：用户管理与节点管理 ──────────────────────
+	userSubMenu := &menu.Menu{
 		Title: menu.L{"用户管理", "User Management"},
 		Items: []menu.Item{
 			{Label: menu.L{"查看用户列表", "List Users"}, Action: actions.UserList},
@@ -35,30 +38,33 @@ func main() {
 		},
 	}
 
-	// ─── 二级菜单：安装管理 ────────────────────────────────
-	installMenu := &menu.Menu{
-		Title: menu.L{"安装管理", "Installation Management"},
+	nodeSubMenu := &menu.Menu{
+		Title: menu.L{"节点管理", "Node Management"},
 		Items: []menu.Item{
-			{Label: menu.L{"申请SSL证书", "Apply SSL Certificate"}, Action: actions.ApplyCert},
-			{Label: menu.L{"初始化部署（主节点）", "Initial Deployment (Master Node)"}, Action: actions.InitDeployMaster},
-			{Label: menu.L{"初始化部署（从节点）", "Initial Deployment (Worker Node)"}, Action: actions.InitDeployWorker},
+			{Label: menu.L{"查看节点列表", "List Nodes"}, Action: actions.NodeList},
+			{Label: menu.L{"添加节点", "Add Node"}, Action: actions.NodeAdd},
+			{Label: menu.L{"修改节点", "Modify Node"}, Action: actions.NodeModify},
+			{Label: menu.L{"删除节点", "Delete Node"}, Action: actions.NodeDelete},
+			{Label: menu.L{"查看从节点同步 URL", "Show Node Sync URL"}, Action: actions.ShowNodeSyncURL},
 		},
 	}
 
-	// ─── 二级菜单：web 管理 ────────────────────────────────
-	webMenu := &menu.Menu{
-		Title: menu.L{"web管理", "Web Management"},
+	// ─── 二级菜单：代理数据管理 ────────────────────────────
+	dataMenu := &menu.Menu{
+		Title: menu.L{"代理数据管理", "Proxy Data Admin"},
 		Items: []menu.Item{
-			{Label: menu.L{"修改管理员密码", "Change Admin Password"}, Action: actions.ChangeAdminPassword},
+			{Label: menu.L{"用户管理", "User Management"}, Sub: userSubMenu},
+			{Label: menu.L{"节点管理", "Node Management"}, Sub: nodeSubMenu},
 		},
 	}
 
-	// ─── 二级菜单：查看配置 ────────────────────────────────
+	// ─── 二级菜单：配置与安全管理 ──────────────────────────
 	configMenu := &menu.Menu{
-		Title: menu.L{"查看配置", "View Configuration"},
+		Title: menu.L{"配置与安全管理", "Config & Security"},
 		Items: []menu.Item{
 			{Label: menu.L{"显示当前配置", "Show Current Config"}, Action: actions.ShowConfig},
 			{Label: menu.L{"切换 WebSocket 伪装", "Toggle WS Camouflage"}, Action: actions.ToggleWebSocket},
+			{Label: menu.L{"修改管理员密码", "Change Admin Password"}, Action: actions.ChangeAdminPassword},
 		},
 	}
 
@@ -66,11 +72,9 @@ func main() {
 	root := &menu.Menu{
 		Title: menu.L{"主菜单", "Main Menu"},
 		Items: []menu.Item{
-			{Label: menu.L{"trojan管理", "Trojan Management"}, Sub: trojanMenu},
-			{Label: menu.L{"用户管理", "User Management"}, Sub: userMenu},
-			{Label: menu.L{"安装管理", "Installation"}, Sub: installMenu},
-			{Label: menu.L{"web管理", "Web Admin"}, Sub: webMenu},
-			{Label: menu.L{"查看配置", "Config Info"}, Sub: configMenu},
+			{Label: menu.L{"服务运维与部署", "Service Ops & Deployment"}, Sub: opsMenu},
+			{Label: menu.L{"代理数据管理", "Proxy Data Admin"}, Sub: dataMenu},
+			{Label: menu.L{"配置与安全管理", "Config & Security"}, Sub: configMenu},
 			{Label: menu.L{"切换语言 / Toggle Language", "Toggle Language / 切换语言"}, Action: func() {
 				if menu.CurrentLang == menu.CN {
 					menu.CurrentLang = menu.EN

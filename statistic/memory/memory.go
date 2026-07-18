@@ -217,7 +217,15 @@ func (a *Authenticator) ListUsers() []statistic.User {
 }
 
 func (a *Authenticator) Close() error {
-	return nil
+	var firstErr error
+	a.users.Range(func(key, value any) bool {
+		if err := value.(*User).Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		a.users.Delete(key)
+		return true
+	})
+	return firstErr
 }
 
 func NewAuthenticator(ctx context.Context) (statistic.Authenticator, error) {

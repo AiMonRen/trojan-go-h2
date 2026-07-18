@@ -2,6 +2,7 @@ package config
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/voidluo/trojan-go/common"
@@ -58,5 +59,37 @@ field3:
 	c := FromContext(ctx, "test").(*TestStruct)
 	if c.Field1 != "012345678" || c.Field2 != true || c.Field3[0].Field1 != "test" {
 		t.Fail()
+	}
+}
+
+type AdminConfig struct {
+	Path    string
+	SubPath string
+}
+
+func adminCreator() any {
+	return &AdminConfig{}
+}
+
+func TestSubPathAutoGeneration(t *testing.T) {
+	RegisterConfigCreator("AdminConfig", adminCreator)
+	data := []byte(`{}`)
+	ctx, err := WithJSONConfig(context.Background(), data)
+	if err != nil {
+		t.Fatalf("Failed to parse config: %v", err)
+	}
+	c := FromContext(ctx, "AdminConfig").(*AdminConfig)
+
+	// 验证 Path 是否被强制清洗为 "/admin/"
+	if c.Path != "/admin/" {
+		t.Errorf("Path expected /admin/, got %s", c.Path)
+	}
+
+	// 验证 SubPath 是否被自动生成且符合前缀 /sub-
+	if !strings.HasPrefix(c.SubPath, "/sub-") {
+		t.Errorf("SubPath expected prefix /sub-, got %s", c.SubPath)
+	}
+	if len(c.SubPath) != 13 { // "/sub-" (5 chars) + 8 chars random
+		t.Errorf("SubPath expected length 13, got %d (value: %s)", len(c.SubPath), c.SubPath)
 	}
 }

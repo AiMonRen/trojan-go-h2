@@ -87,7 +87,7 @@ func (s *Server) handshake(conn net.Conn) (*Conn, error) {
 	}
 
 	addr := new(tunnel.Address)
-	if err := addr.ReadFrom(conn); err != nil {
+	if _, err := addr.ReadFrom(conn); err != nil {
 		return nil, err
 	}
 
@@ -107,8 +107,9 @@ func (s *Server) connect(conn net.Conn) error {
 
 func (s *Server) associate(conn net.Conn, addr *tunnel.Address) error {
 	buf := bytes.NewBuffer([]byte{0x05, 0x00, 0x00})
-	common.Must(addr.WriteTo(buf))
-	_, err := conn.Write(buf.Bytes())
+	_, err := addr.WriteTo(buf)
+	common.Must(err)
+	_, err = conn.Write(buf.Bytes())
 	return err
 }
 
@@ -146,7 +147,8 @@ func (s *Server) packetDispatchLoop() {
 					case info := <-conn.output:
 						buf := bytes.NewBuffer(make([]byte, 0, MaxPacketSize))
 						buf.Write([]byte{0, 0, 0}) // RSV, FRAG
-						common.Must(info.metadata.Address.WriteTo(buf))
+						_, err = info.metadata.Address.WriteTo(buf)
+						common.Must(err)
 						buf.Write(info.payload)
 						_, err := s.listenPacketConn.WriteTo(buf.Bytes(), conn.src)
 						if err != nil {
@@ -171,12 +173,17 @@ func (s *Server) packetDispatchLoop() {
 			s.mapping[src.String()] = conn
 			s.mappingLock.Unlock()
 
-			s.packetChan <- conn
+			select {
+			case s.packetChan <- conn:
+			case <-s.ctx.Done():
+				_ = conn.Close()
+				return
+			}
 			log.Info("socks new udp session from", src)
 		}
 		r := bytes.NewBuffer(buf[3:n])
 		address := new(tunnel.Address)
-		if err := address.ReadFrom(r); err != nil {
+		if _, err := address.ReadFrom(r); err != nil {
 			log.Error(common.NewError("socks failed to parse incoming packet").Base(err))
 			continue
 		}
@@ -216,7 +223,11 @@ func (s *Server) acceptLoop() {
 					newConn.Close()
 					return
 				}
-				s.connChan <- newConn
+				select {
+				case s.connChan <- newConn:
+				case <-s.ctx.Done():
+					_ = newConn.Close()
+				}
 				return
 			case Associate:
 				defer newConn.Close()

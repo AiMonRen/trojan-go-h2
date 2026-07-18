@@ -20,5 +20,6 @@ func PutBuffer(buf []byte) {
 	if len(buf) != BufferSize {
 		return
 	}
+	clear(buf[:min(len(buf), 2048)])
 	pool.Put(buf)
 }

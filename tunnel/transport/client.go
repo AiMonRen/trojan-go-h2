@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 
 	"github.com/voidluo/trojan-go/common"
@@ -71,6 +72,17 @@ func NewClient(ctx context.Context, _ tunnel.Client) (*Client, error) {
 			serverAddress = tunnel.NewAddressFromHostPort("tcp", cfg.RemoteHost, cfg.RemotePort)
 			log.Debug("plugin address", serverAddress.String())
 			log.Debug("plugin env", cfg.TransportPlugin.Env)
+
+			if os.Getenv("TROJAN_GO_ALLOW_ANY_PLUGIN") != "1" {
+				cmdName := filepath.Base(cfg.TransportPlugin.Command)
+				allowedPlugins := map[string]bool{
+					"v2ray-plugin": true, "obfs-local": true, "go-shadowsocks2": true,
+					"v2ray-plugin.exe": true, "obfs-local.exe": true, "go-shadowsocks2.exe": true,
+				}
+				if !allowedPlugins[cmdName] {
+					return nil, common.NewError("transport plugin not in whitelist: " + cmdName)
+				}
+			}
 
 			cmd = exec.Command(cfg.TransportPlugin.Command, cfg.TransportPlugin.Arg...)
 			cmd.Env = append(cmd.Env, cfg.TransportPlugin.Env...)

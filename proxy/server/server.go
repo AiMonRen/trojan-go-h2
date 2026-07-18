@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 
+	"github.com/voidluo/trojan-go/common"
 	"github.com/voidluo/trojan-go/config"
 	"github.com/voidluo/trojan-go/proxy"
 	"github.com/voidluo/trojan-go/tunnel/freedom"
@@ -20,7 +21,14 @@ const Name = "SERVER"
 
 func init() {
 	proxy.RegisterProxyCreator(Name, func(ctx context.Context) (*proxy.Proxy, error) {
-		cfg := config.FromContext(ctx, Name).(*Config)
+		cfgAny := config.FromContext(ctx, Name)
+		if cfgAny == nil {
+			return nil, common.NewError("server configuration not found")
+		}
+		cfg, ok := cfgAny.(*Config)
+		if !ok {
+			return nil, common.NewError("invalid server configuration type")
+		}
 		ctx, cancel := context.WithCancel(ctx)
 		transportServer, err := transport.NewServer(ctx, nil)
 		if err != nil {

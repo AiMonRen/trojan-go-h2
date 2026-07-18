@@ -2,6 +2,7 @@ package trojan
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -96,7 +97,7 @@ func (c *InboundConn) Auth() error {
 	}
 
 	c.metadata = &tunnel.Metadata{}
-	if err := c.metadata.ReadFrom(c.Conn); err != nil {
+	if _, err := c.metadata.ReadFrom(c.Conn); err != nil {
 		return err
 	}
 
@@ -128,12 +129,16 @@ func (s *Server) Close() error {
 func (s *Server) acceptLoop() {
 	for {
 		conn, err := s.underlay.AcceptConn(&Tunnel{})
-		if err != nil { // Closing
+		if err != nil {
 			log.Error(common.NewError("trojan failed to accept conn").Base(err))
 			select {
 			case <-s.ctx.Done():
 				return
 			default:
+			}
+			// 底层 Listener 已关闭（如 net.ErrClosed），退出循环防止无效重试
+			if errors.Is(err, net.ErrClosed) {
+				return
 			}
 			continue
 		}
@@ -166,23 +171,39 @@ func (s *Server) acceptLoop() {
 			switch inboundConn.metadata.Command {
 			case Connect:
 				if inboundConn.metadata.DomainName == "MUX_CONN" {
-					s.muxChan <- inboundConn
-					log.Debug("mux(r) connection")
+					select {
+					case s.muxChan <- inboundConn:
+						log.Debug("mux(r) connection")
+					case <-s.ctx.Done():
+						inboundConn.Close()
+					}
 				} else {
-					s.connChan <- inboundConn
-					log.Info("user", inboundConn.hash, "from", inboundConn.Conn.RemoteAddr(), "proxied to", inboundConn.metadata.Address)
+					select {
+					case s.connChan <- inboundConn:
+						log.Info("user", inboundConn.hash, "from", inboundConn.Conn.RemoteAddr(), "proxied to", inboundConn.metadata.Address)
+					case <-s.ctx.Done():
+						inboundConn.Close()
+					}
 				}
 
 			case Associate:
-				s.packetChan <- &PacketConn{
-					Conn: inboundConn,
+				pc := &PacketConn{Conn: inboundConn}
+				select {
+				case s.packetChan <- pc:
+					log.Info("user", inboundConn.hash, "from", inboundConn.Conn.RemoteAddr(), "proxied(udp) to", inboundConn.metadata.Address)
+				case <-s.ctx.Done():
+					inboundConn.Close()
 				}
-				log.Info("user", inboundConn.hash, "from", inboundConn.Conn.RemoteAddr(), "proxied(udp) to", inboundConn.metadata.Address)
 			case Mux:
-				s.muxChan <- inboundConn
-				log.Info("user", inboundConn.hash, "from", inboundConn.Conn.RemoteAddr(), "mux connection")
+				select {
+				case s.muxChan <- inboundConn:
+					log.Info("user", inboundConn.hash, "from", inboundConn.Conn.RemoteAddr(), "mux connection")
+				case <-s.ctx.Done():
+					inboundConn.Close()
+				}
 			default:
 				log.Error(common.NewError(fmt.Sprintf("unknown trojan command %d", inboundConn.metadata.Command)))
+				inboundConn.Close()
 			}
 		}(conn)
 	}
@@ -217,7 +238,14 @@ func (s *Server) AcceptPacket(tunnel.Tunnel) (tunnel.PacketConn, error) {
 }
 
 func NewServer(ctx context.Context, underlay tunnel.Server) (*Server, error) {
-	cfg := config.FromContext(ctx, Name).(*Config)
+	cfgAny := config.FromContext(ctx, Name)
+	if cfgAny == nil {
+		return nil, common.NewError("trojan server configuration not found")
+	}
+	cfg, ok := cfgAny.(*Config)
+	if !ok {
+		return nil, common.NewError("invalid trojan server configuration type")
+	}
 	ctx, cancel := context.WithCancel(ctx)
 
 	// TODO replace this dirty code

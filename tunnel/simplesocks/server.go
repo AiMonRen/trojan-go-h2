@@ -37,22 +37,27 @@ func (s *Server) acceptLoop() {
 			continue
 		}
 		metadata := new(tunnel.Metadata)
-		if err := metadata.ReadFrom(conn); err != nil {
+		if _, err := metadata.ReadFrom(conn); err != nil {
 			log.Error(common.NewError("simplesocks server faield to read header").Base(err))
 			conn.Close()
 			continue
 		}
 		switch metadata.Command {
 		case Connect:
-			s.connChan <- &Conn{
-				metadata: metadata,
-				Conn:     conn,
+			inbound := &Conn{metadata: metadata, Conn: conn}
+			select {
+			case s.connChan <- inbound:
+			case <-s.ctx.Done():
+				_ = inbound.Close()
+				return
 			}
 		case Associate:
-			s.packetChan <- &PacketConn{
-				PacketConn: trojan.PacketConn{
-					Conn: conn,
-				},
+			packetConn := &PacketConn{PacketConn: trojan.PacketConn{Conn: conn}}
+			select {
+			case s.packetChan <- packetConn:
+			case <-s.ctx.Done():
+				_ = packetConn.Close()
+				return
 			}
 		default:
 			log.Error(common.NewError(fmt.Sprintf("simplesocks unknown command %d", metadata.Command)))

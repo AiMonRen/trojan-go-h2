@@ -8,14 +8,32 @@ BUILD_DIR := build
 LDFLAGS := -s -w -buildid= -X $(PACKAGE_NAME)/version.Version=$(VERSION) -X $(PACKAGE_NAME)/version.Commit=$(COMMIT)
 GOBUILD := CGO_ENABLED=0 go build -tags "full" -trimpath -ldflags="$(LDFLAGS)"
 
-.PHONY: all trojan-go trojan clean install
+.PHONY: all trojan-go trojan clean install test test-race test-cover test-scenario
 
 all: trojan-go trojan
 
 clean:
 	rm -rf $(BUILD_DIR)
+	rm -f coverage.out coverage.html
 
-# 编译核心代理引擎 (含内置 Web 管理面板)
+# ========== 测试 ==========
+
+test:
+	go test -count=1 ./...
+
+test-race:
+	CGO_ENABLED=1 go test -race -count=1 ./...
+
+test-cover:
+	go test -count=1 -coverprofile=coverage.out -coverpkg=./... ./...
+	go tool cover -func=coverage.out | grep total
+	go tool cover -html=coverage.out -o coverage.html
+	@echo "Coverage HTML: coverage.html"
+
+test-scenario:
+	go test -count=1 -v ./test/scenario/...
+
+# ========== 编译 ==========
 trojan-go:
 	mkdir -p $(BUILD_DIR)/linux-amd64
 	GOOS=linux GOARCH=amd64 $(GOBUILD) -o $(BUILD_DIR)/linux-amd64/$(NAME) ./cmd/trojan-go
