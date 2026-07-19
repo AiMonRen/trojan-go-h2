@@ -113,9 +113,20 @@ func (c *Client) newMuxClient() (*smuxClientInfo, error) {
 	}
 	conn = newStickyConn(conn)
 
-	smuxConfig := smux.DefaultConfig()
-	// smuxConfig.KeepAliveDisabled = true
-	client, _ := smux.Client(conn, smuxConfig)
+	smuxConfig := &smux.Config{
+		Version:           2,                    // v2: byte-based flow control, better for bulk transfers
+		KeepAliveInterval: 15 * time.Second,     // default 10s — reduced heartbeat frequency
+		KeepAliveTimeout:  45 * time.Second,     // default 30s
+		KeepAliveDisabled: false,
+		MaxFrameSize:      32768,                // 32KB frames
+		MaxReceiveBuffer:  4 * 1024 * 1024,     // 4MB receive buffer (default 4MB in v2)
+		MaxStreamBuffer:   1 * 1024 * 1024,     // 1MB per-stream buffer
+	}
+	client, err := smux.Client(conn, smuxConfig)
+	if err != nil {
+		conn.Close()
+		return nil, common.NewError("mux failed to create smux client").Base(err)
+	}
 	info := &smuxClientInfo{
 		client:         client,
 		underlayConn:   conn,

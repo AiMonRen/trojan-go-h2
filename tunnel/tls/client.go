@@ -20,6 +20,12 @@ import (
 	"github.com/voidluo/trojan-go/tunnel/transport"
 )
 
+// globalSessionCache is a process-wide TLS session cache shared across all client
+// connections. This allows TLS session resumption (tickets / session IDs) so
+// subsequent connections to the same server skip the full handshake and save
+// 1-2 RTTs on high-latency links.
+var globalSessionCache = tls.NewLRUClientSessionCache(128)
+
 // Client is a tls client
 type Client struct {
 	verify        bool
@@ -74,6 +80,7 @@ func (c *Client) DialConn(_ *tunnel.Address, overlay tunnel.Tunnel) (tunnel.Conn
 		KeyLogWriter:           c.keyLogger,
 		CipherSuites:           c.cipher,
 		SessionTicketsDisabled: !c.sessionTicket,
+		ClientSessionCache:     globalSessionCache, // process-wide session reuse
 	})
 	err = tlsConn.Handshake()
 	if err != nil {

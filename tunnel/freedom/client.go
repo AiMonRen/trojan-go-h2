@@ -58,6 +58,10 @@ func (c *Client) DialConn(addr *tunnel.Address, _ tunnel.Tunnel) (tunnel.Conn, e
 
 	tcpConn.(*net.TCPConn).SetKeepAlive(c.keepAlive)
 	tcpConn.(*net.TCPConn).SetNoDelay(c.noDelay)
+	// Enlarge socket buffers to improve throughput on high-bandwidth or high-latency links.
+	// The OS may silently clamp these to the system maximum (net.core.rmem_max / wmem_max).
+	tcpConn.(*net.TCPConn).SetReadBuffer(256 * 1024)
+	tcpConn.(*net.TCPConn).SetWriteBuffer(256 * 1024)
 	return &Conn{
 		Conn: tcpConn,
 	}, nil

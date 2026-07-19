@@ -2,6 +2,7 @@ package mux
 
 import (
 	"context"
+	"time"
 
 	"github.com/xtaci/smux"
 
@@ -31,8 +32,15 @@ func (s *Server) acceptConnWorker() {
 			continue
 		}
 		go func(conn tunnel.Conn) {
-			smuxConfig := smux.DefaultConfig()
-			// smuxConfig.KeepAliveDisabled = true
+			smuxConfig := &smux.Config{
+				Version:           2,
+				KeepAliveInterval: 15 * time.Second,
+				KeepAliveTimeout:  45 * time.Second,
+				KeepAliveDisabled: false,
+				MaxFrameSize:      32768,
+				MaxReceiveBuffer:  4 * 1024 * 1024,
+				MaxStreamBuffer:   1 * 1024 * 1024,
+			}
 			smuxSession, err := smux.Server(conn, smuxConfig)
 			if err != nil {
 				log.Error(err)

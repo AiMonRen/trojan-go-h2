@@ -40,6 +40,7 @@ type OutboundConn struct {
 	metadata          *tunnel.Metadata
 	user              statistic.User
 	headerWrittenOnce sync.Once
+	headerSent        chan struct{} // closed once the trojan header has been flushed
 	net.Conn
 }
 
@@ -64,6 +65,7 @@ func (c *OutboundConn) WriteHeader(payload []byte) (bool, error) {
 		_, err = c.Conn.Write(buf.Bytes())
 		if err == nil {
 			written = true
+			close(c.headerSent) // notify the flush goroutine that header is already on the wire
 		}
 	})
 	return written, err
@@ -113,8 +115,9 @@ func (c *Client) DialConn(addr *tunnel.Address, overlay tunnel.Tunnel) (tunnel.C
 		return nil, err
 	}
 	newConn := &OutboundConn{
-		Conn: conn,
-		user: c.user,
+		Conn:       conn,
+		user:       c.user,
+		headerSent: make(chan struct{}),
 		metadata: &tunnel.Metadata{
 			Command: Connect,
 			Address: addr,
@@ -125,10 +128,18 @@ func (c *Client) DialConn(addr *tunnel.Address, overlay tunnel.Tunnel) (tunnel.C
 	}
 
 	go func(newConn *OutboundConn) {
-		// if the trojan header is still buffered after 100 ms, the client may expect data from the server
-		// so we flush the trojan header
-		time.Sleep(time.Millisecond * 100)
-		newConn.WriteHeader(nil)
+		// If the application layer doesn't send data within 20ms, the remote target
+		// likely speaks first (e.g. SMTP, some DB protocols). Flush the header early
+		// to unblock the server. In the common case (HTTP/HTTPS) the header is already
+		// sent with the first Write() and this goroutine exits immediately.
+		timer := time.NewTimer(time.Millisecond * 20)
+		defer timer.Stop()
+		select {
+		case <-newConn.headerSent:
+			// header already on the wire, nothing to do
+		case <-timer.C:
+			newConn.WriteHeader(nil)
+		}
 	}(newConn)
 	return newConn, nil
 }
@@ -144,8 +155,9 @@ func (c *Client) DialPacket(tunnel.Tunnel) (tunnel.PacketConn, error) {
 	}
 	return &PacketConn{
 		Conn: &OutboundConn{
-			Conn: conn,
-			user: c.user,
+			Conn:       conn,
+			user:       c.user,
+			headerSent: make(chan struct{}),
 			metadata: &tunnel.Metadata{
 				Command: Associate,
 				Address: fakeAddr,

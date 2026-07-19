@@ -17,8 +17,8 @@ func init() {
 		return &Config{
 			Mux: MuxConfig{
 				Enabled:     false,
-				IdleTimeout: 30,
-				Concurrency: 8,
+				IdleTimeout: 60,  // was 30s — longer idle window reduces session churn
+				Concurrency: 16,  // was 8 — more parallel streams per underlying connection
 			},
 		}
 	})

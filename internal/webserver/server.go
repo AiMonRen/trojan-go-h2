@@ -1077,14 +1077,28 @@ func generateClashConfigMultiNode(db *gorm.DB, u database.User, nodes []database
 		sb.WriteString("\n")
 	}
 
-	sb.WriteString("proxy-groups:\n  - name: \"PROXY\"\n    type: select\n    proxies:\n")
-	sb.WriteString(fmt.Sprintf("      - \"%s\"\n", mainNodeName))
+	// 收集全部节点名（主节点 + 从节点），用于生成代理组
+	nodeNames := make([]string, 0, len(nodes)+1)
+	nodeNames = append(nodeNames, mainNodeName)
 	for _, node := range nodes {
 		nodeName := node.Name
 		if nodeName == "" {
 			nodeName = node.Address
 		}
-		sb.WriteString(fmt.Sprintf("      - \"%s\"\n", nodeName))
+		nodeNames = append(nodeNames, nodeName)
+	}
+
+	// PROXY: 手动选择组，第一项为"自动选择"，用户默认无需干预即走最低延迟节点
+	sb.WriteString("proxy-groups:\n  - name: \"PROXY\"\n    type: select\n    proxies:\n")
+	sb.WriteString("      - \"自动选择\"\n")
+	for _, name := range nodeNames {
+		sb.WriteString(fmt.Sprintf("      - \"%s\"\n", name))
+	}
+
+	// 自动选择: url-test 组，客户端周期性测速自动挑选延迟最低的节点（电信/移动线路自适应）
+	sb.WriteString("  - name: \"自动选择\"\n    type: url-test\n    url: http://www.gstatic.com/generate_204\n    interval: 300\n    tolerance: 50\n    proxies:\n")
+	for _, name := range nodeNames {
+		sb.WriteString(fmt.Sprintf("      - \"%s\"\n", name))
 	}
 
 	if rulesStr != "" {
