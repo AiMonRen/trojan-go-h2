@@ -208,6 +208,28 @@ func InitDeployMaster() {
 		dbPath = filepath.Join(deployPath, "trojan-go.db")
 	}
 
+	// 8. 是否启用 Hysteria2 (QUIC/UDP 主力协议)
+	h2Enabled := false
+	h2Port := 8443
+	h2Up := 100
+	h2Down := 500
+	h2Ans := getStdin("8. 是否启用 Hysteria2 (QUIC/UDP) 主力协议？(y/n, 默认 n): ", "8. Enable Hysteria2 (QUIC/UDP) protocol? (y/n, default n): ")
+	if h2Ans == "y" || h2Ans == "Y" {
+		h2Enabled = true
+		h2PortStr := getStdin("   Hysteria2 监听端口 (默认 8443): ", "   Hysteria2 listen port (default 8443): ")
+		if h2PortStr != "" {
+			fmt.Sscanf(h2PortStr, "%d", &h2Port)
+		}
+		h2UpStr := getStdin("   上行带宽 Mbps (默认 100): ", "   Upstream bandwidth Mbps (default 100): ")
+		if h2UpStr != "" {
+			fmt.Sscanf(h2UpStr, "%d", &h2Up)
+		}
+		h2DownStr := getStdin("   下行带宽 Mbps (默认 500): ", "   Downstream bandwidth Mbps (default 500): ")
+		if h2DownStr != "" {
+			fmt.Sscanf(h2DownStr, "%d", &h2Down)
+		}
+	}
+
 	// 开始执行操作
 	fmt.Println("\n\033[36m=== 开始执行初始化部署 ===\033[0m")
 
@@ -474,6 +496,18 @@ admin:
 	webContent = strings.ReplaceAll(webContent, "{{.DbPath}}", dbPath)
 	webContent = strings.ReplaceAll(webContent, "{{.SubPath}}", subPath)
 
+	// Hysteria2 配置处理
+	if h2Enabled {
+		proxyContent = strings.ReplaceAll(proxyContent, "# hysteria2:", "hysteria2:")
+		proxyContent = strings.ReplaceAll(proxyContent, "#   enabled: true", "  enabled: true")
+		proxyContent = strings.ReplaceAll(proxyContent, "#   port: 8443", fmt.Sprintf("  port: %d", h2Port))
+		proxyContent = strings.ReplaceAll(proxyContent, "#   up_mbps: 100", fmt.Sprintf("  up_mbps: %d", h2Up))
+		proxyContent = strings.ReplaceAll(proxyContent, "#   down_mbps: 500", fmt.Sprintf("  down_mbps: %d", h2Down))
+		proxyContent = strings.ReplaceAll(proxyContent, "#   masquerade_url: \"https://www.bilibili.com\"", "  masquerade_url: \"https://www.bilibili.com\"")
+		proxyContent = strings.ReplaceAll(proxyContent, "#   auth_api: \"http://127.0.0.1:{{.AdminPort}}/admin/api/hysteria/auth\"",
+			fmt.Sprintf("  auth_api: \"http://127.0.0.1:%d/admin/api/hysteria/auth\"", adminPort))
+	}
+
 	if err := os.WriteFile(configPath, []byte(proxyContent), 0644); err != nil {
 		fmt.Printf("\033[31m❌ 写入 config.yaml 失败: %v\033[0m\n", err)
 		return
@@ -547,6 +581,49 @@ Commercial support is available at
 	// 修正配置目录权限，确保证书可读
 	runCmd("chmod", "-R", "0755", deployPath)
 
+	// ─── Hysteria2 部署（如用户选择启用） ──────
+	if h2Enabled {
+		fmt.Println("\n--- 开始 Hysteria2 (QUIC/UDP) 部署 ---")
+		// 1. 下载 Hysteria2 二进制
+		h2URL := "https://github.com/apernet/hysteria/releases/download/app%2Fv2.10.0/hysteria-linux-amd64"
+		fmt.Printf(" [!] 正在下载 Hysteria2...\n")
+		if err := runCmd("wget", "-qO", "/usr/local/bin/hysteria", h2URL); err != nil {
+			fmt.Printf("\033[31m❌ 下载 Hysteria2 失败: %v\033[0m\n", err)
+		} else {
+			runCmd("chmod", "+x", "/usr/local/bin/hysteria")
+			fmt.Println("✓ Hysteria2 已安装至 /usr/local/bin/hysteria")
+		}
+
+		// 2. 生成 Hysteria2 配置文件
+		hysteriaConfig := fmt.Sprintf(`listen: :%d
+tls:
+  cert: %s
+  key: %s
+auth:
+  type: password
+  password: {{需要套用 Trojan 密码，在 Web 面板管理用户}}
+masquerade:
+  type: proxy
+  proxy:
+    url: https://www.bilibili.com
+    rewriteHost: true
+quic:
+  initStreamReceiveWindow: 8388608
+  maxStreamReceiveWindow: 8388608
+  initConnReceiveWindow: 20971520
+  maxConnReceiveWindow: 20971520
+  maxIdleTimeout: 60s
+  keepAliveInterval: 10s
+bandwidth:
+  up: %d mbps
+  down: %d mbps
+`, h2Port, crtPath, keyPath, h2Up, h2Down)
+		hysteriaConfigPath := filepath.Join(deployPath, "hysteria.yaml")
+		os.WriteFile(hysteriaConfigPath, []byte(hysteriaConfig), 0644)
+		fmt.Printf("✓ Hysteria2 配置已生成 (%s)\n", hysteriaConfigPath)
+		fmt.Println("  [!] 请登录 Web 面板创建用户，并将 hysteria.yaml 中的 password 替换为实际密码")
+	}
+
 	// ─── 步骤 4: 创建 Systemd 服务文件 ────────────────────────────
 	fmt.Println("\n[4/5] 正在配置 Systemd 服务...")
 	// 1. 代理核心服务 (依赖于 Web 服务提供的回落支持)
@@ -582,6 +659,24 @@ WantedBy=multi-user.target
 	
 	os.WriteFile("/etc/systemd/system/trojan-go.service", []byte(proxySvc), 0644)
 	os.WriteFile("/etc/systemd/system/trojan-web.service", []byte(webSvc), 0644)
+
+	if h2Enabled {
+		hysteriaSvc := `[Unit]
+Description=Hysteria2 QUIC/UDP Server
+After=network.target trojan-web.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hysteria server -c ` + filepath.Join(deployPath, "hysteria.yaml") + `
+Restart=on-failure
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target
+`
+		os.WriteFile("/etc/systemd/system/hysteria.service", []byte(hysteriaSvc), 0644)
+	}
+
 	fmt.Println("✓ Systemd 服务配置完成")
 
 	// ─── 步骤 5: 启动双服务 ────────────────────────────
@@ -589,6 +684,9 @@ WantedBy=multi-user.target
 	if err := runCmd("systemctl", "daemon-reload"); err == nil {
 		// 先启动 Web 服务 (80) 以便 Proxy (443) 验证回落地址
 		svcs := []string{"trojan-web", "trojan-go"}
+		if h2Enabled {
+			svcs = append(svcs, "hysteria")
+		}
 		for _, s := range svcs {
 			fmt.Printf(" [!] 正在激活 %s...\n", s)
 			runCmd("systemctl", "enable", s)
