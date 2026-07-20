@@ -73,7 +73,9 @@ func (m *NodeSyncManager) syncLoop(ctx context.Context) {
 	ticker := time.NewTicker(m.syncInterval)
 	defer ticker.Stop()
 
-	// 启动时立即执行一次同步
+	// 启动时等待认证器初始化完成后再执行首次同步
+	// 避免认证器还没注册就静默跳过
+	m.waitForAuth(3 * time.Second)
 	m.performSync()
 
 	for {
@@ -85,6 +87,19 @@ func (m *NodeSyncManager) syncLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		}
+	}
+}
+
+func (m *NodeSyncManager) waitForAuth(timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		m.mu.Lock()
+		ready := len(m.auths) > 0
+		m.mu.Unlock()
+		if ready {
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
 }
 
