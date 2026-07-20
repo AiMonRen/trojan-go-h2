@@ -845,6 +845,28 @@ func InitDeployWorker() {
 		fmt.Sscanf(adminPortStr, "%d", &adminPort)
 	}
 
+	// 10. 是否启用 Hysteria2 (QUIC/UDP)
+	wh2Enabled := false
+	wh2Port := 8443
+	wh2Up := 100
+	wh2Down := 500
+	wh2Ans := getStdin("10. 是否启用 Hysteria2 (QUIC/UDP) 协议？(y/n, 默认 n): ", "10. Enable Hysteria2 (QUIC/UDP) protocol? (y/n, default n): ")
+	if wh2Ans == "y" || wh2Ans == "Y" {
+		wh2Enabled = true
+		wh2PortStr := getStdin("    Hysteria2 监听端口 (默认 8443): ", "    Hysteria2 listen port (default 8443): ")
+		if wh2PortStr != "" {
+			fmt.Sscanf(wh2PortStr, "%d", &wh2Port)
+		}
+		wh2UpStr := getStdin("    上行带宽 Mbps (默认 100): ", "    Upstream bandwidth Mbps (default 100): ")
+		if wh2UpStr != "" {
+			fmt.Sscanf(wh2UpStr, "%d", &wh2Up)
+		}
+		wh2DownStr := getStdin("    下行带宽 Mbps (默认 500): ", "    Downstream bandwidth Mbps (default 500): ")
+		if wh2DownStr != "" {
+			fmt.Sscanf(wh2DownStr, "%d", &wh2Down)
+		}
+	}
+
 	// SQLite 作为本地缓存库，路径定为 deployPath/trojan-go.db
 	dbPath := filepath.Join(deployPath, "trojan-go.db")
 
@@ -996,8 +1018,47 @@ node:
 
 	runCmd("chmod", "-R", "0755", deployPath)
 
-	// ─── 步骤 4: 创建 Systemd 服务文件 ────────────────────────────
-	fmt.Println("\n[4/5] 正在配置 Systemd 服务...")
+	// ─── Hysteria2 部署（从节点，如用户选择启用） ──────
+	if wh2Enabled {
+		fmt.Println("\n--- 开始 Hysteria2 (QUIC/UDP) 从节点部署 ---")
+		h2URL := "https://github.com/apernet/hysteria/releases/download/app%2Fv2.10.0/hysteria-linux-amd64"
+		if err := runCmd("wget", "-qO", "/usr/local/bin/hysteria", h2URL); err != nil {
+			fmt.Printf("\033[31m❌ 下载 Hysteria2 失败: %v\033[0m\n", err)
+		} else {
+			runCmd("chmod", "+x", "/usr/local/bin/hysteria")
+			fmt.Println("✓ Hysteria2 已安装")
+		}
+		hysteriaConfig := fmt.Sprintf(`listen: :%d
+tls:
+  cert: %s
+  key: %s
+auth:
+  type: http
+  http:
+    url: http://127.0.0.1:%d/admin/api/hysteria/auth
+    insecure: true
+masquerade:
+  type: proxy
+  proxy:
+    url: https://www.bilibili.com
+    rewriteHost: true
+quic:
+  initStreamReceiveWindow: 8388608
+  maxStreamReceiveWindow: 8388608
+  initConnReceiveWindow: 20971520
+  maxConnReceiveWindow: 20971520
+  maxIdleTimeout: 60s
+  keepAliveInterval: 10s
+bandwidth:
+  up: %d mbps
+  down: %d mbps
+`, wh2Port, crtPath, keyPath, adminPort, wh2Up, wh2Down)
+		hysteriaConfigPath := filepath.Join(deployPath, "hysteria.yaml")
+		os.WriteFile(hysteriaConfigPath, []byte(hysteriaConfig), 0644)
+		fmt.Printf("✓ Hysteria2 从节点配置已生成 (%s)\n", hysteriaConfigPath)
+	}
+
+	// ─── 步骤 4: 创建 Systemd 服务文件 ──────────────── (Worker)
 	proxySvc := `[Unit]
 Description=Trojan-Go Worker Proxy Service
 After=network.target trojan-web.service
@@ -1028,12 +1089,33 @@ WantedBy=multi-user.target
 `
 	os.WriteFile("/etc/systemd/system/trojan-go.service", []byte(proxySvc), 0644)
 	os.WriteFile("/etc/systemd/system/trojan-web.service", []byte(webSvc), 0644)
+
+	if wh2Enabled {
+		hysteriaSvc := `[Unit]
+Description=Hysteria2 QUIC/UDP Server (Worker)
+After=network.target trojan-web.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hysteria server -c ` + filepath.Join(deployPath, "hysteria.yaml") + `
+Restart=on-failure
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target
+`
+		os.WriteFile("/etc/systemd/system/hysteria.service", []byte(hysteriaSvc), 0644)
+	}
+
 	fmt.Println("✓ Systemd 服务配置完成")
 
-	// ─── 步骤 5: 启动双服务 ────────────────────────────
+	// ─── 步骤 5: 启动双服务 ──────────────────────────── (Worker)
 	fmt.Println("\n[5/5] 正在启动并激活服务...")
 	if err := runCmd("systemctl", "daemon-reload"); err == nil {
 		svcs := []string{"trojan-web", "trojan-go"}
+		if wh2Enabled {
+			svcs = append(svcs, "hysteria")
+		}
 		for _, s := range svcs {
 			fmt.Printf(" [!] 正在激活 %s...\n", s)
 			runCmd("systemctl", "enable", s)

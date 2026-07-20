@@ -1036,15 +1036,28 @@ func (s *AdminServer) handleNodeSync(c *gin.Context) {
 // Request: {"password": "clear-text-password"}
 // Response: {"ok": true, "quota": ..., "used": ...} or {"ok": false}
 func (s *AdminServer) handleHysteriaAuth(c *gin.Context) {
-	var req struct {
-		Password string `json:"password"`
+	// Hysteria2 HTTP auth 的请求体格式因版本而异，使用通用 map 兼容多种字段名
+	var raw map[string]interface{}
+	if err := c.ShouldBindJSON(&raw); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"ok": false})
+		return
 	}
-	if err := c.ShouldBindJSON(&req); err != nil || req.Password == "" {
+	// 尝试 Hysteria2 可能使用的各种密码字段名
+	password := ""
+	for _, key := range []string{"password", "pass", "user", "username", "token", "auth"} {
+		if v, ok := raw[key]; ok {
+			if s, ok := v.(string); ok && s != "" {
+				password = s
+				break
+			}
+		}
+	}
+	if password == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"ok": false})
 		return
 	}
 	var user database.User
-	if err := s.db.Where("hash = ?", common.SHA224String(req.Password)).First(&user).Error; err != nil {
+	if err := s.db.Where("hash = ?", common.SHA224String(password)).First(&user).Error; err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"ok": false})
 		return
 	}
