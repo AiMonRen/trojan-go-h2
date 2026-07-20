@@ -1244,6 +1244,12 @@ func generateClashConfigMultiNode(db *gorm.DB, u database.User, nodes []database
 	if h2Enabled && len(h2NodeNames) > 0 {
 		sb.WriteString("      - \"HYSTERIA\"\n")
 		sb.WriteString("      - \"TROJAN\"\n")
+		for _, name := range h2NodeNames {
+			sb.WriteString(fmt.Sprintf("      - \"%s\"\n", name))
+		}
+		for _, name := range tjNodeNames {
+			sb.WriteString(fmt.Sprintf("      - \"%s\"\n", name))
+		}
 	} else {
 		sb.WriteString("      - \"TROJAN\"\n")
 		for _, name := range tjNodeNames {
