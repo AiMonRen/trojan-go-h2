@@ -10,9 +10,12 @@ type Config struct {
 }
 
 type TCPConfig struct {
-	PreferIPV4 bool `json:"prefer_ipv4" yaml:"prefer_ipv4"`
-	KeepAlive  bool `json:"keep_alive" yaml:"keep_alive"`
-	NoDelay    bool `json:"no_delay" yaml:"no_delay"`
+	PreferIPV4   bool `json:"prefer_ipv4" yaml:"prefer_ipv4"`
+	KeepAlive    bool `json:"keep_alive" yaml:"keep_alive"`
+	NoDelay      bool `json:"no_delay" yaml:"no_delay"`
+	FastOpen     bool `json:"fast_open" yaml:"fast_open"`
+	SocketBuffer int  `json:"socket_buffer" yaml:"socket_buffer"` // KB, 0=use default(256)
+	DialTimeout  int  `json:"dial_timeout" yaml:"dial_timeout"`   // seconds, 0=system default
 }
 
 type ForwardProxyConfig struct {
@@ -27,9 +30,12 @@ func init() {
 	config.RegisterConfigCreator(Name, func() any {
 		return &Config{
 			TCP: TCPConfig{
-				PreferIPV4: false,
-				NoDelay:    true,
-				KeepAlive:  true,
+				PreferIPV4:   false,
+				NoDelay:      true,
+				KeepAlive:    true,
+				FastOpen:     false,
+				SocketBuffer: 256,
+				DialTimeout:  10,
 			},
 		}
 	})

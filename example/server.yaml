@@ -67,6 +67,23 @@ websocket:
   host: "your_domain.com"
 
 # =================================================================
+# [Hysteria2 协议 — QUIC/UDP 主力协议]
+# =================================================================
+# Hysteria2 基于 QUIC (Quick UDP Internet Connections，快速UDP互联网连接)，
+# 可将 Trojan (TCP) 退居备用。通过自定义拥塞控制 (Brutal) 显著降低国际出口丢包
+# 和运营商 QoS 限速带来的延迟，是提升高丢包链路表现的最直接手段。
+#
+# 启用后需在服务器上额外启动 hysteria-server 进程，认证密码由 trojan-go 的
+# HTTP Auth API (POST /admin/api/hysteria/auth) 统一接管。
+# hysteria2:
+#   enabled: true
+#   port: 8443
+#   up_mbps: 100
+#   down_mbps: 500
+#   masquerade_url: "https://www.bilibili.com"
+#   auth_api: "http://127.0.0.1:8080/admin/api/hysteria/auth"
+
+# =================================================================
 # [内置 Web 运维管理面板]
 # =================================================================
 # Trojan-Go 拥有强大的内置用户管理与数据可视化后台。开启后可直接通过 443 端口复用访问。

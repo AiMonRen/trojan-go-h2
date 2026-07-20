@@ -179,3 +179,37 @@ func normalizeValue(val reflect.Value) {
 }
 
 var _ normalizer
+
+// Hysteria2Config holds the Hysteria2 (QUIC/UDP) protocol server settings.
+// This is a separately deployed process (hysteria-server) managed alongside trojan-go.
+// The config section in config.yaml is named "hysteria2".
+type Hysteria2Config struct {
+	Enabled       bool   `json:"enabled" yaml:"enabled"`
+	Port          int    `json:"port" yaml:"port"`
+	UpMbps        int    `json:"up_mbps" yaml:"up_mbps"`
+	DownMbps      int    `json:"down_mbps" yaml:"down_mbps"`
+	MasqueradeURL string `json:"masquerade_url" yaml:"masquerade_url"`
+	AuthAPI       string `json:"auth_api" yaml:"auth_api"`
+}
+
+func (c *Hysteria2Config) Normalize() {
+	if c.Port == 0 {
+		c.Port = 8443
+	}
+	if c.UpMbps == 0 {
+		c.UpMbps = 100
+	}
+	if c.DownMbps == 0 {
+		c.DownMbps = 500
+	}
+	if c.MasqueradeURL == "" {
+		c.MasqueradeURL = "https://www.bilibili.com"
+	}
+}
+
+func init() {
+	RegisterConfigCreator("hysteria2", func() any {
+		cfg := &Hysteria2Config{}
+		return cfg
+	})
+}

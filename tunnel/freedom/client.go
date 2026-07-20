@@ -3,6 +3,8 @@ package freedom
 import (
 	"context"
 	"net"
+	"syscall"
+	"time"
 
 	"github.com/txthinking/socks5"
 	"golang.org/x/net/proxy"
@@ -16,6 +18,9 @@ type Client struct {
 	preferIPv4   bool
 	noDelay      bool
 	keepAlive    bool
+	fastOpen     bool
+	socketBuffer int
+	dialTimeout  time.Duration
 	ctx          context.Context
 	cancel       context.CancelFunc
 	forwardProxy bool
@@ -50,7 +55,25 @@ func (c *Client) DialConn(addr *tunnel.Address, _ tunnel.Tunnel) (tunnel.Conn, e
 	if c.preferIPv4 {
 		network = "tcp4"
 	}
-	dialer := new(net.Dialer)
+	dialer := &net.Dialer{
+		Timeout: c.dialTimeout,
+		Control: func(network, address string, rawConn syscall.RawConn) error {
+			var operr error
+			err := rawConn.Control(func(fd uintptr) {
+				if c.fastOpen {
+					// Enable TCP_FASTOPEN_CONNECT on Linux.
+					// This allows the kernel to send data in the SYN packet,
+					// saving one full RTT on reconnections to known hosts.
+					// Silently ignored on non-Linux or kernels < 4.11.
+					operr = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, 23, 1) // TCP_FASTOPEN_CONNECT=23
+				}
+			})
+			if err != nil {
+				return err
+			}
+			return operr
+		},
+	}
 	tcpConn, err := dialer.DialContext(c.ctx, network, addr.String())
 	if err != nil {
 		return nil, common.NewError("freedom failed to dial " + addr.String()).Base(err)
@@ -58,10 +81,15 @@ func (c *Client) DialConn(addr *tunnel.Address, _ tunnel.Tunnel) (tunnel.Conn, e
 
 	tcpConn.(*net.TCPConn).SetKeepAlive(c.keepAlive)
 	tcpConn.(*net.TCPConn).SetNoDelay(c.noDelay)
-	// Enlarge socket buffers to improve throughput on high-bandwidth or high-latency links.
-	// The OS may silently clamp these to the system maximum (net.core.rmem_max / wmem_max).
-	tcpConn.(*net.TCPConn).SetReadBuffer(256 * 1024)
-	tcpConn.(*net.TCPConn).SetWriteBuffer(256 * 1024)
+	// Configurable socket buffer size.
+	// On high-BDP links (e.g. cross-ISP), larger buffers improve throughput.
+	// Values above the OS limit (net.core.rmem_max/wmem_max) are silently clamped.
+	bufSize := c.socketBuffer * 1024
+	if bufSize <= 0 {
+		bufSize = 256 * 1024
+	}
+	tcpConn.(*net.TCPConn).SetReadBuffer(bufSize)
+	tcpConn.(*net.TCPConn).SetWriteBuffer(bufSize)
 	return &Conn{
 		Conn: tcpConn,
 	}, nil
@@ -123,6 +151,9 @@ func NewClient(ctx context.Context, _ tunnel.Client) (*Client, error) {
 		noDelay:      cfg.TCP.NoDelay,
 		keepAlive:    cfg.TCP.KeepAlive,
 		preferIPv4:   cfg.TCP.PreferIPV4,
+		fastOpen:     cfg.TCP.FastOpen,
+		socketBuffer: cfg.TCP.SocketBuffer,
+		dialTimeout:  time.Duration(cfg.TCP.DialTimeout) * time.Second,
 		forwardProxy: cfg.ForwardProxy.Enabled,
 		proxyAddr:    addr,
 		username:     cfg.ForwardProxy.Username,

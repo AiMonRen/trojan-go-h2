@@ -16,11 +16,17 @@ RUN mkdir -p /geodata && \
 
 FROM alpine
 WORKDIR /
-RUN apk add --no-cache tzdata ca-certificates
+RUN apk add --no-cache tzdata ca-certificates wget
 
 # 从编译阶段拷贝核心二进制和 CLI 管理工具
 COPY --from=builder /app/build/linux-amd64/trojan-go /usr/local/bin/trojan-go
 COPY --from=builder /app/build/linux-amd64/trojan /usr/local/bin/trojan
+
+# 下载 Hysteria2 服务端二进制（QUIC/UDP 主力协议，配套 trojan-go 使用）
+ARG HYSTERIA_VERSION=v2.6.1
+RUN wget -qO /usr/local/bin/hysteria \
+    https://github.com/apernet/hysteria/releases/download/${HYSTERIA_VERSION}/hysteria-linux-amd64 \
+    && chmod +x /usr/local/bin/hysteria
 
 # 从编译阶段拷贝地理路由规则文件到 /usr/share/trojan-go 目录
 COPY --from=builder /geodata /usr/share/trojan-go

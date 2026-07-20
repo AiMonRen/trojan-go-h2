@@ -98,10 +98,11 @@ func (c *OutboundConn) Close() error {
 }
 
 type Client struct {
-	underlay tunnel.Client
-	user     statistic.User
-	ctx      context.Context
-	cancel   context.CancelFunc
+	underlay     tunnel.Client
+	user         statistic.User
+	flushTimeout time.Duration // 0 = disable auto-flush (header sent only with first Write)
+	ctx          context.Context
+	cancel       context.CancelFunc
 }
 
 func (c *Client) Close() error {
@@ -128,15 +129,22 @@ func (c *Client) DialConn(addr *tunnel.Address, overlay tunnel.Tunnel) (tunnel.C
 	}
 
 	go func(newConn *OutboundConn) {
-		// If the application layer doesn't send data within 20ms, the remote target
-		// likely speaks first (e.g. SMTP, some DB protocols). Flush the header early
-		// to unblock the server. In the common case (HTTP/HTTPS) the header is already
-		// sent with the first Write() and this goroutine exits immediately.
-		timer := time.NewTimer(time.Millisecond * 20)
+		// If auto-flush is disabled (flushTimeout <= 0), the trojan header is only
+		// sent with the first Write() call — it never goes out alone.
+		// This is safe for HTTPS/HTTP/WebSocket clients (they always send first),
+		// but may deadlock protocols where the server speaks first (SMTP, FTP).
+		if c.flushTimeout <= 0 {
+			return
+		}
+		// On high-latency links (cross-ISP ~100ms RTT), a short flush timeout causes
+		// unnecessary header-only packets before the application data, wasting half
+		// a round-trip. A longer timeout gives the application layer time to produce
+		// its first payload so header + data travel in a single packet.
+		timer := time.NewTimer(c.flushTimeout)
 		defer timer.Stop()
 		select {
 		case <-newConn.headerSent:
-			// header already on the wire, nothing to do
+			// header already on the wire with the first Write(), nothing to do
 		case <-timer.C:
 			newConn.WriteHeader(nil)
 		}
@@ -191,9 +199,10 @@ func NewClient(ctx context.Context, client tunnel.Client) (*Client, error) {
 
 	log.Debug("trojan client created")
 	return &Client{
-		underlay: client,
-		ctx:      ctx,
-		user:     user,
-		cancel:   cancel,
+		underlay:     client,
+		ctx:          ctx,
+		user:         user,
+		cancel:       cancel,
+		flushTimeout: time.Duration(cfg.FlushTimeout) * time.Millisecond,
 	}, nil
 }

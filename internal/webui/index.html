@@ -579,6 +579,16 @@ const SettingsPage = {
         const wsRes = await api('GET', '/settings/websocket');
         wsConfig = wsRes ? wsRes.config : '';
         s.websocket_config = wsConfig;
+
+        // 加载 Hysteria2 配置
+        const h2Res = await api('GET', '/settings/hysteria');
+        if (h2Res) {
+            s.hysteria_enabled = h2Res.hysteria_enabled || 'false';
+            s.hysteria_port = h2Res.hysteria_port || '8443';
+            s.hysteria_up_mbps = h2Res.hysteria_up_mbps || '100';
+            s.hysteria_down_mbps = h2Res.hysteria_down_mbps || '500';
+            s.hysteria_masquerade_url = h2Res.hysteria_masquerade_url || '';
+        }
         
         let masterConfig = null;
         if (isNode) {
@@ -633,6 +643,45 @@ const SettingsPage = {
                     <button class="btn btn-primary" onclick="saveAdminCreds()">修改密码</button>
                 </div>
             </div>
+        `;
+
+        htmlContent += `
+        <!-- Hysteria2 协议配置 -->
+        <div id="card-hysteria" class="card shadow-lg" style="margin-bottom: 32px;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 12px;">
+                <h3 style="font-size: 16px; display:flex; align-items:center; gap:8px; margin:0"><span>⚡</span> Hysteria2 协议配置</h3>
+                <button class="btn btn-primary card-edit-btn" onclick="toggleEditCard('card-hysteria', true)">✏️ 修改配置</button>
+            </div>
+            <p style="font-size: 12px; color: var(--text2); margin-bottom: 20px; line-height: 1.6">
+                Hysteria2 基于 QUIC/UDP，可与 Trojan (TCP) 互补。开启后订阅链接会优先包含 Hysteria2 节点，用户在 Clash 客户端中默认走 QUIC 协议以应对国际出口拥堵或运营商 QoS 限速。
+            </p>
+            <div class="form-group">
+                <label>启用 Hysteria2</label>
+                <div style="display:flex; align-items:center; gap:8px">
+                    <input id="setHysteriaEnabled" type="checkbox" style="width: 18px; height: 18px;">
+                    <span>开启后 Clash 订阅将包含 Hysteria2 协议节点作为主力</span>
+                </div>
+            </div>
+            <div class="form-group">
+                <label>监听端口</label>
+                <input id="setHysteriaPort" type="number" value="8443" disabled style="width: 120px">
+            </div>
+            <div class="form-group">
+                <label>上行带宽 (Mbps)</label>
+                <input id="setHysteriaUp" type="number" disabled value="100" style="width: 120px">
+            </div>
+            <div class="form-group">
+                <label>下行带宽 (Mbps)</label>
+                <input id="setHysteriaDown" type="number" disabled value="500" style="width: 120px">
+            </div>
+            <div class="form-group">
+                <label>伪装 URL (防主动探测)</label>
+                <input id="setHysteriaMasquerade" type="text" disabled placeholder="https://www.bilibili.com">
+            </div>
+            <div class="card-save-area" style="display:none; justify-content:flex-end; gap:12px; margin-top:24px">
+                <button class="btn btn-primary" onclick="saveHysteriaConfig()">保存配置</button>
+            </div>
+        </div>
         `;
 
         htmlContent += `
@@ -939,6 +988,12 @@ window.toggleEditCard = function(cardId, isEditing) {
         } else if (cardId === 'card-clash') {
             const fullYaml = `# rules:\n${s.clash_rules||''}\n\n# rule-providers:\n${s.clash_rule_providers||''}`;
             document.getElementById('setRulesEditor').value = fullYaml;
+        } else if (cardId === 'card-hysteria') {
+            document.getElementById('setHysteriaEnabled').checked = s.hysteria_enabled === 'true';
+            document.getElementById('setHysteriaPort').value = s.hysteria_port || '8443';
+            document.getElementById('setHysteriaUp').value = s.hysteria_up_mbps || '100';
+            document.getElementById('setHysteriaDown').value = s.hysteria_down_mbps || '500';
+            document.getElementById('setHysteriaMasquerade').value = s.hysteria_masquerade_url || '';
         }
         
         inputs.forEach(el => {
@@ -1020,6 +1075,32 @@ window.saveRulesConfig = async function() {
         toggleEditCard('card-clash', false);
     } else {
         alert('保存规则配置失败');
+    }
+};
+
+window.saveHysteriaConfig = async function() {
+    const enabled = document.getElementById('setHysteriaEnabled').checked;
+    const port = document.getElementById('setHysteriaPort').value || '8443';
+    const upMbps = document.getElementById('setHysteriaUp').value || '100';
+    const downMbps = document.getElementById('setHysteriaDown').value || '500';
+    const masquerade = document.getElementById('setHysteriaMasquerade').value || 'https://www.bilibili.com';
+    const res = await api('POST', '/settings/hysteria', {
+        hysteria_enabled: enabled ? 'true' : 'false',
+        hysteria_port: port,
+        hysteria_up_mbps: upMbps,
+        hysteria_down_mbps: downMbps,
+        hysteria_masquerade_url: masquerade
+    });
+    if (res) {
+        alert('Hysteria2 配置已保存');
+        window.currentSettingsCached.hysteria_enabled = enabled ? 'true' : 'false';
+        window.currentSettingsCached.hysteria_port = port;
+        window.currentSettingsCached.hysteria_up_mbps = upMbps;
+        window.currentSettingsCached.hysteria_down_mbps = downMbps;
+        window.currentSettingsCached.hysteria_masquerade_url = masquerade;
+        toggleEditCard('card-hysteria', false);
+    } else {
+        alert('保存失败');
     }
 };
 

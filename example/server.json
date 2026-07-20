@@ -19,5 +19,13 @@
         ],
         "geoip": "/usr/share/trojan-go/geoip.dat",
         "geosite": "/usr/share/trojan-go/geosite.dat"
+    },
+    "hysteria2": {
+        "enabled": false,
+        "port": 8443,
+        "up_mbps": 100,
+        "down_mbps": 500,
+        "masquerade_url": "https://www.bilibili.com",
+        "auth_api": "http://127.0.0.1:8080/admin/api/hysteria/auth"
     }
 }

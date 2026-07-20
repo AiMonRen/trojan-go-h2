@@ -8,6 +8,7 @@ type Config struct {
 	RemoteHost       string      `json:"remote_addr" yaml:"remote_addr"`
 	RemotePort       int         `json:"remote_port" yaml:"remote_port"`
 	DisableHTTPCheck bool        `json:"disable_http_check" yaml:"disable_http_check"`
+	FlushTimeout     int         `json:"flush_timeout" yaml:"flush_timeout"` // ms, 0=disable auto-flush
 	MySQL            MySQLConfig `json:"mysql" yaml:"mysql"`
 	API              APIConfig   `json:"api" yaml:"api"`
 }

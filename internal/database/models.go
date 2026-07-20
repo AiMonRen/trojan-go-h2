@@ -185,6 +185,18 @@ func InitDb(dbPath string) (*gorm.DB, error) {
 		{Key: "clash_rules", Value: defaultRules},
 		{Key: "clash_rule_providers", Value: defaultProviders},
 		{Key: "traffic_reset_day", Value: "0"},
+		// Hysteria2 协议配置（QUIC/UDP 主力协议，Trojan 降级备用）
+		{Key: "hysteria_enabled", Value: "false"},
+		{Key: "hysteria_port", Value: "8443"},
+		{Key: "hysteria_up_mbps", Value: "100"},
+		{Key: "hysteria_down_mbps", Value: "500"},
+		{Key: "hysteria_masquerade_url", Value: "https://www.bilibili.com"},
+		// Clash 订阅节点显示名称中的地区标签（如 "美国"）
+		{Key: "node_location", Value: "节点"},
+		// Clash 测试延迟的测速 URL（0=关闭 url-test）
+		{Key: "clash_test_url", Value: "http://cp.cloudflare.com/generate_204"},
+		// 订阅中是否输出 WebSocket 配置（非 CDN 场景建议关闭以省 1 RTT）
+		{Key: "sub_use_ws", Value: "false"},
 	}
 	for _, seed := range seeds {
 		db.FirstOrCreate(&Config{}, seed)

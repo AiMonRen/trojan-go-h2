@@ -356,6 +356,16 @@ websocket:
 # [WebSocket] WebSocket 域名头匹配
   host: "{{.Domain}}"
 
+# [Hysteria2] Hysteria2 (QUIC/UDP) 协议配置 — 主力协议
+# [Hysteria2] 启用后 Clash 订阅会优先包含 Hysteria2 节点，Trojan 退居备用
+# hysteria2:
+#   enabled: true
+#   port: 8443
+#   up_mbps: 100
+#   down_mbps: 500
+#   masquerade_url: "https://www.bilibili.com"
+#   auth_api: "http://127.0.0.1:{{.AdminPort}}/admin/api/hysteria/auth"
+
 # [Control Plane] Web admin server settings
 # [管理控制面] Web 管理后台与订阅接口配置
 admin:

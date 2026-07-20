@@ -187,6 +187,9 @@ func New(db *gorm.DB, username, password, mountPath string, port int, wsEnabled 
 	apiGroup.POST("/login", srv.handleLogin)
 	apiGroup.POST("/node/sync", srv.handleNodeSync)
 
+	// ─── Hysteria2 用户认证（Hysteria2 服务端 HTTP Auth 端点，无 JWT 鉴权） ──
+	apiGroup.POST("/hysteria/auth", srv.handleHysteriaAuth)
+
 	// ─── 需要鉴权的管理 API ──────────────────────────────
 	auth := apiGroup.Group("/", func(c *gin.Context) {
 		// 跳过登录接口
@@ -286,6 +289,10 @@ func New(db *gorm.DB, username, password, mountPath string, port int, wsEnabled 
 		auth.GET("/logs", srv.handleGetLogs)
 		auth.POST("/service", srv.handleServiceControl)
 		auth.POST("/restart", srv.handleRestart)
+
+		// ─── Hysteria2 协议管理 ──────────────────────
+		auth.GET("/settings/hysteria", srv.handleGetHysteriaConfig)
+		auth.POST("/settings/hysteria", srv.handleSaveHysteriaConfig)
 	}
 
 	srv.handler = r
@@ -1022,6 +1029,83 @@ func (s *AdminServer) handleNodeSync(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"users": validHashes})
 }
 
+// ─── Hysteria2 协议管理 API ─────────────────────────
+
+// handleHysteriaAuth verifies a user password for the Hysteria2 server.
+// Called by hysteria2-server's HTTP auth backend on every new QUIC connection.
+// Request: {"password": "clear-text-password"}
+// Response: {"ok": true, "quota": ..., "used": ...} or {"ok": false}
+func (s *AdminServer) handleHysteriaAuth(c *gin.Context) {
+	var req struct {
+		Password string `json:"password"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.Password == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"ok": false})
+		return
+	}
+	var user database.User
+	if err := s.db.Where("hash = ?", common.SHA224String(req.Password)).First(&user).Error; err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"ok": false})
+		return
+	}
+	if user.Status != 0 {
+		c.JSON(http.StatusUnauthorized, gin.H{"ok": false})
+		return
+	}
+	now := time.Now()
+	if user.ExpiryTime != nil && !user.ExpiryTime.IsZero() && user.ExpiryTime.Before(now) {
+		c.JSON(http.StatusUnauthorized, gin.H{"ok": false})
+		return
+	}
+	if user.Quota > 0 && user.Used >= user.Quota {
+		c.JSON(http.StatusUnauthorized, gin.H{"ok": false})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"ok":    true,
+		"quota": user.Quota,
+		"used":  user.Used,
+	})
+}
+
+// handleGetHysteriaConfig returns current Hysteria2 protocol settings.
+func (s *AdminServer) handleGetHysteriaConfig(c *gin.Context) {
+	keys := []string{"hysteria_enabled", "hysteria_port", "hysteria_up_mbps", "hysteria_down_mbps", "hysteria_masquerade_url"}
+	result := gin.H{}
+	for _, k := range keys {
+		var cfg database.Config
+		if s.db.Where("`key` = ?", k).First(&cfg).Error == nil {
+			result[k] = cfg.Value
+		} else {
+			result[k] = ""
+		}
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+// handleSaveHysteriaConfig persists Hysteria2 protocol settings.
+func (s *AdminServer) handleSaveHysteriaConfig(c *gin.Context) {
+	var req map[string]string
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效请求"})
+		return
+	}
+	allowed := map[string]bool{
+		"hysteria_enabled":        true,
+		"hysteria_port":           true,
+		"hysteria_up_mbps":        true,
+		"hysteria_down_mbps":      true,
+		"hysteria_masquerade_url": true,
+	}
+	for k, v := range req {
+		if !allowed[k] {
+			continue
+		}
+		s.db.Where("`key` = ?", k).Assign(database.Config{Value: v}).FirstOrCreate(&database.Config{Key: k})
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "Hysteria2 配置已保存"})
+}
+
 // ─── 多节点 Clash 订阅配置文件生成器 ─────────────────────
 
 func generateClashConfigMultiNode(db *gorm.DB, u database.User, nodes []database.Node, defaultDomain string, defaultPort int, defaultWS bool, defaultWSPath string) string {
@@ -1048,57 +1132,126 @@ func generateClashConfigMultiNode(db *gorm.DB, u database.User, nodes []database
 		sb.WriteString("\n\n")
 	}
 
+	// ---- 读取全局配置 ----
+	getConfigValue := func(d *gorm.DB, key string) (string, error) {
+		var c database.Config
+		if err := d.Where("`key` = ?", key).First(&c).Error; err != nil {
+			return "", err
+		}
+		return c.Value, nil
+	}
+
+	h2Enabled := db.Where("`key` = ? AND value = ?", "hysteria_enabled", "true").First(&database.Config{}).Error == nil
+
+	h2PortStr := "8443"
+	if cfg, err := getConfigValue(db, "hysteria_port"); err == nil && cfg != "" {
+		h2PortStr = cfg
+	}
+	h2UpStr := "50"
+	if cfg, err := getConfigValue(db, "hysteria_up_mbps"); err == nil && cfg != "" {
+		h2UpStr = cfg
+	}
+	h2DownStr := "300"
+	if cfg, err := getConfigValue(db, "hysteria_down_mbps"); err == nil && cfg != "" {
+		h2DownStr = cfg
+	}
+
+	// 节点地区标签（如 "美国"）
+	nodeLoc := "节点"
+	if cfg, err := getConfigValue(db, "node_location"); err == nil && cfg != "" {
+		nodeLoc = cfg
+	}
+
+	// 测速 URL（默认用 Cloudflare 端点，比 gstatic 在国内快）
+	testURL := "http://cp.cloudflare.com/generate_204"
+	if cfg, err := getConfigValue(db, "clash_test_url"); err == nil && cfg != "" && cfg != "0" {
+		testURL = cfg
+	}
+
+	// 是否在 Clash 订阅中输出 WebSocket 配置（非 CDN 场景关掉省 1 RTT）
+	useWS := defaultWS
+	if subWS, err := getConfigValue(db, "sub_use_ws"); err == nil && subWS == "false" {
+		useWS = false
+	}
+
 	sb.WriteString("proxies:\n")
 
-	// 1. 永远先生成主节点代理配置
-	mainNodeName := "主节点"
-	var cfgTitle database.Config
-	if db.Where("`key` = ?", "site_title").First(&cfgTitle).Error == nil && cfgTitle.Value != "" {
-		mainNodeName = cfgTitle.Value
-	}
+	// 收集节点名
+	h2NodeNames := make([]string, 0, len(nodes)+1)
+	tjNodeNames := make([]string, 0, len(nodes)+1)
+
+	// ---- 1. 主节点 ----
+	tjMainName := "tcp-" + nodeLoc
+	h2MainName := "h-" + nodeLoc
+
 	sb.WriteString(fmt.Sprintf("  - name: \"%s\"\n    type: trojan\n    server: %s\n    port: %d\n    password: %s\n    udp: true\n    sni: %s\n    skip-cert-verify: true\n",
-		mainNodeName, defaultDomain, defaultPort, u.Password, defaultDomain))
-	if defaultWS {
+		tjMainName, defaultDomain, defaultPort, u.Password, defaultDomain))
+	if useWS && defaultWS {
 		sb.WriteString(fmt.Sprintf("    network: ws\n    ws-opts:\n      path: \"%s\"\n      headers:\n        Host: %s\n", defaultWSPath, defaultDomain))
 	}
 	sb.WriteString("\n")
+	tjNodeNames = append(tjNodeNames, tjMainName)
 
-	// 2. 依次生成从节点代理配置
+	if h2Enabled {
+		sb.WriteString(fmt.Sprintf("  - name: \"%s\"\n    type: hysteria2\n    server: %s\n    port: %s\n    password: %s\n    sni: %s\n    skip-cert-verify: true\n    up: \"%s\"\n    down: \"%s\"\n",
+			h2MainName, defaultDomain, h2PortStr, u.Password, defaultDomain, h2UpStr, h2DownStr))
+		sb.WriteString("\n")
+		h2NodeNames = append(h2NodeNames, h2MainName)
+	}
+
+	// ---- 2. 从节点 ----
 	for _, node := range nodes {
 		nodeName := node.Name
 		if nodeName == "" {
 			nodeName = node.Address
 		}
+
+		tjSlaveName := "tcp-" + nodeName
 		sb.WriteString(fmt.Sprintf("  - name: \"%s\"\n    type: trojan\n    server: %s\n    port: %d\n    password: %s\n    udp: true\n    sni: %s\n    skip-cert-verify: true\n",
-			nodeName, node.Address, node.Port, u.Password, node.Address))
-		if node.WSEnabled {
+			tjSlaveName, node.Address, node.Port, u.Password, node.Address))
+		if useWS && node.WSEnabled {
 			sb.WriteString(fmt.Sprintf("    network: ws\n    ws-opts:\n      path: \"%s\"\n      headers:\n        Host: %s\n", node.WSPath, node.Address))
 		}
 		sb.WriteString("\n")
-	}
+		tjNodeNames = append(tjNodeNames, tjSlaveName)
 
-	// 收集全部节点名（主节点 + 从节点），用于生成代理组
-	nodeNames := make([]string, 0, len(nodes)+1)
-	nodeNames = append(nodeNames, mainNodeName)
-	for _, node := range nodes {
-		nodeName := node.Name
-		if nodeName == "" {
-			nodeName = node.Address
+		if h2Enabled {
+			h2SlaveName := "h-" + nodeName
+			sb.WriteString(fmt.Sprintf("  - name: \"%s\"\n    type: hysteria2\n    server: %s\n    port: %s\n    password: %s\n    sni: %s\n    skip-cert-verify: true\n    up: \"%s\"\n    down: \"%s\"\n",
+				h2SlaveName, node.Address, h2PortStr, u.Password, node.Address, h2UpStr, h2DownStr))
+			sb.WriteString("\n")
+			h2NodeNames = append(h2NodeNames, h2SlaveName)
 		}
-		nodeNames = append(nodeNames, nodeName)
 	}
 
-	// PROXY: 手动选择组，第一项为"自动选择"，用户默认无需干预即走最低延迟节点
-	sb.WriteString("proxy-groups:\n  - name: \"PROXY\"\n    type: select\n    proxies:\n")
-	sb.WriteString("      - \"自动选择\"\n")
-	for _, name := range nodeNames {
-		sb.WriteString(fmt.Sprintf("      - \"%s\"\n", name))
+	// ---- 代理组 ----
+	sb.WriteString("proxy-groups:\n")
+	sb.WriteString("  - name: \"PROXY\"\n    type: select\n    proxies:\n")
+
+	if h2Enabled && len(h2NodeNames) > 0 {
+		sb.WriteString("      - \"HYSTERIA\"\n")
+		sb.WriteString("      - \"TROJAN\"\n")
+	} else {
+		sb.WriteString("      - \"TROJAN\"\n")
+		for _, name := range tjNodeNames {
+			sb.WriteString(fmt.Sprintf("      - \"%s\"\n", name))
+		}
 	}
 
-	// 自动选择: url-test 组，客户端周期性测速自动挑选延迟最低的节点（电信/移动线路自适应）
-	sb.WriteString("  - name: \"自动选择\"\n    type: url-test\n    url: http://www.gstatic.com/generate_204\n    interval: 300\n    tolerance: 50\n    proxies:\n")
-	for _, name := range nodeNames {
-		sb.WriteString(fmt.Sprintf("      - \"%s\"\n", name))
+	if h2Enabled && len(h2NodeNames) > 0 {
+		sb.WriteString(fmt.Sprintf("  - name: \"HYSTERIA\"\n    type: fallback\n    url: %s\n    interval: 300\n    proxies:\n", testURL))
+		for _, name := range h2NodeNames {
+			sb.WriteString(fmt.Sprintf("      - \"%s\"\n", name))
+		}
+		sb.WriteString(fmt.Sprintf("  - name: \"TROJAN\"\n    type: url-test\n    url: %s\n    interval: 300\n    tolerance: 50\n    proxies:\n", testURL))
+		for _, name := range tjNodeNames {
+			sb.WriteString(fmt.Sprintf("      - \"%s\"\n", name))
+		}
+	} else {
+		sb.WriteString(fmt.Sprintf("  - name: \"TROJAN\"\n    type: url-test\n    url: %s\n    interval: 300\n    tolerance: 50\n    proxies:\n", testURL))
+		for _, name := range tjNodeNames {
+			sb.WriteString(fmt.Sprintf("      - \"%s\"\n", name))
+		}
 	}
 
 	if rulesStr != "" {
