@@ -119,8 +119,8 @@ func (c *Client) newMuxClient() (*smuxClientInfo, error) {
 		KeepAliveTimeout:  45 * time.Second,     // default 30s
 		KeepAliveDisabled: false,
 		MaxFrameSize:      32768,                // 32KB frames
-		MaxReceiveBuffer:  8 * 1024 * 1024,     // 8MB receive window for high-BDP links
-		MaxStreamBuffer:   2 * 1024 * 1024,     // 2MB per-stream buffer
+		MaxReceiveBuffer:  4 * 1024 * 1024,     // 4MB receive window (reduced from 8MB to limit head-of-line blocking)
+		MaxStreamBuffer:   1 * 1024 * 1024,     // 1MB per-stream buffer (reduced from 2MB)
 	}
 	client, err := smux.Client(conn, smuxConfig)
 	if err != nil {

@@ -1160,7 +1160,7 @@ func generateClashConfigMultiNode(db *gorm.DB, u database.User, nodes []database
 	if cfg, err := getConfigValue(db, "hysteria_port"); err == nil && cfg != "" {
 		h2PortStr = cfg
 	}
-	h2UpStr := "50"
+	h2UpStr := "100"
 	if cfg, err := getConfigValue(db, "hysteria_up_mbps"); err == nil && cfg != "" {
 		h2UpStr = cfg
 	}

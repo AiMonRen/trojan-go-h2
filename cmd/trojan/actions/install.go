@@ -212,7 +212,7 @@ func InitDeployMaster() {
 	h2Enabled := false
 	h2Port := 8443
 	h2Up := 100
-	h2Down := 500
+	h2Down := 300
 	h2Ans := getStdin("8. 是否启用 Hysteria2 (QUIC/UDP) 主力协议？(y/n, 默认 n): ", "8. Enable Hysteria2 (QUIC/UDP) protocol? (y/n, default n): ")
 	if h2Ans == "y" || h2Ans == "Y" {
 		h2Enabled = true
@@ -220,11 +220,11 @@ func InitDeployMaster() {
 		if h2PortStr != "" {
 			fmt.Sscanf(h2PortStr, "%d", &h2Port)
 		}
-		h2UpStr := getStdin("   上行带宽 Mbps (默认 100): ", "   Upstream bandwidth Mbps (default 100): ")
+		h2UpStr := getStdin("   上行带宽 Mbps（请填写 VPS 实际上行带宽，默认 100）: ", "   Upstream bandwidth Mbps (enter VPS actual uplink, default 100): ")
 		if h2UpStr != "" {
 			fmt.Sscanf(h2UpStr, "%d", &h2Up)
 		}
-		h2DownStr := getStdin("   下行带宽 Mbps (默认 500): ", "   Downstream bandwidth Mbps (default 500): ")
+		h2DownStr := getStdin("   下行带宽 Mbps（请填写 VPS 实际下行带宽，默认 300）: ", "   Downstream bandwidth Mbps (enter VPS actual downlink, default 300): ")
 		if h2DownStr != "" {
 			fmt.Sscanf(h2DownStr, "%d", &h2Down)
 		}
@@ -849,7 +849,7 @@ func InitDeployWorker() {
 	wh2Enabled := false
 	wh2Port := 8443
 	wh2Up := 100
-	wh2Down := 500
+	wh2Down := 300
 	wh2Ans := getStdin("10. 是否启用 Hysteria2 (QUIC/UDP) 协议？(y/n, 默认 n): ", "10. Enable Hysteria2 (QUIC/UDP) protocol? (y/n, default n): ")
 	if wh2Ans == "y" || wh2Ans == "Y" {
 		wh2Enabled = true
@@ -857,11 +857,11 @@ func InitDeployWorker() {
 		if wh2PortStr != "" {
 			fmt.Sscanf(wh2PortStr, "%d", &wh2Port)
 		}
-		wh2UpStr := getStdin("    上行带宽 Mbps (默认 100): ", "    Upstream bandwidth Mbps (default 100): ")
+		wh2UpStr := getStdin("    上行带宽 Mbps（请填写 VPS 实际上行带宽，默认 100）: ", "    Upstream bandwidth Mbps (enter VPS actual uplink, default 100): ")
 		if wh2UpStr != "" {
 			fmt.Sscanf(wh2UpStr, "%d", &wh2Up)
 		}
-		wh2DownStr := getStdin("    下行带宽 Mbps (默认 500): ", "    Downstream bandwidth Mbps (default 500): ")
+		wh2DownStr := getStdin("    下行带宽 Mbps（请填写 VPS 实际下行带宽，默认 300）: ", "    Downstream bandwidth Mbps (enter VPS actual downlink, default 300): ")
 		if wh2DownStr != "" {
 			fmt.Sscanf(wh2DownStr, "%d", &wh2Down)
 		}
