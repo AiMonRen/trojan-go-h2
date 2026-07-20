@@ -191,6 +191,18 @@ func InitDb(dbPath string) (*gorm.DB, error) {
 		{Key: "hysteria_up_mbps", Value: "100"},
 		{Key: "hysteria_down_mbps", Value: "500"},
 		{Key: "hysteria_masquerade_url", Value: "https://www.bilibili.com"},
+		// VLESS + Reality 反封锁协议（偷合法网站 TLS 指纹，抵御 DPI 检测）
+		{Key: "reality_enabled", Value: "false"},
+		{Key: "reality_server_name", Value: "swdist.apple.com"},
+		{Key: "reality_private_key", Value: ""}, // 空=部署时自动生成
+		{Key: "reality_public_key", Value: ""},
+		{Key: "reality_short_id", Value: "8b9a1c3d"},
+		// TUIC 协议（QUIC/UDP，BBR 拥塞控制，Hysteria2 的高带宽备选）
+		{Key: "tuic_enabled", Value: "false"},
+		{Key: "tuic_port", Value: "9443"},
+		{Key: "tuic_congestion", Value: "bbr"},
+		// uTLS 指纹伪装（模拟 Chrome 浏览器的 TLS 握手特征）
+		{Key: "utls_fingerprint", Value: "chrome"},
 		// Clash 订阅节点显示名称中的地区标签（如 "美国"）
 		{Key: "node_location", Value: "节点"},
 		// Clash 测试延迟的测速 URL（0=关闭 url-test）

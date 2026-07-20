@@ -600,8 +600,10 @@ tls:
   cert: %s
   key: %s
 auth:
-  type: password
-  password: {{需要套用 Trojan 密码，在 Web 面板管理用户}}
+  type: http
+  http:
+    url: http://127.0.0.1:%d/admin/api/hysteria/auth
+    insecure: true
 masquerade:
   type: proxy
   proxy:
@@ -617,7 +619,7 @@ quic:
 bandwidth:
   up: %d mbps
   down: %d mbps
-`, h2Port, crtPath, keyPath, h2Up, h2Down)
+`, h2Port, crtPath, keyPath, adminPort, h2Up, h2Down)
 		hysteriaConfigPath := filepath.Join(deployPath, "hysteria.yaml")
 		os.WriteFile(hysteriaConfigPath, []byte(hysteriaConfig), 0644)
 		fmt.Printf("✓ Hysteria2 配置已生成 (%s)\n", hysteriaConfigPath)

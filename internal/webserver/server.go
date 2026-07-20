@@ -187,7 +187,9 @@ func New(db *gorm.DB, username, password, mountPath string, port int, wsEnabled 
 	apiGroup.POST("/login", srv.handleLogin)
 	apiGroup.POST("/node/sync", srv.handleNodeSync)
 
-	// ─── Hysteria2 用户认证（Hysteria2 服务端 HTTP Auth 端点，无 JWT 鉴权） ──
+	// ─── 通用协议认证端点（Trojan/Hysteria2/VLESS/TUIC 共用，无 JWT 鉴权） ──
+	apiGroup.POST("/auth", srv.handleHysteriaAuth)
+	// 保留旧路径向后兼容
 	apiGroup.POST("/hysteria/auth", srv.handleHysteriaAuth)
 
 	// ─── 需要鉴权的管理 API ──────────────────────────────
@@ -1169,6 +1171,38 @@ func generateClashConfigMultiNode(db *gorm.DB, u database.User, nodes []database
 		h2DownStr = cfg
 	}
 
+	// VLESS Reality 反封锁协议配置
+	realityEnabled := db.Where("`key` = ? AND value = ?", "reality_enabled", "true").First(&database.Config{}).Error == nil
+	realityPubKey := ""
+	realityShortID := "8b9a1c3d"
+	realitySN := "swdist.apple.com"
+	if cfg, err := getConfigValue(db, "reality_public_key"); err == nil && cfg != "" {
+		realityPubKey = cfg
+	}
+	if cfg, err := getConfigValue(db, "reality_short_id"); err == nil && cfg != "" {
+		realityShortID = cfg
+	}
+	if cfg, err := getConfigValue(db, "reality_server_name"); err == nil && cfg != "" {
+		realitySN = cfg
+	}
+	// TUIC 协议配置（QUIC/UDP，BBR 拥塞控制）
+	tuicEnabled := db.Where("`key` = ? AND value = ?", "tuic_enabled", "true").First(&database.Config{}).Error == nil
+	tuicPort := "9443"
+	if cfg, err := getConfigValue(db, "tuic_port"); err == nil && cfg != "" {
+		tuicPort = cfg
+	}
+	// TUIC 固定 UUID（与 sing-box 服务端配置一致，否则 Clash 生成的非标准 UUID 会被拒）
+	tuicUUID := u.Password
+	if cfg, err := getConfigValue(db, "tuic_uuid"); err == nil && cfg != "" {
+		tuicUUID = cfg
+	}
+
+	// VLESS Reality 端口（独立 7443 避免和 Trojan 冲突）
+	realityPort := 7443
+	if cfg, err := getConfigValue(db, "reality_port"); err == nil && cfg != "" {
+		fmt.Sscanf(cfg, "%d", &realityPort)
+	}
+
 	// 节点地区标签（如 "美国"）
 	nodeLoc := "节点"
 	if cfg, err := getConfigValue(db, "node_location"); err == nil && cfg != "" {
@@ -1192,6 +1226,8 @@ func generateClashConfigMultiNode(db *gorm.DB, u database.User, nodes []database
 	// 收集节点名
 	h2NodeNames := make([]string, 0, len(nodes)+1)
 	tjNodeNames := make([]string, 0, len(nodes)+1)
+	vlNodeNames := make([]string, 0, len(nodes)+1)
+	tuNodeNames := make([]string, 0, len(nodes)+1)
 
 	// ---- 1. 主节点 ----
 	tjMainName := "tcp-" + nodeLoc
@@ -1210,6 +1246,25 @@ func generateClashConfigMultiNode(db *gorm.DB, u database.User, nodes []database
 			h2MainName, defaultDomain, h2PortStr, u.Password, defaultDomain, h2UpStr, h2DownStr))
 		sb.WriteString("\n")
 		h2NodeNames = append(h2NodeNames, h2MainName)
+	}
+
+	// VLESS Reality 主力节点（如果启用）
+	if realityEnabled && realityPubKey != "" {
+		vlMainName := "vl-" + nodeLoc
+		vlUUID := u.Password // 复用 Trojan 密码作为 VLESS UUID（或从配置读取）
+		sb.WriteString(fmt.Sprintf("  - name: \"%s\"\n    type: vless\n    server: %s\n    port: %d\n    uuid: %s\n    flow: xtls-rprx-vision\n    tls: true\n    servername: %s\n    reality-opts:\n      public-key: %s\n      short-id: \"%s\"\n    client-fingerprint: chrome\n",
+			vlMainName, defaultDomain, realityPort, vlUUID, realitySN, realityPubKey, realityShortID))
+		sb.WriteString("\n")
+		vlNodeNames = append(vlNodeNames, vlMainName)
+	}
+
+	// TUIC 节点（如果启用）
+	if tuicEnabled {
+		tuMainName := "tu-" + nodeLoc
+		sb.WriteString(fmt.Sprintf("  - name: \"%s\"\n    type: tuic\n    server: %s\n    port: %s\n    uuid: %s\n    password: %s\n    sni: %s\n    skip-cert-verify: true\n    heartbeat-interval: 10000\n    alpn:\n      - h3\n",
+			tuMainName, defaultDomain, tuicPort, tuicUUID, u.Password, defaultDomain))
+		sb.WriteString("\n")
+		tuNodeNames = append(tuNodeNames, tuMainName)
 	}
 
 	// ---- 2. 从节点 ----
@@ -1235,6 +1290,25 @@ func generateClashConfigMultiNode(db *gorm.DB, u database.User, nodes []database
 			sb.WriteString("\n")
 			h2NodeNames = append(h2NodeNames, h2SlaveName)
 		}
+
+		// VLESS Reality 从节点
+		if realityEnabled && realityPubKey != "" {
+			vlSlaveName := "vl-" + nodeName
+			vlUUID := u.Password
+			sb.WriteString(fmt.Sprintf("  - name: \"%s\"\n    type: vless\n    server: %s\n    port: %d\n    uuid: %s\n    flow: xtls-rprx-vision\n    tls: true\n    servername: %s\n    reality-opts:\n      public-key: %s\n      short-id: \"%s\"\n    client-fingerprint: chrome\n",
+				vlSlaveName, node.Address, realityPort, vlUUID, realitySN, realityPubKey, realityShortID))
+			sb.WriteString("\n")
+			vlNodeNames = append(vlNodeNames, vlSlaveName)
+		}
+
+		// TUIC 从节点
+		if tuicEnabled {
+			tuSlaveName := "tu-" + nodeName
+			sb.WriteString(fmt.Sprintf("  - name: \"%s\"\n    type: tuic\n    server: %s\n    port: %s\n    uuid: %s\n    password: %s\n    sni: %s\n    skip-cert-verify: true\n    heartbeat-interval: 10000\n    alpn:\n      - h3\n",
+				tuSlaveName, node.Address, tuicPort, tuicUUID, u.Password, node.Address))
+			sb.WriteString("\n")
+			tuNodeNames = append(tuNodeNames, tuSlaveName)
+		}
 	}
 
 	// ---- 代理组 ----
@@ -1250,9 +1324,21 @@ func generateClashConfigMultiNode(db *gorm.DB, u database.User, nodes []database
 		for _, name := range tjNodeNames {
 			sb.WriteString(fmt.Sprintf("      - \"%s\"\n", name))
 		}
+		for _, name := range vlNodeNames {
+			sb.WriteString(fmt.Sprintf("      - \"%s\"\n", name))
+		}
+		for _, name := range tuNodeNames {
+			sb.WriteString(fmt.Sprintf("      - \"%s\"\n", name))
+		}
 	} else {
 		sb.WriteString("      - \"TROJAN\"\n")
 		for _, name := range tjNodeNames {
+			sb.WriteString(fmt.Sprintf("      - \"%s\"\n", name))
+		}
+		for _, name := range vlNodeNames {
+			sb.WriteString(fmt.Sprintf("      - \"%s\"\n", name))
+		}
+		for _, name := range tuNodeNames {
 			sb.WriteString(fmt.Sprintf("      - \"%s\"\n", name))
 		}
 	}
@@ -1261,6 +1347,20 @@ func generateClashConfigMultiNode(db *gorm.DB, u database.User, nodes []database
 		sb.WriteString(fmt.Sprintf("  - name: \"HYSTERIA\"\n    type: fallback\n    url: %s\n    interval: 300\n    proxies:\n", testURL))
 		for _, name := range h2NodeNames {
 			sb.WriteString(fmt.Sprintf("      - \"%s\"\n", name))
+		}
+		// VLESS Reality fallback 组
+		if len(vlNodeNames) > 0 {
+			sb.WriteString(fmt.Sprintf("  - name: \"REALITY\"\n    type: fallback\n    url: %s\n    interval: 300\n    proxies:\n", testURL))
+			for _, name := range vlNodeNames {
+				sb.WriteString(fmt.Sprintf("      - \"%s\"\n", name))
+			}
+		}
+		// TUIC url-test 组
+		if len(tuNodeNames) > 0 {
+			sb.WriteString(fmt.Sprintf("  - name: \"TUIC\"\n    type: url-test\n    url: %s\n    interval: 300\n    tolerance: 50\n    proxies:\n", testURL))
+			for _, name := range tuNodeNames {
+				sb.WriteString(fmt.Sprintf("      - \"%s\"\n", name))
+			}
 		}
 		sb.WriteString(fmt.Sprintf("  - name: \"TROJAN\"\n    type: url-test\n    url: %s\n    interval: 300\n    tolerance: 50\n    proxies:\n", testURL))
 		for _, name := range tjNodeNames {
