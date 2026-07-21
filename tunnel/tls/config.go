@@ -56,8 +56,7 @@ func init() {
 				Verify:         true,
 				VerifyHostName: true,
 				Fingerprint:    "",
-				ReuseSession:   true,                        // default on: saves 1-2 RTT on repeat connections
-				ALPN:           []string{"h2", "http/1.1"}, // advertise HTTP/2 support
+				ALPN:           []string{"http/1.1"},
 			},
 			Admin: AdminConfig{
 				Username:       "admin",

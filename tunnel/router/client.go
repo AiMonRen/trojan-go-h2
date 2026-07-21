@@ -7,8 +7,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"sync"
-	"time"
 
 	v2router "github.com/v2fly/v2ray-core/v4/app/router"
 
@@ -34,38 +32,6 @@ const (
 )
 
 const MaxPacketSize = 1024 * 8
-
-// dnsCache is a simple TTL-based DNS resolution cache.
-// It avoids redundant OS/network DNS lookups when the router uses
-// IPIfNonMatch or IPOnDemand strategies for the same domain repeatedly.
-type dnsCacheEntry struct {
-	ip        net.IP
-	expiresAt time.Time
-}
-
-type dnsCache struct {
-	mu      sync.RWMutex
-	entries map[string]dnsCacheEntry
-}
-
-func (dc *dnsCache) lookup(domain string) (net.IP, bool) {
-	dc.mu.RLock()
-	defer dc.mu.RUnlock()
-	e, ok := dc.entries[domain]
-	if !ok || time.Now().After(e.expiresAt) {
-		return nil, false
-	}
-	return e.ip, true
-}
-
-func (dc *dnsCache) set(domain string, ip net.IP, ttl time.Duration) {
-	dc.mu.Lock()
-	defer dc.mu.Unlock()
-	dc.entries[domain] = dnsCacheEntry{ip: ip, expiresAt: time.Now().Add(ttl)}
-}
-
-// globalDNSCache is shared across all router Client instances for the process lifetime.
-var globalDNSCache = &dnsCache{entries: make(map[string]dnsCacheEntry)}
 
 func matchDomain(list []*v2router.Domain, target string) bool {
 	for _, d := range list {
@@ -137,20 +103,10 @@ func matchIP(list []*v2router.CIDR, target net.IP) bool {
 }
 
 func newIPAddress(address *tunnel.Address) (*tunnel.Address, error) {
-	if cached, ok := globalDNSCache.lookup(address.DomainName); ok {
-		newAddress := &tunnel.Address{IP: cached, Port: address.Port}
-		if cached.To4() != nil {
-			newAddress.AddressType = tunnel.IPv4
-		} else {
-			newAddress.AddressType = tunnel.IPv6
-		}
-		return newAddress, nil
-	}
 	ip, err := address.ResolveIP()
 	if err != nil {
 		return nil, common.NewError("router failed to resolve ip").Base(err)
 	}
-	globalDNSCache.set(address.DomainName, ip, 60*time.Second)
 	newAddress := &tunnel.Address{
 		IP:   ip,
 		Port: address.Port,
