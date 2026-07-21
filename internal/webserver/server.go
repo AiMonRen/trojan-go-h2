@@ -1232,6 +1232,14 @@ func generateClashConfigMultiNode(db *gorm.DB, u database.User, nodes []database
 		nodeLoc = cfg
 	}
 
+	// sniFor 决定 SNI 字段：节点自定义 SNI 优先，否则用 Address（不合法 IP 需设 SNI）
+	sniFor := func(addr, custom string) string {
+		if custom != "" {
+			return custom
+		}
+		return addr
+	}
+
 	// 测速 URL（默认用 Cloudflare 端点，比 gstatic 在国内快）
 	testURL := "http://cp.cloudflare.com/generate_204"
 	if cfg, err := getConfigValue(db, "clash_test_url"); err == nil && cfg != "" && cfg != "0" {
@@ -1299,7 +1307,7 @@ func generateClashConfigMultiNode(db *gorm.DB, u database.User, nodes []database
 
 		tjSlaveName := "tcp-" + nodeName
 		sb.WriteString(fmt.Sprintf("  - name: \"%s\"\n    type: trojan\n    server: %s\n    port: %d\n    password: %s\n    udp: true\n    sni: %s\n    skip-cert-verify: true\n",
-			tjSlaveName, node.Address, node.Port, u.Password, node.Address))
+			tjSlaveName, node.Address, node.Port, u.Password, sniFor(node.Address, node.SNI)))
 		if useWS && node.WSEnabled {
 			sb.WriteString(fmt.Sprintf("    network: ws\n    ws-opts:\n      path: \"%s\"\n      headers:\n        Host: %s\n", node.WSPath, node.Address))
 		}
@@ -1309,7 +1317,7 @@ func generateClashConfigMultiNode(db *gorm.DB, u database.User, nodes []database
 		if h2Enabled {
 			h2SlaveName := "h-" + nodeName
 			sb.WriteString(fmt.Sprintf("  - name: \"%s\"\n    type: hysteria2\n    server: %s\n    port: %s\n    password: %s\n    sni: %s\n    skip-cert-verify: true\n    up: \"%s\"\n    down: \"%s\"\n",
-				h2SlaveName, node.Address, h2PortStr, u.Password, node.Address, h2UpStr, h2DownStr))
+				h2SlaveName, node.Address, h2PortStr, u.Password, sniFor(node.Address, node.SNI), h2UpStr, h2DownStr))
 			sb.WriteString("\n")
 			h2NodeNames = append(h2NodeNames, h2SlaveName)
 		}

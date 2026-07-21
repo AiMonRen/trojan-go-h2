@@ -49,6 +49,7 @@ type Node struct {
 	// Clash 订阅所需参数
 	WSEnabled     bool       `gorm:"default:false" json:"ws_enabled"`     // 是否启用 Websocket
 	WSPath        string     `gorm:"size:255;default:'/trojan-go'" json:"ws_path"` // Websocket 路径
+	SNI           string     `gorm:"size:255" json:"sni"`                  // TLS SNI 字段（空=使用 Address）
 }
 
 // InitDb 初始化数据库
