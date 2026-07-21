@@ -1304,6 +1304,7 @@ func generateClashConfigMultiNode(db *gorm.DB, u database.User, nodes []database
 		if nodeName == "" {
 			nodeName = node.Address
 		}
+		isRelay := strings.Contains(nodeName, "(港转)") || strings.Contains(nodeName, "(转)")
 
 		tjSlaveName := "tcp-" + nodeName
 		sb.WriteString(fmt.Sprintf("  - name: \"%s\"\n    type: trojan\n    server: %s\n    port: %d\n    password: %s\n    udp: true\n    sni: %s\n    skip-cert-verify: true\n",
@@ -1313,6 +1314,11 @@ func generateClashConfigMultiNode(db *gorm.DB, u database.User, nodes []database
 		}
 		sb.WriteString("\n")
 		tjNodeNames = append(tjNodeNames, tjSlaveName)
+
+		// 中继节点仅生成 TCP/Trojan 变体，Hysteria2/VLESS 不可经由 TCP 中转
+		if isRelay {
+			continue
+		}
 
 		if h2Enabled {
 			h2SlaveName := "h-" + nodeName
