@@ -1273,7 +1273,7 @@ func generateClashConfigMultiNode(db *gorm.DB, u database.User, nodes []database
 	tjNodeNames = append(tjNodeNames, tjMainName)
 
 	if h2Enabled {
-		sb.WriteString(fmt.Sprintf("  - name: \"%s\"\n    type: hysteria2\n    server: %s\n    port: %s\n    password: %s\n    sni: %s\n    skip-cert-verify: true\n    up: %s Mbps\n    down: %s Mbps\n",
+		sb.WriteString(fmt.Sprintf("  - name: \"%s\"\n    type: hysteria2\n    server: %s\n    port: %s\n    password: %s\n    sni: %s\n    skip-cert-verify: true\n    up: \"%s Mbps\"\n    down: \"%s Mbps\"\n",
 			h2MainName, defaultDomain, h2PortStr, u.Password, defaultDomain, h2UpStr, h2DownStr))
 		sb.WriteString("\n")
 		h2NodeNames = append(h2NodeNames, h2MainName)
@@ -1316,7 +1316,7 @@ func generateClashConfigMultiNode(db *gorm.DB, u database.User, nodes []database
 
 		if h2Enabled {
 			h2SlaveName := "h-" + nodeName
-			sb.WriteString(fmt.Sprintf("  - name: \"%s\"\n    type: hysteria2\n    server: %s\n    port: %s\n    password: %s\n    sni: %s\n    skip-cert-verify: true\n    up: %s Mbps\n    down: %s Mbps\n",
+			sb.WriteString(fmt.Sprintf("  - name: \"%s\"\n    type: hysteria2\n    server: %s\n    port: %s\n    password: %s\n    sni: %s\n    skip-cert-verify: true\n    up: \"%s Mbps\"\n    down: \"%s Mbps\"\n",
 				h2SlaveName, node.Address, h2PortStr, u.Password, sniFor(node.Address, node.SNI), h2UpStr, h2DownStr))
 			sb.WriteString("\n")
 			h2NodeNames = append(h2NodeNames, h2SlaveName)
