@@ -211,7 +211,7 @@ func InitDb(dbPath string) (*gorm.DB, error) {
 		{Key: "sub_use_ws", Value: "false"},
 	}
 	for _, seed := range seeds {
-		db.FirstOrCreate(&Config{}, seed)
+		db.Where("key = ?", seed.Key).FirstOrCreate(&Config{Key: seed.Key, Value: seed.Value})
 	}
 
 	// 补丁：修正历史存量数据中的错误规则组名称及 Google 直连逻辑错误 (静默处理)
