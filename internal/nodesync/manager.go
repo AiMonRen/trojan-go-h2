@@ -264,10 +264,10 @@ func (m *NodeSyncManager) heartbeatLoop(ctx context.Context) {
 // performHeartbeat sends a lightweight ping to the master's /node/heartbeat endpoint.
 // Failure is logged but not fatal — the sync loop will update LastHeartbeat on its next success.
 func (m *NodeSyncManager) performHeartbeat() {
-	heartbeatURL := m.masterURL
-	// If masterURL points to the sync endpoint, derive the heartbeat URL
-	// from it by replacing the path. For safety, use a relative path construction.
-	hbURL := heartbeatURL[:len(heartbeatURL)-len("/admin/api/node/sync")] + "/admin/api/node/heartbeat"
+	if m.masterURL == "" {
+		return
+	}
+	hbURL := m.masterURL[:len(m.masterURL)-len("/admin/api/node/sync")] + "/admin/api/node/heartbeat"
 
 	req, err := http.NewRequest("POST", hbURL, nil)
 	if err != nil {
