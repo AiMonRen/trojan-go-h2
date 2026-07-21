@@ -187,7 +187,7 @@ func InitDb(dbPath string) (*gorm.DB, error) {
 		{Key: "traffic_reset_day", Value: "0"},
 		// Hysteria2 协议配置（QUIC/UDP 主力协议，Trojan 降级备用）
 		{Key: "hysteria_enabled", Value: "false"},
-		{Key: "hysteria_port", Value: "8443"},
+		{Key: "hysteria_port", Value: "443"},
 		{Key: "hysteria_up_mbps", Value: "100"},
 		{Key: "hysteria_down_mbps", Value: "500"},
 		{Key: "hysteria_masquerade_url", Value: "https://www.bilibili.com"},

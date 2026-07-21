@@ -1158,7 +1158,7 @@ func generateClashConfigMultiNode(db *gorm.DB, u database.User, nodes []database
 
 	h2Enabled := db.Where("`key` = ? AND value = ?", "hysteria_enabled", "true").First(&database.Config{}).Error == nil
 
-	h2PortStr := "8443"
+	h2PortStr := "443"
 	if cfg, err := getConfigValue(db, "hysteria_port"); err == nil && cfg != "" {
 		h2PortStr = cfg
 	}

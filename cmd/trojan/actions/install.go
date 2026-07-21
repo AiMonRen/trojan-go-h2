@@ -210,13 +210,13 @@ func InitDeployMaster() {
 
 	// 8. 是否启用 Hysteria2 (QUIC/UDP 主力协议)
 	h2Enabled := false
-	h2Port := 8443
+	h2Port := 443
 	h2Up := 100
 	h2Down := 300
 	h2Ans := getStdin("8. 是否启用 Hysteria2 (QUIC/UDP) 主力协议？(y/n, 默认 n): ", "8. Enable Hysteria2 (QUIC/UDP) protocol? (y/n, default n): ")
 	if h2Ans == "y" || h2Ans == "Y" {
 		h2Enabled = true
-		h2PortStr := getStdin("   Hysteria2 监听端口 (默认 8443): ", "   Hysteria2 listen port (default 8443): ")
+		h2PortStr := getStdin("   Hysteria2 监听端口 (默认 443): ", "   Hysteria2 listen port (default 443): ")
 		if h2PortStr != "" {
 			fmt.Sscanf(h2PortStr, "%d", &h2Port)
 		}
@@ -382,7 +382,7 @@ websocket:
 # [Hysteria2] 启用后 Clash 订阅会优先包含 Hysteria2 节点，Trojan 退居备用
 # hysteria2:
 #   enabled: true
-#   port: 8443
+#   port: 443
 #   up_mbps: 100
 #   down_mbps: 500
 #   masquerade_url: "https://www.bilibili.com"
@@ -500,7 +500,7 @@ admin:
 	if h2Enabled {
 		proxyContent = strings.ReplaceAll(proxyContent, "# hysteria2:", "hysteria2:")
 		proxyContent = strings.ReplaceAll(proxyContent, "#   enabled: true", "  enabled: true")
-		proxyContent = strings.ReplaceAll(proxyContent, "#   port: 8443", fmt.Sprintf("  port: %d", h2Port))
+		proxyContent = strings.ReplaceAll(proxyContent, "#   port: 443", fmt.Sprintf("  port: %d", h2Port))
 		proxyContent = strings.ReplaceAll(proxyContent, "#   up_mbps: 100", fmt.Sprintf("  up_mbps: %d", h2Up))
 		proxyContent = strings.ReplaceAll(proxyContent, "#   down_mbps: 500", fmt.Sprintf("  down_mbps: %d", h2Down))
 		proxyContent = strings.ReplaceAll(proxyContent, "#   masquerade_url: \"https://www.bilibili.com\"", "  masquerade_url: \"https://www.bilibili.com\"")
@@ -849,13 +849,13 @@ func InitDeployWorker() {
 
 	// 10. 是否启用 Hysteria2 (QUIC/UDP)
 	wh2Enabled := false
-	wh2Port := 8443
+	wh2Port := 443
 	wh2Up := 100
 	wh2Down := 300
 	wh2Ans := getStdin("10. 是否启用 Hysteria2 (QUIC/UDP) 协议？(y/n, 默认 n): ", "10. Enable Hysteria2 (QUIC/UDP) protocol? (y/n, default n): ")
 	if wh2Ans == "y" || wh2Ans == "Y" {
 		wh2Enabled = true
-		wh2PortStr := getStdin("    Hysteria2 监听端口 (默认 8443): ", "    Hysteria2 listen port (default 8443): ")
+		wh2PortStr := getStdin("    Hysteria2 监听端口 (默认 443): ", "    Hysteria2 listen port (default 443): ")
 		if wh2PortStr != "" {
 			fmt.Sscanf(wh2PortStr, "%d", &wh2Port)
 		}
