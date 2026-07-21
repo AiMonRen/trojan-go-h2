@@ -186,6 +186,7 @@ func New(db *gorm.DB, username, password, mountPath string, port int, wsEnabled 
 	// ─── 登录（无需鉴权） ──────────────────────────────
 	apiGroup.POST("/login", srv.handleLogin)
 	apiGroup.POST("/node/sync", srv.handleNodeSync)
+	apiGroup.POST("/node/heartbeat", srv.handleNodeHeartbeat)
 
 	// ─── 通用协议认证端点（Trojan/Hysteria2/VLESS/TUIC 共用，无 JWT 鉴权） ──
 	apiGroup.POST("/auth", srv.handleHysteriaAuth)
@@ -1029,6 +1030,28 @@ func (s *AdminServer) handleNodeSync(c *gin.Context) {
 		}
 	}
 	c.JSON(http.StatusOK, gin.H{"users": validHashes})
+}
+
+// handleNodeHeartbeat 从节点独立心跳上报（与数据同步解耦，30s 一次轻量 ping）
+func (s *AdminServer) handleNodeHeartbeat(c *gin.Context) {
+	secret := c.GetHeader("X-Node-Secret")
+	if secret == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "缺少通信密钥"})
+		return
+	}
+	var node database.Node
+	if err := s.db.Where("secret = ?", secret).First(&node).Error; err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "无效的通信密钥"})
+		return
+	}
+	now := time.Now()
+	node.LastHeartbeat = &now
+	node.Status = 1
+	if ip := c.ClientIP(); ip != "" && ip != "::1" && ip != "127.0.0.1" {
+		node.DetectedIP = ip
+	}
+	s.db.Save(&node)
+	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
 // ─── Hysteria2 协议管理 API ─────────────────────────

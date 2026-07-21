@@ -59,6 +59,7 @@ func (m *NodeSyncManager) AddAuthenticator(auth statistic.Authenticator) {
 
 func (m *NodeSyncManager) Start(ctx context.Context) {
 	go m.syncLoop(ctx)
+	go m.heartbeatLoop(ctx)
 }
 
 func (m *NodeSyncManager) Stop() {
@@ -235,5 +236,55 @@ func (m *NodeSyncManager) performSync() {
 			}
 			return nil
 		})
+	}
+}
+
+// heartbeatLoop sends lightweight heartbeats to the master every 30 seconds.
+// This is independent of the data sync loop so the master always knows
+// the slave is alive, even when there's no traffic or sync fails temporarily.
+func (m *NodeSyncManager) heartbeatLoop(ctx context.Context) {
+	// 等待认证器就绪
+	m.waitForAuth(3 * time.Second)
+
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			m.performHeartbeat()
+		case <-m.done:
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// performHeartbeat sends a lightweight ping to the master's /node/heartbeat endpoint.
+// Failure is logged but not fatal — the sync loop will update LastHeartbeat on its next success.
+func (m *NodeSyncManager) performHeartbeat() {
+	heartbeatURL := m.masterURL
+	// If masterURL points to the sync endpoint, derive the heartbeat URL
+	// from it by replacing the path. For safety, use a relative path construction.
+	hbURL := heartbeatURL[:len(heartbeatURL)-len("/admin/api/node/sync")] + "/admin/api/node/heartbeat"
+
+	req, err := http.NewRequest("POST", hbURL, nil)
+	if err != nil {
+		log.Warn("heartbeat: failed to create request:", err)
+		return
+	}
+	req.Header.Set("X-Node-Secret", m.secret)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Warn("heartbeat: request to master failed:", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Warnf("heartbeat: master returned abnormal status: %d", resp.StatusCode)
 	}
 }
