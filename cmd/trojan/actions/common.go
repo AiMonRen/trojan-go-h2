@@ -24,9 +24,9 @@ type legoUser struct {
 	key          *ecdsa.PrivateKey
 }
 
-func (u *legoUser) GetEmail() string                        { return u.Email }
+func (u *legoUser) GetEmail() string                       { return u.Email }
 func (u legoUser) GetRegistration() *registration.Resource { return u.Registration }
-func (u *legoUser) GetPrivateKey() crypto.PrivateKey        { return u.key }
+func (u *legoUser) GetPrivateKey() crypto.PrivateKey       { return u.key }
 
 // getStdin 获取用户输入
 func getStdin(promptCN, promptEN string) string {

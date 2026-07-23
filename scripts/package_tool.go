@@ -13,7 +13,7 @@ func main() {
 	// 1. 设置环境变量并编译
 	fmt.Println("正在编译 Trojan-Go (Linux amd64)...")
 	build("./cmd/trojan-go", "build/linux-amd64/trojan-go")
-	
+
 	fmt.Println("正在编译 Trojan CLI (Linux amd64)...")
 	build("./cmd/trojan", "build/linux-amd64/trojan")
 

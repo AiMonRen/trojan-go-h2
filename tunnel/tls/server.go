@@ -95,13 +95,18 @@ func (s *Server) acceptLoop() {
 			return
 		}
 		go func(conn net.Conn) {
+			// 证书热重载协程会替换 keyPair；先在同一把锁下复制默认值，
+			// 再交给 tls.Config，避免并发读写切片导致数据竞争。
+			s.keyPairLock.RLock()
+			certificates := append([]stdtls.Certificate(nil), s.keyPair...)
+			s.keyPairLock.RUnlock()
 			tlsConfig := &stdtls.Config{
 				CipherSuites:             s.cipherSuite,
 				PreferServerCipherSuites: s.PreferServerCipher,
 				SessionTicketsDisabled:   !s.sessionTicket,
 				NextProtos:               []string{"http/1.1"}, // 强制回退到 http/1.1 以匹配本地管理后台的解析能力
 				KeyLogWriter:             s.keyLogger,
-				Certificates:             s.keyPair, // 注入默认证书作为绕过 SNI 匹配的兜底
+				Certificates:             certificates, // 注入默认证书作为绕过 SNI 匹配的兜底
 				GetCertificate: func(hello *stdtls.ClientHelloInfo) (*stdtls.Certificate, error) {
 					s.keyPairLock.RLock()
 					defer s.keyPairLock.RUnlock()
@@ -405,6 +410,9 @@ func NewServer(ctx context.Context, underlay tunnel.Server) (*Server, error) {
 	}
 
 	if cfg.Admin.Enabled {
+		if strings.TrimSpace(cfg.Admin.Password) == "" {
+			return nil, common.NewError("admin panel is enabled but admin.password is empty")
+		}
 		db, err := database.InitDb(cfg.Admin.DbPath)
 		if err != nil {
 			log.Warn("admin panel: failed to init db:", err)

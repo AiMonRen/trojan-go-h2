@@ -16,7 +16,7 @@ type Config struct {
 type AdminConfig struct {
 	Enabled        bool   `json:"enabled" yaml:"enabled"`
 	Username       string `json:"username" yaml:"username"`               // Web 登录用户名，默认 admin
-	Password       string `json:"password" yaml:"password"`               // Web 登录密码，默认 trojan@123
+	Password       string `json:"password" yaml:"password"`               // Web 登录密码；启用管理面板时必须显式提供
 	Path           string `json:"path" yaml:"path"`                       // 管理面板挂载路径，默认 /admin/
 	DbPath         string `json:"db" yaml:"db"`                           // Sqlite 数据库路径，默认 /etc/trojan-go/trojan-go.db
 	Port           int    `json:"port" yaml:"port"`                       // Web 管理面板监听端口，默认 8080
@@ -60,7 +60,7 @@ func init() {
 			},
 			Admin: AdminConfig{
 				Username:       "admin",
-				Password:       "trojan@123",
+				Password:       "",
 				Path:           "/admin/",
 				DbPath:         "/etc/trojan-go/trojan-go.db",
 				Port:           8080,

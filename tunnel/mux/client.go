@@ -59,9 +59,11 @@ func (c *Client) cleanLoop() {
 		checkDuration = c.timeout / 4
 	}
 	log.Debug("check duration:", checkDuration.Seconds(), "s")
+	ticker := time.NewTicker(checkDuration)
+	defer ticker.Stop()
 	for {
 		select {
-		case <-time.After(checkDuration):
+		case <-ticker.C:
 			c.clientPoolLock.Lock()
 			for id, info := range c.clientPool {
 				if info.client.IsClosed() {
@@ -114,13 +116,13 @@ func (c *Client) newMuxClient() (*smuxClientInfo, error) {
 	conn = newStickyConn(conn)
 
 	smuxConfig := &smux.Config{
-		Version:           2,                    // v2: byte-based flow control, better for bulk transfers
-		KeepAliveInterval: 15 * time.Second,     // default 10s — reduced heartbeat frequency
-		KeepAliveTimeout:  45 * time.Second,     // default 30s
+		Version:           2,                // v2: byte-based flow control, better for bulk transfers
+		KeepAliveInterval: 15 * time.Second, // default 10s — reduced heartbeat frequency
+		KeepAliveTimeout:  45 * time.Second, // default 30s
 		KeepAliveDisabled: false,
-		MaxFrameSize:      32768,                // 32KB frames
-		MaxReceiveBuffer:  4 * 1024 * 1024,     // 4MB receive window (reduced from 8MB to limit head-of-line blocking)
-		MaxStreamBuffer:   1 * 1024 * 1024,     // 1MB per-stream buffer (reduced from 2MB)
+		MaxFrameSize:      32768,           // 32KB frames
+		MaxReceiveBuffer:  4 * 1024 * 1024, // 4MB receive window (reduced from 8MB to limit head-of-line blocking)
+		MaxStreamBuffer:   1 * 1024 * 1024, // 1MB per-stream buffer (reduced from 2MB)
 	}
 	client, err := smux.Client(conn, smuxConfig)
 	if err != nil {

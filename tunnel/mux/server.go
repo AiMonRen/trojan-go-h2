@@ -38,8 +38,10 @@ func (s *Server) acceptConnWorker() {
 				KeepAliveTimeout:  45 * time.Second,
 				KeepAliveDisabled: false,
 				MaxFrameSize:      32768,
-				MaxReceiveBuffer:  8 * 1024 * 1024,
-				MaxStreamBuffer:   2 * 1024 * 1024,
+				// Keep both ends symmetric. Mismatched windows make memory use and
+				// backpressure dependent on which side accepted the underlay connection.
+				MaxReceiveBuffer: 4 * 1024 * 1024,
+				MaxStreamBuffer:  1 * 1024 * 1024,
 			}
 			smuxSession, err := smux.Server(conn, smuxConfig)
 			if err != nil {

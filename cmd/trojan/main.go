@@ -9,6 +9,14 @@ import (
 )
 
 func main() {
+	if len(os.Args) == 4 && os.Args[1] == "cert-renew" && os.Args[2] == "--config" {
+		if err := actions.RenewCertificateFromConfig(os.Args[3]); err != nil {
+			fmt.Fprintf(os.Stderr, "certificate renewal failed: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	// 允许通过环境变量指定数据库路径
 	if dbPath := os.Getenv("TROJAN_DB"); dbPath != "" {
 		actions.SetDBPath(dbPath)

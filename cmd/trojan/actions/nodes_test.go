@@ -4,25 +4,25 @@ import (
 	"bytes"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/google/uuid"
 	"github.com/voidluo/trojan-go/internal/database"
 )
 
-func setupTestDB(t *testing.T) {
-	// 强制指向测试本地数据库
-	dbPath = "test_nodes.db"
-	os.Remove(dbPath) // 确保初始为空
-}
-
-func teardownTestDB() {
-	os.Remove(dbPath)
+func setupTestDB(t *testing.T) func() {
+	t.Helper()
+	originalDBPath := dbPath
+	t.Setenv("TROJAN_CREDENTIAL_KEY_FILE", filepath.Join(t.TempDir(), "credentials.key"))
+	dbPath = filepath.Join(t.TempDir(), "nodes.db")
+	return func() {
+		dbPath = originalDBPath
+	}
 }
 
 func TestNodeCRUD(t *testing.T) {
-	setupTestDB(t)
+	teardownTestDB := setupTestDB(t)
 	defer teardownTestDB()
 
 	db, err := database.InitDb(dbPath)
@@ -33,18 +33,18 @@ func TestNodeCRUD(t *testing.T) {
 	// ----------------- 1. 测试添加节点 (NodeAdd) -----------------
 	// 模拟交互输入: 名称\n地址\n端口\n倍率\nws(y)\nws路径\n
 	input := "HK-01\nhk.example.com\n443\n1.2\ny\n/ws-path\n"
-	
+
 	oldStdin := os.Stdin
 	r, w, _ := os.Pipe()
 	os.Stdin = r
-	
+
 	// 写入模拟输入
 	w.Write([]byte(input))
 	w.Close()
-	
+
 	// 执行添加
 	NodeAdd()
-	
+
 	// 恢复标准输入
 	os.Stdin = oldStdin
 	r.Close()
@@ -59,9 +59,9 @@ func TestNodeCRUD(t *testing.T) {
 		t.Errorf("Node fields mismatched: %+v", node)
 	}
 
-	// 验证 Secret 是否为合法的 UUID 格式
-	if _, err := uuid.Parse(node.Secret); err != nil {
-		t.Errorf("Secret is not a valid UUID: %s, error: %v", node.Secret, err)
+	// Secret is encrypted at rest and no longer stored as a reusable UUID.
+	if node.SecretCiphertext == "" || node.SecretHash == "" || strings.Contains(node.Secret, "-") {
+		t.Errorf("Node Secret storage is not encrypted: %+v", node)
 	}
 
 	// ----------------- 2. 测试列出节点 (NodeList) -----------------

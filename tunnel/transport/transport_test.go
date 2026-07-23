@@ -57,7 +57,7 @@ func TestTransport(t *testing.T) {
 	c.Close()
 }
 
-func TestClientPlugin(t *testing.T) {
+func TestClientPluginRejectsCommandOutsideWhitelist(t *testing.T) {
 	clientCfg := &Config{
 		LocalHost:  "127.0.0.1",
 		LocalPort:  common.PickPort("tcp", "127.0.0.1"),
@@ -67,17 +67,17 @@ func TestClientPlugin(t *testing.T) {
 			Enabled: true,
 			Type:    "shadowsocks",
 			Command: "echo $SS_REMOTE_PORT",
-			Option:  "",
-			Arg:     nil,
-			Env:     nil,
 		},
 	}
 	ctx := config.WithConfig(context.Background(), Name, clientCfg)
-	freedomCfg := &freedom.Config{}
-	ctx = config.WithConfig(ctx, freedom.Name, freedomCfg)
-	c, err := NewClient(ctx, nil)
-	common.Must(err)
-	c.Close()
+	ctx = config.WithConfig(ctx, freedom.Name, &freedom.Config{})
+	client, err := NewClient(ctx, nil)
+	if err == nil {
+		if client != nil {
+			_ = client.Close()
+		}
+		t.Fatal("expected an unsafe transport plugin command to be rejected")
+	}
 }
 
 func TestServerPlugin(t *testing.T) {

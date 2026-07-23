@@ -1,8 +1,10 @@
 package actions
 
 import (
+	cryptorand "crypto/rand"
 	"fmt"
-	"math/rand"
+	"math/big"
+	mathrand "math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -38,10 +40,39 @@ Commercial support is available at
 </body>
 </html>`
 
+func generateSecurePassword(length int) (string, error) {
+	const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789-_"
+	buf := make([]byte, length)
+	for i := range buf {
+		n, err := cryptorand.Int(cryptorand.Reader, big.NewInt(int64(len(alphabet))))
+		if err != nil {
+			return "", err
+		}
+		buf[i] = alphabet[n.Int64()]
+	}
+	return string(buf), nil
+}
+
+// promptAdminPassword refuses the historical weak default. A blank value creates
+// a high-entropy password and prints it once to the local deployment terminal.
+func promptAdminPassword(promptCN, promptEN string) string {
+	password := getStdin(promptCN, promptEN)
+	if password != "" {
+		return password
+	}
+	password, err := generateSecurePassword(24)
+	if err != nil {
+		fmt.Println("❌ 无法生成安全的管理面板密码，请手动输入密码后重试：", err)
+		return ""
+	}
+	fmt.Printf("\n\033[33m⚠ 已生成随机管理面板密码（仅显示本次，请立即安全保存）：%s\033[0m\n", password)
+	return password
+}
+
 // InitDeployMaster 初始化部署（主节点）一键化流程
 func InitDeployMaster() {
 	// 动态生成 6 位随机字符组成 websocket 路径
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	r := mathrand.New(mathrand.NewSource(time.Now().UnixNano()))
 	const letters = "abcdefghijklmnopqrstuvwxyz0123456789"
 	randChars := make([]byte, 6)
 	for i := range randChars {
@@ -128,10 +159,10 @@ func InitDeployMaster() {
 		adminUser = "admin"
 	}
 
-	// 5. 管理面板密码
-	adminPwd := getStdin("5. 设置管理面板密码 (默认 trojan@123): ", "5. Set admin password (default trojan@123): ")
+	// 5. 管理面板密码：不再使用历史弱默认密码。
+	adminPwd := promptAdminPassword("5. 设置管理面板密码（直接回车生成随机强密码）: ", "5. Set admin password (press Enter to generate a strong random password): ")
 	if adminPwd == "" {
-		adminPwd = "trojan@123"
+		return
 	}
 
 	// 6. 管理面板监听端口
@@ -242,17 +273,10 @@ func InitDeployMaster() {
 	}
 
 	tlsDir := filepath.Join(deployPath, "tls", domain)
-	os.MkdirAll(tlsDir, 0755)
-
 	crtPath := filepath.Join(tlsDir, domain+".crt")
 	keyPath := filepath.Join(tlsDir, domain+".key")
-
-	if err := os.WriteFile(crtPath, certs.Certificate, 0644); err != nil {
-		fmt.Printf("\033[31m❌ 写入证书失败: %v\033[0m\n", err)
-		return
-	}
-	if err := os.WriteFile(keyPath, certs.PrivateKey, 0600); err != nil {
-		fmt.Printf("\033[31m❌ 写入私钥失败: %v\033[0m\n", err)
+	if err := writeCertificateFiles(crtPath, keyPath, certs.Certificate, certs.PrivateKey); err != nil {
+		fmt.Printf("\033[31m❌ 写入证书或私钥失败: %v\033[0m\n", err)
 		return
 	}
 	fmt.Println("\033[32m✓ 证书已保存至:", tlsDir, "\033[0m")
@@ -295,224 +319,35 @@ func InitDeployMaster() {
 
 	// ─── 步骤 2: 生成配置文件 ────────────────────────────
 	fmt.Println("\n[2/5] 正在生成配置文件...")
-	
-	// 代理专用配置模板 (config.yaml)
-	proxyTmpl := `# =================================================================
-# Trojan-Go Core Proxy Configuration File (config.yaml)
-# Trojan-Go 核心代理配置文件 (config.yaml)
-# =================================================================
 
-# [Core Configuration] The run type of the service (server or client)
-# [核心配置] 服务运行类型 (server 或 client)
-run_type: server
-
-# [Core Configuration] The local IP address to listen on
-# [核心配置] 本地监听 IP 地址
-local_addr: 0.0.0.0
-
-# [Core Configuration] The local port to listen on
-# [核心配置] 本地监听端口
-local_port: {{.LocalPort}}
-
-# [Core Configuration] The destination server address to route connection (optional)
-# [核心配置] 目标代理转发目标地址（备用）
-remote_addr: 127.0.0.1
-
-# [Core Configuration] The destination server port to route connection (optional)
-# [核心配置] 目标代理转发目标端口（备用）
-remote_port: {{.AdminPort}}
-
-# [TLS Configuration] SSL settings
-# [TLS配置] SSL 证书与安全设定
-ssl:
-# [TLS Configuration] The certificate file path
-# [TLS配置] SSL 证书文件路径
-  cert: {{.CertPath}}
-
-# [TLS Configuration] The private key file path
-# [TLS配置] SSL 私钥文件路径
-  key: {{.KeyPath}}
-
-# [TLS Configuration] The server SNI (Server Name Indication)
-# [TLS配置] 预设的 SNI 证书匹配域名
-  sni: {{.Domain}}
-
-# [TLS Configuration] Whether to verify the client cert (false to improve compatibility)
-# [TLS配置] 是否验证客户端证书（设为 false 可提高兼容性）
-  verify: false
-
-# [TLS Configuration] Whether to verify host name in certificate
-# [TLS配置] 是否验证证书中的域名匹配（防 SNI 阻断）
-  verify_hostname: false
-
-# [TLS Configuration] The fallback address of plaintext http server (uncomment to use Nginx fallback)
-# [TLS配置] 原生 Fallback 本地反代地址（如果结合 Nginx 伪装则取消下面两行注释）
-#   fallback_addr: 127.0.0.1
-# [TLS Configuration] The fallback port of plaintext http server
-# [TLS配置] 原生 Fallback 本地反代端口
-#   fallback_port: 80
-
-# [TLS Configuration] The static HTML fallback webpage when no fallback port is configured
-# [TLS配置] 无 Nginx 情况下，未认证流量直接回送的本地静态网页（字节流形式）
-  plain_http_response: {{.DeployPath}}/index.html
-
-# [Multiplexing] Mux configuration
-# [多路复用] Mux 配置段，提高多小文件并发下的传输效率
-mux:
-# [Multiplexing] Whether to enable multiplexing
-# [多路复用] 是否开启多路复用
-  enabled: true
-
-# [WebSocket] WebSocket transport settings
-# [WebSocket] WebSocket 传输层协议伪装设置
-websocket:
-# [WebSocket] Whether to enable WebSocket camouflage
-# [WebSocket] 是否启用 WebSocket 伪装
-  enabled: true
-
-# [WebSocket] The path to listen on (Random path is recommended to bypass firewall)
-# [WebSocket] WebSocket 挂载路径（千万不要用 /ws 等常见词，模板使用随机路径）
-  path: "{{.WSPath}}"
-
-# [WebSocket] The SNI host to match
-# [WebSocket] WebSocket 域名头匹配
-  host: "{{.Domain}}"
-
-# [Hysteria2] Hysteria2 (QUIC/UDP) 协议配置 — 主力协议
-# [Hysteria2] 启用后 Clash 订阅会优先包含 Hysteria2 节点，Trojan 退居备用
-# hysteria2:
-#   enabled: true
-#   port: 443
-#   up_mbps: 100
-#   down_mbps: 500
-#   masquerade_url: "https://www.bilibili.com"
-#   auth_api: "http://127.0.0.1:{{.AdminPort}}/admin/api/hysteria/auth"
-
-# [Control Plane] Web admin server settings
-# [管理控制面] Web 管理后台与订阅接口配置
-admin:
-# [Control Plane] Whether to enable admin panel server
-# [管理控制面] 是否启用 Web 管理服务
-  enabled: true
-
-# [Control Plane] The login username of admin panel
-# [管理控制面] 管理面板的登录用户名
-  username: "{{.User}}"
-
-# [Control Plane] The login password of admin panel
-# [管理控制面] 管理面板的登录密码
-  password: "{{.Pass}}"
-
-# [Control Plane] The standalone port to listen on (default 8080 to avoid nginx conflicts)
-# [管理控制面] 管理面板监听的本地独立端口（默认为 127.0.0.1 独立监听）
-  port: {{.AdminPort}}
-
-# [Control Plane] The SQLite database file path or MySQL DSN
-# [管理控制面] 存储用户与节点数据的数据库路径或 DSN 链接
-  db: "{{.DbPath}}"
-
-# [Control Plane] The routing mount path of web UI
-# [管理控制面] 管理主界面的网页挂载路径，系统将强制清洗为 "/admin/"
-  path: /admin
-
-# [Control Plane] The dynamic obfuscated subscription path to download clash config
-# [管理控制面] 自定义加密订阅混淆路径（主节点），系统运行后将随机自动生成
-  sub_path: "{{.SubPath}}"
-
-# [Advanced Config] The redirect URL of unauthenticated http request
-# [高级配置] 未认证的 302 外部重定向跳转地址
-#   unauth_redirect: "https://your-redirect-domain.com"
-
-# [Advanced Config] The custom mask HTML file path for standalone admin port
-# [高级配置] 独立端口收到非 admin 访问时的本地伪装网页路径
-#   mask_html_path: "{{.DeployPath}}/index.html"
-
-# [Routing Policy] Custom router settings
-# [路由策略] 自定义路由策略（如果您需要绕过局域网和国内流量可取消下面注释）
-# router:
-# [Routing Policy] Whether to enable custom router
-# [路由策略] 是否启用自定义路由分流
-#   enabled: true
-# [Routing Policy] The bypass rules list
-# [路由策略] 默认直连的域名和 IP 段
-#   bypass:
-#     - geosite:cn
-#     - geoip:private
-
-# [Logging] System logs settings
-# [系统日志] 访问和错误日志配置文件路径
-log:
-# [Logging] Log level (0: TRACE, 1: INFO, 2: WARN, 3: ERROR)
-# [系统日志] 日志级别记录
-  level: 1
-
-# [Logging] Access log output path
-# [系统日志] 访问日志输出文件路径
-  access: {{.DeployPath}}/log/trojan-go/access.log
-
-# [Logging] Error log output path
-# [系统日志] 错误日志输出文件路径
-  error: {{.DeployPath}}/log/trojan-go/error.log
-`
-
-	// Web 专用配置模板 (web_config.yaml)
-	webTmpl := `# =================================================================
-# Trojan-Go Web Management Backend Configuration (web_config.yaml)
-# Trojan-Go Web 管理后台配置文件 (web_config.yaml)
-# =================================================================
-
-run_type: server
-
-admin:
-  enabled: true
-  username: "{{.User}}"    # 面板登录用户名
-  password: "{{.Pass}}"    # 面板登录密码
-  port: {{.AdminPort}}     # 服务真正在独立端口监听
-  db: "{{.DbPath}}"        # 数据库路径或 DSN
-  path: "/admin/"          # 面板挂载根路径
-  sub_path: "{{.SubPath}}" # 安全订阅下载路径
-`
-
-	os.MkdirAll(deployPath, 0755)
-	
-	// 填充替换逻辑
-	proxyContent := proxyTmpl
-	proxyContent = strings.ReplaceAll(proxyContent, "{{.CertPath}}", crtPath)
-	proxyContent = strings.ReplaceAll(proxyContent, "{{.KeyPath}}", keyPath)
-	proxyContent = strings.ReplaceAll(proxyContent, "{{.Domain}}", domain)
-	proxyContent = strings.ReplaceAll(proxyContent, "{{.LocalPort}}", fmt.Sprintf("%d", localPort))
-	proxyContent = strings.ReplaceAll(proxyContent, "{{.DeployPath}}", deployPath)
-	proxyContent = strings.ReplaceAll(proxyContent, "{{.AdminPort}}", fmt.Sprintf("%d", adminPort))
-	proxyContent = strings.ReplaceAll(proxyContent, "{{.WSPath}}", wsPath)
-	proxyContent = strings.ReplaceAll(proxyContent, "{{.DbPath}}", dbPath)
-	proxyContent = strings.ReplaceAll(proxyContent, "{{.User}}", adminUser)
-	proxyContent = strings.ReplaceAll(proxyContent, "{{.Pass}}", adminPwd)
-	proxyContent = strings.ReplaceAll(proxyContent, "{{.SubPath}}", subPath)
-
-	webContent := webTmpl
-	webContent = strings.ReplaceAll(webContent, "{{.User}}", adminUser)
-	webContent = strings.ReplaceAll(webContent, "{{.Pass}}", adminPwd)
-	webContent = strings.ReplaceAll(webContent, "{{.AdminPort}}", fmt.Sprintf("%d", adminPort))
-	webContent = strings.ReplaceAll(webContent, "{{.DbPath}}", dbPath)
-	webContent = strings.ReplaceAll(webContent, "{{.SubPath}}", subPath)
-
-	// Hysteria2 配置处理
-	if h2Enabled {
-		proxyContent = strings.ReplaceAll(proxyContent, "# hysteria2:", "hysteria2:")
-		proxyContent = strings.ReplaceAll(proxyContent, "#   enabled: true", "  enabled: true")
-		proxyContent = strings.ReplaceAll(proxyContent, "#   port: 443", fmt.Sprintf("  port: %d", h2Port))
-		proxyContent = strings.ReplaceAll(proxyContent, "#   up_mbps: 100", fmt.Sprintf("  up_mbps: %d", h2Up))
-		proxyContent = strings.ReplaceAll(proxyContent, "#   down_mbps: 500", fmt.Sprintf("  down_mbps: %d", h2Down))
-		proxyContent = strings.ReplaceAll(proxyContent, "#   masquerade_url: \"https://www.bilibili.com\"", "  masquerade_url: \"https://www.bilibili.com\"")
-		proxyContent = strings.ReplaceAll(proxyContent, "#   auth_api: \"http://127.0.0.1:{{.AdminPort}}/admin/api/hysteria/auth\"",
-			fmt.Sprintf("  auth_api: \"http://127.0.0.1:%d/admin/api/hysteria/auth\"", adminPort))
+	proxyContent, err := buildMasterProxyConfig(deploymentCoreConfigInput{
+		DeployPath: deployPath, Domain: domain, CertPath: crtPath, KeyPath: keyPath,
+		LocalPort: localPort, AdminPort: adminPort, WSPath: wsPath, WSEnabled: true,
+		AdminUser: adminUser, AdminPass: adminPwd, DBPath: dbPath, SubPath: subPath,
+	})
+	if err != nil {
+		fmt.Printf("\033[31m❌ 生成 config.yaml 失败: %v\033[0m\n", err)
+		return
+	}
+	webContent, err := buildMasterWebConfig(adminUser, adminPwd, adminPort, dbPath, subPath)
+	if err != nil {
+		fmt.Printf("\033[31m❌ 生成 web_config.yaml 失败: %v\033[0m\n", err)
+		return
 	}
 
-	if err := os.WriteFile(configPath, []byte(proxyContent), 0644); err != nil {
+	if err := os.MkdirAll(deployPath, 0755); err != nil {
+		fmt.Printf("\033[31m❌ 创建部署目录失败: %v\033[0m\n", err)
+		return
+	}
+
+	// Hysteria2 由独立 hysteria.service 读取 hysteria.yaml；核心 Trojan-Go 并不消费
+	// config.yaml 中的 hysteria2 元数据。订阅端的 HY2 开关由数据库配置持久化管理。
+
+	if err := os.WriteFile(configPath, proxyContent, 0600); err != nil {
 		fmt.Printf("\033[31m❌ 写入 config.yaml 失败: %v\033[0m\n", err)
 		return
 	}
-	if err := os.WriteFile(filepath.Join(deployPath, "web_config.yaml"), []byte(webContent), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(deployPath, "web_config.yaml"), webContent, 0600); err != nil {
 		fmt.Printf("\033[31m❌ 写入 web_config.yaml 失败: %v\033[0m\n", err)
 		return
 	}
@@ -548,178 +383,56 @@ Commercial support is available at
 
 	// ─── 步骤 3: 自动安装二进制文件 ────────────────────────────
 	fmt.Println("\n[3/5] 正在安装二进制文件到系统路径...")
-	// 安装 trojan-go
-	installedProxy := false
-	if _, err := os.Stat("./trojan-go"); err == nil {
-		runCmd("cp", "-f", "./trojan-go", "/usr/bin/trojan-go")
-		runCmd("chmod", "+x", "/usr/bin/trojan-go")
-		installedProxy = true
-	} else if _, err := os.Stat("./trojan-go-linux-amd64"); err == nil {
-		runCmd("cp", "-f", "./trojan-go-linux-amd64", "/usr/bin/trojan-go")
-		runCmd("chmod", "+x", "/usr/bin/trojan-go")
-		installedProxy = true
+	if err := installDeploymentBinaries(deployPath, tlsDir, crtPath, keyPath); err != nil {
+		fmt.Printf("\033[31m❌ 安装二进制或设置权限失败: %v\033[0m\n", err)
+		return
 	}
-	if installedProxy {
-		fmt.Println("✓ 已安装 trojan-go 至 /usr/bin/trojan-go")
-	}
-
-	// 安装 trojan 管理工具自身
-	installedCli := false
-	if _, err := os.Stat("./trojan"); err == nil {
-		runCmd("cp", "-f", "./trojan", "/usr/bin/trojan")
-		runCmd("chmod", "+x", "/usr/bin/trojan")
-		installedCli = true
-	} else if _, err := os.Stat("./trojan-linux-amd64"); err == nil {
-		runCmd("cp", "-f", "./trojan-linux-amd64", "/usr/bin/trojan")
-		runCmd("chmod", "+x", "/usr/bin/trojan")
-		installedCli = true
-	}
-	if installedCli {
-		fmt.Println("✓ 已安装 trojan 至 /usr/bin/trojan")
-	}
-
-	// 修正配置目录权限，确保证书可读
-	runCmd("chmod", "-R", "0755", deployPath)
 
 	// ─── Hysteria2 部署（如用户选择启用） ──────
 	if h2Enabled {
 		fmt.Println("\n--- 开始 Hysteria2 (QUIC/UDP) 部署 ---")
-		// 1. 下载 Hysteria2 二进制
-		h2URL := "https://github.com/apernet/hysteria/releases/download/app%2Fv2.10.0/hysteria-linux-amd64"
-		fmt.Printf(" [!] 正在下载 Hysteria2...\n")
-		if err := runCmd("wget", "-qO", "/usr/local/bin/hysteria", h2URL); err != nil {
-			fmt.Printf("\033[31m❌ 下载 Hysteria2 失败: %v\033[0m\n", err)
-		} else {
-			runCmd("chmod", "+x", "/usr/local/bin/hysteria")
-			fmt.Println("✓ Hysteria2 已安装至 /usr/local/bin/hysteria")
+		// 1. 下载、校验并原子安装 Hysteria2 二进制。失败后不继续创建配置或服务。
+		fmt.Printf(" [!] 正在下载并验证 Hysteria2 %s...\n", hysteriaVersion)
+		if err := installHysteriaBinary(); err != nil {
+			fmt.Printf("\033[31m❌ Hysteria2 安装失败，已停止部署: %v\033[0m\n", err)
+			return
 		}
+		fmt.Println("✓ Hysteria2 已通过 SHA-256 校验并安装至 /usr/local/bin/hysteria")
 
 		// 2. 生成 Hysteria2 配置文件
-		hysteriaConfig := fmt.Sprintf(`listen: :%d
-tls:
-  cert: %s
-  key: %s
-auth:
-  type: http
-  http:
-    url: http://127.0.0.1:%d/admin/api/hysteria/auth
-    insecure: true
-masquerade:
-  type: proxy
-  proxy:
-    url: https://www.bilibili.com
-    rewriteHost: true
-quic:
-  initStreamReceiveWindow: 8388608
-  maxStreamReceiveWindow: 8388608
-  initConnReceiveWindow: 20971520
-  maxConnReceiveWindow: 20971520
-  maxIdleTimeout: 60s
-  keepAliveInterval: 10s
-bandwidth:
-  up: %d mbps
-  down: %d mbps
-`, h2Port, crtPath, keyPath, adminPort, h2Up, h2Down)
+		hysteriaConfig, err := buildHysteriaConfig(deploymentHysteriaConfigInput{
+			ListenPort: h2Port, CertPath: crtPath, KeyPath: keyPath, AdminPort: adminPort, UpMbps: h2Up, DownMbps: h2Down,
+		})
+		if err != nil {
+			fmt.Printf("\033[31m❌ 生成 Hysteria2 配置失败: %v\033[0m\n", err)
+			return
+		}
 		hysteriaConfigPath := filepath.Join(deployPath, "hysteria.yaml")
-		os.WriteFile(hysteriaConfigPath, []byte(hysteriaConfig), 0644)
+		if err := os.WriteFile(hysteriaConfigPath, hysteriaConfig, 0600); err != nil {
+			fmt.Printf("\033[31m❌ 写入 Hysteria2 配置失败: %v\033[0m\n", err)
+			return
+		}
 		fmt.Printf("✓ Hysteria2 配置已生成 (%s)\n", hysteriaConfigPath)
-		fmt.Println("  [!] 请登录 Web 面板创建用户，并将 hysteria.yaml 中的 password 替换为实际密码")
 	}
 
-	// ─── 步骤 4: 创建 Systemd 服务文件 ────────────────────────────
-	fmt.Println("\n[4/5] 正在配置 Systemd 服务...")
-	// 1. 代理核心服务 (依赖于 Web 服务提供的回落支持)
-	proxySvc := `[Unit]
-Description=Trojan-Go Proxy Service
-After=network.target trojan-web.service
-
-[Service]
-Type=simple
-LimitNOFILE=65536
-ExecStart=/usr/bin/trojan-go -config ` + filepath.Join(deployPath, "config.yaml") + `
-Restart=on-failure
-RestartSec=10s
-
-[Install]
-WantedBy=multi-user.target
-`
-	// 2. Web 管理服务
-	webSvc := `[Unit]
-Description=Trojan-Go Web Management Service
-After=network.target
-
-[Service]
-Type=simple
-LimitNOFILE=65536
-ExecStart=/usr/bin/trojan-go web -config ` + filepath.Join(deployPath, "web_config.yaml") + `
-Restart=on-failure
-RestartSec=10s
-
-[Install]
-WantedBy=multi-user.target
-`
-	
-	os.WriteFile("/etc/systemd/system/trojan-go.service", []byte(proxySvc), 0644)
-	os.WriteFile("/etc/systemd/system/trojan-web.service", []byte(webSvc), 0644)
-
-	if h2Enabled {
-		hysteriaSvc := `[Unit]
-Description=Hysteria2 QUIC/UDP Server
-After=network.target trojan-web.service
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/hysteria server -c ` + filepath.Join(deployPath, "hysteria.yaml") + `
-Restart=on-failure
-RestartSec=10s
-
-[Install]
-WantedBy=multi-user.target
-`
-		os.WriteFile("/etc/systemd/system/hysteria.service", []byte(hysteriaSvc), 0644)
-	}
-
-	fmt.Println("✓ Systemd 服务配置完成")
-
-	// ─── 步骤 5: 启动双服务 ────────────────────────────
-	fmt.Println("\n[5/5] 正在启动并激活服务...")
-	if err := runCmd("systemctl", "daemon-reload"); err == nil {
-		// 先启动 Web 服务 (80) 以便 Proxy (443) 验证回落地址
-		svcs := []string{"trojan-web", "trojan-go"}
-		if h2Enabled {
-			svcs = append(svcs, "hysteria")
-		}
-		for _, s := range svcs {
-			fmt.Printf(" [!] 正在激活 %s...\n", s)
-			runCmd("systemctl", "enable", s)
-			if err := runCmd("systemctl", "start", s); err != nil {
-				fmt.Printf("\033[31m(!) 警告: %s 启动可能失败，请检查日志。\033[0m\n", s)
-			}
-		}
-		
-		fmt.Println("\n正在验证服务存活状态...")
-		time.Sleep(2 * time.Second) // 等待服务就绪
-		for _, s := range svcs {
-			active, _ := exec.Command("systemctl", "is-active", s).Output()
-			if string(active) != "active\n" {
-				fmt.Printf("\033[31m❌ %s 启动失败! 错误日志如下:\033[0m\n", s)
-				out, _ := exec.Command("journalctl", "-u", s, "-n", "10", "--no-pager").CombinedOutput()
-				fmt.Println(string(out))
-			} else {
-				fmt.Printf("\033[32m✅ %s 运行正常\033[0m\n", s)
-			}
-		}
+	// ─── 步骤 4-5: 写入服务、续期与启动验证 ──────────────────
+	fmt.Println("\n[4/5] 正在配置 Systemd 服务与证书自动续期...")
+	if err := configureAndStartDeployment(deploymentMaster, deployPath, h2Enabled, certificateRenewalConfig{
+		Domain: domain, Email: email, CAURL: caURL, CertificatePath: crtPath, PrivateKeyPath: keyPath, ReloadHysteria: h2Enabled,
+	}); err != nil {
+		fmt.Printf("\033[31m❌ 配置或启动服务失败: %v\033[0m\n", err)
+		return
 	}
 
 	fmt.Println("\n\033[32m=== 初始化部署成功 ! ===\033[0m")
-	fmt.Printf("1. 双服务已就绪: trojan-go (主端口: %d) 和 trojan-web (管理端口: %d)\n", localPort, adminPort)
+	fmt.Printf("1. 服务已就绪: Trojan TCP/%d、Web 后端仅监听 127.0.0.1:%d\n", localPort, adminPort)
 	fmt.Printf("2. 安全订阅链接 (443 TLS 加密保护):\n")
 	fmt.Printf("   - https://%s%s?token=[用户UUID]\n", domain, subPath)
-	fmt.Printf("3. 管理后台访问方式 (独立端口):\n")
-	fmt.Printf("   - 本地端口转发：在客户端建立 SSH 隧道：\n")
-	fmt.Printf("     ssh -L %d:127.0.0.1:%d ubuntu@%s\n", adminPort, adminPort, domain)
-	fmt.Printf("     然后访问：http://127.0.0.1:%d/admin/\n", adminPort)
-	fmt.Printf("4. 检查状态: trojan status\n")
+	fmt.Printf("3. 管理后台入口：\n")
+	fmt.Printf("   - https://%s/admin/\n", domain)
+	fmt.Printf("   - 8080 不开放公网，仅供本机 Hysteria2 HTTP Auth；调试时可使用 SSH 本地转发。\n")
+	fmt.Printf("4. 证书自动续期已启用: systemctl status trojan-cert-renew.timer\n")
+	fmt.Printf("5. 检查状态: trojan status\n")
 }
 
 // 简单的命令执行工具
@@ -730,7 +443,7 @@ func runCmd(name string, args ...string) error {
 
 // InitDeployWorker 初始化部署（从节点）一键化流程
 func InitDeployWorker() {
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	r := mathrand.New(mathrand.NewSource(time.Now().UnixNano()))
 	if os.Geteuid() != 0 {
 		msg := "错误：安装操作需要 sudo 权限！"
 		if menu.CurrentLang == menu.EN {
@@ -834,10 +547,10 @@ func InitDeployWorker() {
 		adminUser = "admin"
 	}
 
-	// 8. 管理面板密码
-	adminPwd := getStdin("8. 设置管理面板密码 (默认 trojan@123): ", "8. Set admin password (default trojan@123): ")
+	// 8. 管理面板密码：不再使用历史弱默认密码。
+	adminPwd := promptAdminPassword("8. 设置管理面板密码（直接回车生成随机强密码）: ", "8. Set admin password (press Enter to generate a strong random password): ")
 	if adminPwd == "" {
-		adminPwd = "trojan@123"
+		return
 	}
 
 	// 9. 管理面板监听端口
@@ -891,15 +604,10 @@ func InitDeployWorker() {
 	}
 
 	tlsDir := filepath.Join(deployPath, "tls", domain)
-	os.MkdirAll(tlsDir, 0755)
-
 	crtPath := filepath.Join(tlsDir, domain+".crt")
 	keyPath := filepath.Join(tlsDir, domain+".key")
-
-	err1 := os.WriteFile(crtPath, certs.Certificate, 0600)
-	err2 := os.WriteFile(keyPath, certs.PrivateKey, 0600)
-	if err1 != nil || err2 != nil {
-		fmt.Printf("\033[31m❌ 证书写入失败: %v %v\033[0m\n", err1, err2)
+	if err := writeCertificateFiles(crtPath, keyPath, certs.Certificate, certs.PrivateKey); err != nil {
+		fmt.Printf("\033[31m❌ 证书写入失败: %v\033[0m\n", err)
 		return
 	}
 	fmt.Println("\033[32m✓ SSL 证书已成功下载并写入配置目录\033[0m")
@@ -907,242 +615,86 @@ func InitDeployWorker() {
 	// ─── 步骤 2: 生成配置文件 ────────────────────────────
 	fmt.Println("\n[2/5] 正在生成配置文件...")
 
-	// 从节点核心配置
-	wsEnabledStr := "false"
-	if wsEnabled {
-		wsEnabledStr = "true"
+	proxyContent, err := buildWorkerProxyConfig(deploymentCoreConfigInput{
+		DeployPath: deployPath, Domain: domain, CertPath: crtPath, KeyPath: keyPath,
+		LocalPort: localPort, AdminPort: adminPort, WSPath: wsPath, WSEnabled: wsEnabled,
+		AdminUser: adminUser, AdminPass: adminPwd, DBPath: dbPath, SubPath: subPath, Fallback: true,
+		Node: &deploymentNodeConfig{Enabled: true, MasterURL: masterURL, Secret: nodeSecret, SyncInterval: 60},
+	})
+	if err != nil {
+		fmt.Printf("\033[31m❌ 生成从节点 config.yaml 失败: %v\033[0m\n", err)
+		return
 	}
-	proxyContent := fmt.Sprintf(`run_type: server
-local_addr: 0.0.0.0
-local_port: %d
-remote_addr: 127.0.0.1
-remote_port: %d
+	webContent, err := buildWorkerWebConfig(adminUser, adminPwd, adminPort, dbPath, subPath)
+	if err != nil {
+		fmt.Printf("\033[31m❌ 生成从节点 web_config.yaml 失败: %v\033[0m\n", err)
+		return
+	}
 
-ssl:
-  cert: %s
-  key: %s
-  sni: %s
-  verify: false
-  verify_hostname: false
-
-  fallback_addr: 127.0.0.1
-  fallback_port: %d
-  plain_http_response: %s/index.html
-
-mux:
-  enabled: true
-websocket:
-  enabled: %s
-  path: "%s"
-  host: "%s"
-admin:
-  enabled: true
-  username: "%s"
-  password: "%s"
-  port: 0
-  db: "%s"
-  path: /admin
-  sub_path: "%s"
-
-node:
-  enabled: true
-  master_url: "%s"
-  secret: "%s"
-  sync_interval: 60
-
-log:
-  level: 1
-  access: %s/log/trojan-go/access.log
-  error: %s/log/trojan-go/error.log
-`, localPort, adminPort, crtPath, keyPath, domain, adminPort, deployPath, wsEnabledStr, wsPath, domain, adminUser, adminPwd, dbPath, subPath, masterURL, nodeSecret, deployPath, deployPath)
-
-	// 从节点网页配置
-	webContent := fmt.Sprintf(`# =================================================================
-# Trojan-Go Web 管理后台配置文件 (Web / 80)
-# =================================================================
-run_type: server
-
-admin:
-  enabled: true
-  username: "%s"
-  password: "%s"
-  port: %d
-  db: "%s"
-  path: "/admin/"
-  sub_path: "%s"
-node:
-  enabled: true
-`, adminUser, adminPwd, adminPort, dbPath, subPath)
-
-	os.MkdirAll(deployPath, 0755)
-	if err := os.WriteFile(configPath, []byte(proxyContent), 0644); err != nil {
+	if err := os.MkdirAll(deployPath, 0755); err != nil {
+		fmt.Printf("\033[31m❌ 创建部署目录失败: %v\033[0m\n", err)
+		return
+	}
+	if err := os.WriteFile(configPath, proxyContent, 0600); err != nil {
 		fmt.Printf("\033[31m❌ 写入 config.yaml 失败: %v\033[0m\n", err)
 		return
 	}
-	if err := os.WriteFile(filepath.Join(deployPath, "web_config.yaml"), []byte(webContent), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(deployPath, "web_config.yaml"), webContent, 0600); err != nil {
 		fmt.Printf("\033[31m❌ 写入 web_config.yaml 失败: %v\033[0m\n", err)
 		return
 	}
 
 	// 创建内置首页 (防探测，使用逼真标准 Nginx 测试页面)
-	os.WriteFile(filepath.Join(deployPath, "index.html"), []byte(nginxWelcome), 0644)
+	if err := os.WriteFile(filepath.Join(deployPath, "index.html"), []byte(nginxWelcome), 0644); err != nil {
+		fmt.Printf("\033[31m❌ 写入伪装首页失败: %v\033[0m\n", err)
+		return
+	}
 	fmt.Println("\033[32m✓ 配置文件已生成\033[0m")
 
 	// ─── 步骤 3: 自动安装二进制文件 ────────────────────────────
 	fmt.Println("\n[3/5] 正在安装二进制文件到系统路径...")
-	installedProxy := false
-	if _, err := os.Stat("./trojan-go"); err == nil {
-		runCmd("cp", "-f", "./trojan-go", "/usr/bin/trojan-go")
-		runCmd("chmod", "+x", "/usr/bin/trojan-go")
-		installedProxy = true
-	} else if _, err := os.Stat("./trojan-go-linux-amd64"); err == nil {
-		runCmd("cp", "-f", "./trojan-go-linux-amd64", "/usr/bin/trojan-go")
-		runCmd("chmod", "+x", "/usr/bin/trojan-go")
-		installedProxy = true
+	if err := installDeploymentBinaries(deployPath, tlsDir, crtPath, keyPath); err != nil {
+		fmt.Printf("\033[31m❌ 安装二进制或设置权限失败: %v\033[0m\n", err)
+		return
 	}
-	if installedProxy {
-		fmt.Println("✓ 已安装 trojan-go 至 /usr/bin/trojan-go")
-	}
-
-	installedCli := false
-	if _, err := os.Stat("./trojan"); err == nil {
-		runCmd("cp", "-f", "./trojan", "/usr/bin/trojan")
-		runCmd("chmod", "+x", "/usr/bin/trojan")
-		installedCli = true
-	} else if _, err := os.Stat("./trojan-linux-amd64"); err == nil {
-		runCmd("cp", "-f", "./trojan-linux-amd64", "/usr/bin/trojan")
-		runCmd("chmod", "+x", "/usr/bin/trojan")
-		installedCli = true
-	}
-	if installedCli {
-		fmt.Println("✓ 已安装 trojan 至 /usr/bin/trojan")
-	}
-
-	runCmd("chmod", "-R", "0755", deployPath)
 
 	// ─── Hysteria2 部署（从节点，如用户选择启用） ──────
 	if wh2Enabled {
 		fmt.Println("\n--- 开始 Hysteria2 (QUIC/UDP) 从节点部署 ---")
-		h2URL := "https://github.com/apernet/hysteria/releases/download/app%2Fv2.10.0/hysteria-linux-amd64"
-		if err := runCmd("wget", "-qO", "/usr/local/bin/hysteria", h2URL); err != nil {
-			fmt.Printf("\033[31m❌ 下载 Hysteria2 失败: %v\033[0m\n", err)
-		} else {
-			runCmd("chmod", "+x", "/usr/local/bin/hysteria")
-			fmt.Println("✓ Hysteria2 已安装")
+		fmt.Printf(" [!] 正在下载并验证 Hysteria2 %s...\n", hysteriaVersion)
+		if err := installHysteriaBinary(); err != nil {
+			fmt.Printf("\033[31m❌ Hysteria2 安装失败，已停止部署: %v\033[0m\n", err)
+			return
 		}
-		hysteriaConfig := fmt.Sprintf(`listen: :%d
-tls:
-  cert: %s
-  key: %s
-auth:
-  type: http
-  http:
-    url: http://127.0.0.1:%d/admin/api/hysteria/auth
-    insecure: true
-masquerade:
-  type: proxy
-  proxy:
-    url: https://www.bilibili.com
-    rewriteHost: true
-quic:
-  initStreamReceiveWindow: 8388608
-  maxStreamReceiveWindow: 8388608
-  initConnReceiveWindow: 20971520
-  maxConnReceiveWindow: 20971520
-  maxIdleTimeout: 60s
-  keepAliveInterval: 10s
-bandwidth:
-  up: %d mbps
-  down: %d mbps
-`, wh2Port, crtPath, keyPath, adminPort, wh2Up, wh2Down)
+		fmt.Println("✓ Hysteria2 已通过 SHA-256 校验并安装")
+		hysteriaConfig, err := buildHysteriaConfig(deploymentHysteriaConfigInput{
+			ListenPort: wh2Port, CertPath: crtPath, KeyPath: keyPath, AdminPort: adminPort, UpMbps: wh2Up, DownMbps: wh2Down,
+		})
+		if err != nil {
+			fmt.Printf("\033[31m❌ 生成 Hysteria2 从节点配置失败: %v\033[0m\n", err)
+			return
+		}
 		hysteriaConfigPath := filepath.Join(deployPath, "hysteria.yaml")
-		os.WriteFile(hysteriaConfigPath, []byte(hysteriaConfig), 0644)
+		if err := os.WriteFile(hysteriaConfigPath, hysteriaConfig, 0600); err != nil {
+			fmt.Printf("\033[31m❌ 写入 Hysteria2 从节点配置失败: %v\033[0m\n", err)
+			return
+		}
 		fmt.Printf("✓ Hysteria2 从节点配置已生成 (%s)\n", hysteriaConfigPath)
 	}
 
-	// ─── 步骤 4: 创建 Systemd 服务文件 ──────────────── (Worker)
-	proxySvc := `[Unit]
-Description=Trojan-Go Worker Proxy Service
-After=network.target trojan-web.service
-
-[Service]
-Type=simple
-LimitNOFILE=65536
-ExecStart=/usr/bin/trojan-go -config ` + filepath.Join(deployPath, "config.yaml") + `
-Restart=on-failure
-RestartSec=10s
-
-[Install]
-WantedBy=multi-user.target
-`
-	webSvc := `[Unit]
-Description=Trojan-Go Worker Web Management Service
-After=network.target
-
-[Service]
-Type=simple
-LimitNOFILE=65536
-ExecStart=/usr/bin/trojan-go web -config ` + filepath.Join(deployPath, "web_config.yaml") + `
-Restart=on-failure
-RestartSec=10s
-
-[Install]
-WantedBy=multi-user.target
-`
-	os.WriteFile("/etc/systemd/system/trojan-go.service", []byte(proxySvc), 0644)
-	os.WriteFile("/etc/systemd/system/trojan-web.service", []byte(webSvc), 0644)
-
-	if wh2Enabled {
-		hysteriaSvc := `[Unit]
-Description=Hysteria2 QUIC/UDP Server (Worker)
-After=network.target trojan-web.service
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/hysteria server -c ` + filepath.Join(deployPath, "hysteria.yaml") + `
-Restart=on-failure
-RestartSec=10s
-
-[Install]
-WantedBy=multi-user.target
-`
-		os.WriteFile("/etc/systemd/system/hysteria.service", []byte(hysteriaSvc), 0644)
-	}
-
-	fmt.Println("✓ Systemd 服务配置完成")
-
-	// ─── 步骤 5: 启动双服务 ──────────────────────────── (Worker)
-	fmt.Println("\n[5/5] 正在启动并激活服务...")
-	if err := runCmd("systemctl", "daemon-reload"); err == nil {
-		svcs := []string{"trojan-web", "trojan-go"}
-		if wh2Enabled {
-			svcs = append(svcs, "hysteria")
-		}
-		for _, s := range svcs {
-			fmt.Printf(" [!] 正在激活 %s...\n", s)
-			runCmd("systemctl", "enable", s)
-			if err := runCmd("systemctl", "start", s); err != nil {
-				fmt.Printf("\033[31m(!) 警告: %s 启动可能失败，请检查日志。\033[0m\n", s)
-			}
-		}
-
-		fmt.Println("\n正在验证服务存活状态...")
-		time.Sleep(2 * time.Second)
-		for _, s := range svcs {
-			active, _ := exec.Command("systemctl", "is-active", s).Output()
-			if string(active) != "active\n" {
-				fmt.Printf("\033[31m❌ %s 启动失败! 错误日志如下:\033[0m\n", s)
-				out, _ := exec.Command("journalctl", "-u", s, "-n", "10", "--no-pager").CombinedOutput()
-				fmt.Println(string(out))
-			} else {
-				fmt.Printf("\033[32m✅ %s 运行正常\033[0m\n", s)
-			}
-		}
+	// ─── 步骤 4-5: 写入服务、续期与启动验证 ──────────────────
+	fmt.Println("\n[4/5] 正在配置 Systemd 服务与证书自动续期...")
+	if err := configureAndStartDeployment(deploymentWorker, deployPath, wh2Enabled, certificateRenewalConfig{
+		Domain: domain, Email: email, CAURL: "https://acme-v02.api.letsencrypt.org/directory", CertificatePath: crtPath, PrivateKeyPath: keyPath, ReloadHysteria: wh2Enabled,
+	}); err != nil {
+		fmt.Printf("\033[31m❌ 配置或启动服务失败: %v\033[0m\n", err)
+		return
 	}
 
 	fmt.Println("\n\033[32m=== 从节点部署成功 ! ===\033[0m")
-	fmt.Printf("1. 双服务已就绪: 从节点代理 (%d) 和 管理面板 (%d)\n", localPort, adminPort)
-	fmt.Printf("2. 访问方式:\n")
-	fmt.Printf("   - https://%s:%d/ (回落至面板)\n", domain, localPort)
-	fmt.Printf("   - http://%s:%d/  (直连面板)\n", domain, adminPort)
+	fmt.Printf("1. 服务已就绪: 从节点 Trojan TCP/%d、Web 后端仅监听 127.0.0.1:%d\n", localPort, adminPort)
+	fmt.Printf("2. 管理后台入口: https://%s/admin/\n", domain)
+	fmt.Println("   8080 不开放公网，仅供本机 Hysteria2 HTTP Auth；调试时可使用 SSH 本地端口转发。")
+	fmt.Println("3. 从节点不提供订阅；订阅由主节点 HTTPS 服务统一输出。")
+	fmt.Println("4. 证书自动续期已启用: systemctl status trojan-cert-renew.timer")
 }

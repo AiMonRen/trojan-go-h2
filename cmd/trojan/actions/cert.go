@@ -29,7 +29,7 @@ func ApplyCert() {
 	fmt.Println("1. Let's Encrypt (默认)")
 	fmt.Println("2. BuyPass (Go SSL)")
 	caChoice := getStdin("请选择 [1-2]: ", "Select [1-2]: ")
-	
+
 	caURL := "https://acme-v02.api.letsencrypt.org/directory"
 	caName := "Let's Encrypt"
 	if caChoice == "2" {
@@ -61,11 +61,12 @@ func ApplyCert() {
 		return
 	}
 
-	// 保存证书 (默认到标准路径，除非是首次部署，这里保留 ApplyCert 的原有简易逻辑)
-	os.MkdirAll("/etc/trojan-go", 0755)
-	os.WriteFile("/etc/trojan-go/cert.pem", certs.Certificate, 0644)
-	os.WriteFile("/etc/trojan-go/key.pem", certs.PrivateKey, 0600)
-	
+	// 保存证书；任何目录或文件写入失败都必须显式返回，避免误报申请成功。
+	if err := writeCertificateFiles("/etc/trojan-go/cert.pem", "/etc/trojan-go/key.pem", certs.Certificate, certs.PrivateKey); err != nil {
+		fmt.Printf("\033[31m保存证书失败: %v\033[0m\n", err)
+		return
+	}
+
 	successMsg := "✓ 证书申请成功！"
 	if menu.CurrentLang == menu.EN {
 		successMsg = "✓ Certificate obtained successfully!"

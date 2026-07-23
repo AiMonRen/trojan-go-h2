@@ -7,8 +7,8 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
-	"gopkg.in/yaml.v3"
 	"github.com/voidluo/trojan-go/internal/database"
+	"gopkg.in/yaml.v3"
 )
 
 // NodeList 列出所有节点
@@ -25,8 +25,8 @@ func NodeList() {
 		fmt.Println("暂无节点。")
 		return
 	}
-	fmt.Printf("\033[1m%-5s %-15s %-20s %-6s %-10s %-8s %-10s %-36s\033[0m\n", "ID", "节点名称", "对外地址", "端口", "状态", "结算倍率", "WS状态", "通信密钥 (Secret)")
-	fmt.Println(strings.Repeat("─", 115))
+	fmt.Printf("\033[1m%-5s %-15s %-20s %-6s %-10s %-8s %-10s\033[0m\n", "ID", "节点名称", "对外地址", "端口", "状态", "结算倍率", "WS状态")
+	fmt.Println(strings.Repeat("─", 78))
 	for _, n := range nodes {
 		status := "\033[31m离线\033[0m"
 		if n.Status == 1 {
@@ -36,7 +36,7 @@ func NodeList() {
 		if n.WSEnabled {
 			wsStatus = fmt.Sprintf("开启(%s)", n.WSPath)
 		}
-		fmt.Printf("%-5d %-15s %-20s %-6d %s %-8.2f %-10s %-36s\n", n.ID, n.Name, n.Address, n.Port, status, n.TrafficRate, wsStatus, n.Secret)
+		fmt.Printf("%-5d %-15s %-20s %-6d %s %-8.2f %-10s\n", n.ID, n.Name, n.Address, n.Port, status, n.TrafficRate, wsStatus)
 	}
 }
 
@@ -101,11 +101,16 @@ func NodeAdd() {
 	// 自动生成高强度随机 UUID 作为节点通信密钥
 	nodeSecret := uuid.New().String()
 
+	pendingSecret, err := database.PendingNodeSecretMarker()
+	if err != nil {
+		fmt.Printf("\033[31m添加节点失败: 无法准备凭据: %v\033[0m\n", err)
+		return
+	}
 	node := database.Node{
 		Name:        name,
 		Address:     addr,
 		Port:        port,
-		Secret:      nodeSecret,
+		Secret:      pendingSecret,
 		TrafficRate: rate,
 		WSEnabled:   wsEnabled,
 		WSPath:      wsPath,
@@ -114,6 +119,11 @@ func NodeAdd() {
 
 	if err := db.Create(&node).Error; err != nil {
 		fmt.Printf("\033[31m添加节点失败: %v\033[0m\n", err)
+		return
+	}
+	if err := database.SetNodeSecret(db, &node, nodeSecret); err != nil {
+		_ = db.Delete(&node).Error
+		fmt.Printf("\033[31m添加节点失败: 凭据加密失败: %v\033[0m\n", err)
 		return
 	}
 	fmt.Printf("\033[32m✓ 节点添加成功！\033[0m [名称: %s] [密钥: %s]\n", name, nodeSecret)

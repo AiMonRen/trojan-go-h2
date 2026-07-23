@@ -127,7 +127,7 @@ func UserAdd() {
 		fmt.Printf("\033[31m数据库连接失败: %v\033[0m\n", err)
 		return
 	}
-	user := database.User{Username: username, Password: password, Hash: common.SHA224String(password)}
+	user := database.User{Username: username, Hash: common.SHA224String(password)}
 	var existing database.User
 	if err := db.Where("hash = ?", user.Hash).First(&existing).Error; err == nil {
 		fmt.Printf("\033[31m创建用户失败: 此密码已被用户 [%s] 使用！\033[0m\n", existing.Username)
@@ -135,6 +135,11 @@ func UserAdd() {
 	}
 	if err := db.Create(&user).Error; err != nil {
 		fmt.Printf("\033[31m创建用户失败: %v\033[0m\n", err)
+		return
+	}
+	if err := database.SetUserPassword(db, &user, password); err != nil {
+		_ = db.Delete(&user).Error
+		fmt.Printf("\033[31m创建用户失败: 凭据加密失败: %v\033[0m\n", err)
 		return
 	}
 	fmt.Printf("\033[32m✓ 用户添加成功！\033[0m [备注: %s]\n", username)
@@ -175,9 +180,13 @@ func ChangeAdminPassword() {
 		fmt.Printf("\033[31m数据库连接失败: %v\033[0m\n", err)
 		return
 	}
-	if err := db.Save(&database.Config{Key: "admin_password", Value: password}).Error; err != nil {
+	if err := database.SetAdminPassword(db, password); err != nil {
 		fmt.Printf("\033[31m更新密码失败: %v\033[0m\n", err)
 		return
 	}
-	fmt.Println("\033[32m✓ Web 控制台 admin 密码已成功修改！\033[0m")
+	if _, err := database.RotateJWTSecret(db); err != nil {
+		fmt.Printf("\033[31m轮换管理会话密钥失败: %v\033[0m\n", err)
+		return
+	}
+	fmt.Println("\033[32m✓ Web 控制台 admin 密码已成功修改；请重启管理服务以立即使旧会话失效。\033[0m")
 }

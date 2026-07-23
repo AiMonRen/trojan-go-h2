@@ -62,7 +62,7 @@ func (m *Menu) Run() bool {
 			return m.parent == nil
 		}
 
-		idx := int(ch-'1')
+		idx := int(ch - '1')
 		if idx >= 0 && idx < len(m.Items) {
 			item := &m.Items[idx]
 			if item.Sub != nil {

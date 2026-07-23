@@ -24,3 +24,5 @@ build/
 trojan-go
 !/cmd/trojan-go/
 .ai/
+*.db-wal
+*.db-shm
