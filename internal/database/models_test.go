@@ -1,9 +1,43 @@
 package database
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
+
+func TestInitDbSerializesConcurrentSQLiteSchemaSetup(t *testing.T) {
+	dbPath := t.TempDir() + "/concurrent.db"
+	const callers = 8
+	errors := make(chan error, callers)
+	var ready sync.WaitGroup
+	var start sync.WaitGroup
+	ready.Add(callers)
+	start.Add(1)
+	for range callers {
+		go func() {
+			ready.Done()
+			start.Wait()
+			_, err := InitDb(dbPath)
+			errors <- err
+		}()
+	}
+	ready.Wait()
+	start.Done()
+	for range callers {
+		if err := <-errors; err != nil {
+			t.Fatalf("concurrent InitDb failed: %v", err)
+		}
+	}
+
+	db, err := InitDb(dbPath)
+	if err != nil {
+		t.Fatalf("reinitialize existing database: %v", err)
+	}
+	if !db.Migrator().HasTable(&DataPlaneSyncReceipt{}) {
+		t.Fatal("data-plane sync receipt table missing after concurrent initialization")
+	}
+}
 
 func TestOpenReadOnlyReadsExistingRowsAndRejectsWrites(t *testing.T) {
 	path := t.TempDir() + "/database.db"

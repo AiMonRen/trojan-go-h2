@@ -182,6 +182,15 @@ func OpenReadOnly(dbPath string) (*gorm.DB, error) {
 func InitDb(dbPath string) (*gorm.DB, error) {
 	var dialector gorm.Dialector
 	isMySQL := strings.HasPrefix(dbPath, "mysql:")
+	var unlock func() error
+	if !isMySQL {
+		var lockErr error
+		unlock, lockErr = lockSQLiteSchema(dbPath)
+		if lockErr != nil {
+			return nil, lockErr
+		}
+		defer unlock()
+	}
 	if isMySQL {
 		dsn := strings.TrimPrefix(dbPath, "mysql:")
 		dialector = mysql.Open(dsn)
