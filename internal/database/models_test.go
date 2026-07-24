@@ -6,6 +6,24 @@ import (
 	"time"
 )
 
+func TestSQLiteMemoryDatabaseDetection(t *testing.T) {
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{path: ":memory:", want: true},
+		{path: "file::memory:?cache=shared", want: true},
+		{path: "file:test?mode=memory&cache=shared", want: true},
+		{path: "/var/lib/trojan-go.db", want: false},
+		{path: "file:/var/lib/trojan-go.db?cache=shared", want: false},
+	}
+	for _, tt := range tests {
+		if got := isSQLiteMemoryDatabase(tt.path); got != tt.want {
+			t.Errorf("isSQLiteMemoryDatabase(%q) = %t, want %t", tt.path, got, tt.want)
+		}
+	}
+}
+
 func TestInitDbSerializesConcurrentSQLiteSchemaSetup(t *testing.T) {
 	dbPath := t.TempDir() + "/concurrent.db"
 	const callers = 8

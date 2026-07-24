@@ -5,11 +5,30 @@ package database
 import (
 	"fmt"
 	"os"
+	"strings"
+	"sync"
 
 	"golang.org/x/sys/unix"
 )
 
+var sqliteMemorySchemaLocks sync.Map
+
+func isSQLiteMemoryDatabase(dbPath string) bool {
+	return dbPath == ":memory:" ||
+		strings.HasPrefix(dbPath, "file::memory:") ||
+		(strings.HasPrefix(dbPath, "file:") && strings.Contains(dbPath, "mode=memory"))
+}
+
 func lockSQLiteSchema(dbPath string) (func() error, error) {
+	if isSQLiteMemoryDatabase(dbPath) {
+		value, _ := sqliteMemorySchemaLocks.LoadOrStore(dbPath, &sync.Mutex{})
+		lock := value.(*sync.Mutex)
+		lock.Lock()
+		return func() error {
+			lock.Unlock()
+			return nil
+		}, nil
+	}
 	lockPath := dbPath + ".schema.lock"
 	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
