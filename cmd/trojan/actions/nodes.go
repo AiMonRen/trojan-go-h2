@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/google/uuid"
@@ -260,12 +261,12 @@ func NodeDelete() {
 func ShowNodeSyncURL() {
 	var domain string
 
-	// 尝试读取主配置
-	data, err := os.ReadFile("/etc/trojan-go/config.yaml")
+	// Gateway 配置持有公网 TLS 证书路径；域名通常仍由部署时输入。
+	data, err := os.ReadFile("/etc/trojan-go/gateway.yaml")
 	if err == nil {
 		var cfg map[string]any
 		if err := yaml.Unmarshal(data, &cfg); err == nil {
-			// 1. 尝试从 ssl.sni 提取
+			// 尝试从 TLS 证书目录名提取域名。
 			if sslVal, ok := cfg["ssl"]; ok {
 				var ssl map[string]any
 				if sslMap, ok1 := sslVal.(map[string]any); ok1 {
@@ -279,15 +280,9 @@ func ShowNodeSyncURL() {
 					}
 				}
 				if ssl != nil {
-					if sni, ok4 := ssl["sni"].(string); ok4 && sni != "" {
-						domain = sni
+					if certPath, ok4 := ssl["cert"].(string); ok4 && certPath != "" {
+						domain = filepath.Base(filepath.Dir(certPath))
 					}
-				}
-			}
-			// 2. 尝试从 remote_addr 提取
-			if domain == "" {
-				if remote, ok := cfg["remote_addr"].(string); ok && remote != "" {
-					domain = remote
 				}
 			}
 		}
@@ -298,7 +293,7 @@ func ShowNodeSyncURL() {
 	}
 
 	fmt.Println("\033[36m========== 从节点同步接口信息 ==========\033[0m")
-	fmt.Printf("主节点同步 URL: \033[32mhttps://%s/admin/api/node/sync\033[0m\n", domain)
+	fmt.Printf("主节点同步 URL: \033[32mhttps://%s/control/v1/nodes/sync\033[0m\n", domain)
 	fmt.Println("请在从节点一键部署或从节点配置文件中的 node_sync.node.master_url 中填入上述 URL")
 	fmt.Println("\033[36m========================================\033[0m")
 }

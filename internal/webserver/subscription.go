@@ -19,7 +19,44 @@ import (
 )
 
 func (s *AdminServer) getMainNodeInfo() (string, int, bool, string) {
-	// 默认回退值
+	// Unified Gateway deployments publish the Gateway port, never the private
+	// Trojan data-plane port. WebSocket output is disabled until the Gateway has
+	// an explicit Trojan-over-WebSocket adapter.
+	gatewayPaths := []string{"gateway.yaml", "gateway.yml", "/etc/trojan-go/gateway.yaml"}
+	if WebConfigPath != "" {
+		dir := filepath.Dir(WebConfigPath)
+		gatewayPaths = append([]string{filepath.Join(dir, "gateway.yaml"), filepath.Join(dir, "gateway.yml")}, gatewayPaths...)
+	}
+	for _, path := range gatewayPaths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var cfg struct {
+			Gateway struct {
+				Listen string `yaml:"listen"`
+			} `yaml:"gateway"`
+			SSL struct {
+				Cert string `yaml:"cert"`
+			} `yaml:"ssl"`
+		}
+		if err := yaml.Unmarshal(data, &cfg); err != nil {
+			continue
+		}
+		port := 443
+		if _, portText, err := net.SplitHostPort(cfg.Gateway.Listen); err == nil {
+			if parsed, err := strconv.Atoi(portText); err == nil && parsed > 0 {
+				port = parsed
+			}
+		}
+		domain := ""
+		if cfg.SSL.Cert != "" {
+			domain = filepath.Base(filepath.Dir(cfg.SSL.Cert))
+		}
+		return domain, port, false, ""
+	}
+
+	// Legacy embedded configuration fallback.
 	domain := ""
 	port := 443
 	wsEnabled := s.wsEnabled

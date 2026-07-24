@@ -71,15 +71,9 @@ func promptAdminPassword(promptCN, promptEN string) string {
 
 // InitDeployMaster 初始化部署（主节点）一键化流程
 func InitDeployMaster() {
-	// 动态生成 6 位随机字符组成 websocket 路径
+	// Gateway 独占公网 TCP 443；Trojan data-plane 固定使用 loopback 14443。
 	r := mathrand.New(mathrand.NewSource(time.Now().UnixNano()))
 	const letters = "abcdefghijklmnopqrstuvwxyz0123456789"
-	randChars := make([]byte, 6)
-	for i := range randChars {
-		randChars[i] = letters[r.Intn(len(letters))]
-	}
-	wsPath := "/stream-" + string(randChars)
-
 	// 动态生成 8 位随机字符组成订阅混淆路径
 	subChars := make([]byte, 8)
 	for i := range subChars {
@@ -103,12 +97,10 @@ func InitDeployMaster() {
 	}
 	deployPath = strings.TrimSuffix(deployPath, "/")
 
-	// 自定义代理服务端口
-	localPortStr := getStdin("请输入代理服务端口 (默认 443): ", "Enter proxy service port (default 443): ")
-	localPort := 443
-	if localPortStr != "" {
-		fmt.Sscanf(localPortStr, "%d", &localPort)
-	}
+	// 公网 TCP 入口固定由 Gateway 使用 443；data-plane 不再暴露公网端口。
+	gatewayPort := defaultGatewayPort
+	dataPlanePort := defaultDataPlanePort
+	controlPort := defaultControlServicePort
 
 	configPath := filepath.Join(deployPath, "config.yaml")
 	if _, err := os.Stat(configPath); err == nil {
@@ -165,12 +157,8 @@ func InitDeployMaster() {
 		return
 	}
 
-	// 6. 管理面板监听端口
-	adminPortStr := getStdin("6. 设置管理面板监听端口 (推荐 8080): ", "6. Set admin port (recommended 8080): ")
-	adminPort := 8080
-	if adminPortStr != "" {
-		fmt.Sscanf(adminPortStr, "%d", &adminPort)
-	}
+	// 6. admin-service 仅监听 loopback 8081。
+	adminPort := defaultAdminServicePort
 
 	// 7. 请选择数据库类型
 	fmt.Println("7. 请选择数据库类型:")
@@ -322,11 +310,19 @@ func InitDeployMaster() {
 
 	proxyContent, err := buildMasterProxyConfig(deploymentCoreConfigInput{
 		DeployPath: deployPath, Domain: domain, CertPath: crtPath, KeyPath: keyPath,
-		LocalPort: localPort, AdminPort: adminPort, WSPath: wsPath, WSEnabled: true,
+		GatewayPort: gatewayPort, DataPlanePort: dataPlanePort, AdminPort: adminPort, ControlPort: controlPort,
 		AdminUser: adminUser, AdminPass: adminPwd, DBPath: dbPath, SubPath: subPath,
 	})
 	if err != nil {
 		fmt.Printf("\033[31m❌ 生成 config.yaml 失败: %v\033[0m\n", err)
+		return
+	}
+	gatewayContent, err := buildGatewayConfig(deploymentCoreConfigInput{
+		DeployPath: deployPath, CertPath: crtPath, KeyPath: keyPath,
+		GatewayPort: gatewayPort, DataPlanePort: dataPlanePort, AdminPort: adminPort, ControlPort: controlPort, SubPath: subPath,
+	}, false)
+	if err != nil {
+		fmt.Printf("\033[31m❌ 生成 gateway.yaml 失败: %v\033[0m\n", err)
 		return
 	}
 	webContent, err := buildMasterWebConfig(adminUser, adminPwd, adminPort, dbPath, subPath)
@@ -345,6 +341,10 @@ func InitDeployMaster() {
 
 	if err := os.WriteFile(configPath, proxyContent, 0600); err != nil {
 		fmt.Printf("\033[31m❌ 写入 config.yaml 失败: %v\033[0m\n", err)
+		return
+	}
+	if err := os.WriteFile(filepath.Join(deployPath, "gateway.yaml"), gatewayContent, 0600); err != nil {
+		fmt.Printf("\033[31m❌ 写入 gateway.yaml 失败: %v\033[0m\n", err)
 		return
 	}
 	if err := os.WriteFile(filepath.Join(deployPath, "web_config.yaml"), webContent, 0600); err != nil {
@@ -401,7 +401,7 @@ Commercial support is available at
 
 		// 2. 生成 Hysteria2 配置文件
 		hysteriaConfig, err := buildHysteriaConfig(deploymentHysteriaConfigInput{
-			ListenPort: h2Port, CertPath: crtPath, KeyPath: keyPath, AdminPort: adminPort, UpMbps: h2Up, DownMbps: h2Down,
+			ListenPort: h2Port, CertPath: crtPath, KeyPath: keyPath, ControlPort: controlPort, UpMbps: h2Up, DownMbps: h2Down,
 		})
 		if err != nil {
 			fmt.Printf("\033[31m❌ 生成 Hysteria2 配置失败: %v\033[0m\n", err)
@@ -425,14 +425,15 @@ Commercial support is available at
 	}
 
 	fmt.Println("\n\033[32m=== 初始化部署成功 ! ===\033[0m")
-	fmt.Printf("1. 服务已就绪: Trojan TCP/%d、Web 后端仅监听 127.0.0.1:%d\n", localPort, adminPort)
-	fmt.Printf("2. 安全订阅链接 (443 TLS 加密保护):\n")
+	fmt.Printf("1. Gateway 统一入口: TCP/%d；Trojan data-plane: 127.0.0.1:%d\n", gatewayPort, dataPlanePort)
+	fmt.Printf("2. admin-service: 127.0.0.1:%d；control-service: 127.0.0.1:%d\n", adminPort, controlPort)
+	fmt.Printf("3. 安全订阅链接 (Gateway TLS 加密保护):\n")
 	fmt.Printf("   - https://%s%s?token=[用户UUID]\n", domain, subPath)
-	fmt.Printf("3. 管理后台入口：\n")
+	fmt.Printf("4. 管理后台入口：\n")
 	fmt.Printf("   - https://%s/admin/\n", domain)
-	fmt.Printf("   - 8080 不开放公网，仅供本机 Hysteria2 HTTP Auth；调试时可使用 SSH 本地转发。\n")
-	fmt.Printf("4. 证书自动续期已启用: systemctl status trojan-cert-renew.timer\n")
-	fmt.Printf("5. 检查状态: trojan status\n")
+	fmt.Printf("   - 8081/8082/14443 均仅监听 loopback，不开放公网。\n")
+	fmt.Printf("5. 证书自动续期已启用: systemctl status trojan-cert-renew.timer\n")
+	fmt.Printf("6. 检查状态: trojan status\n")
 }
 
 // 简单的命令执行工具
@@ -491,17 +492,15 @@ func InitDeployWorker() {
 		return
 	}
 
-	// 3. 代理端口
-	localPortStr := getStdin("3. 设置从节点代理服务端口 (默认 443): ", "3. Set proxy port (default 443): ")
-	localPort := 443
-	if localPortStr != "" {
-		fmt.Sscanf(localPortStr, "%d", &localPort)
-	}
+	// 3. Worker 同样由 Gateway 独占 TCP 443，data-plane 仅监听本机 14443。
+	gatewayPort := defaultGatewayPort
+	dataPlanePort := defaultDataPlanePort
+	controlPort := defaultControlServicePort
 
 	// 4. 主节点同步接口 URL (必填)
 	masterURL := ""
 	for {
-		masterURL = getStdin("4. 节点同步接口 URL (必填，如 https://master.com/admin/api/node/sync): ", "4. Enter master sync URL (required): ")
+		masterURL = getStdin("4. 节点同步接口 URL (必填，如 https://master.com/control/v1/nodes/sync): ", "4. Enter master sync URL (required): ")
 		if masterURL != "" {
 			break
 		}
@@ -518,28 +517,7 @@ func InitDeployWorker() {
 		fmt.Println("❌ 必须输入节点通信密钥！")
 	}
 
-	// 6. 是否启用 WebSocket 伪装
-	// 默认先生成一个随机的 wsPath
-	const wsLetters = "abcdefghijklmnopqrstuvwxyz0123456789"
-	wsRandChars := make([]byte, 6)
-	for i := range wsRandChars {
-		wsRandChars[i] = wsLetters[r.Intn(len(wsLetters))]
-	}
-	wsPath := "/stream-" + string(wsRandChars)
-
-	wsEnabled := false
-	wsAns := getStdin("6. 是否启用 WebSocket 伪装？(y/n, 默认 n): ", "6. Enable WebSocket masquerade? (y/n, default n): ")
-	if wsAns == "y" || wsAns == "Y" {
-		wsEnabled = true
-		inputPath := getStdin("   请输入 WebSocket 伪装路径 (直接回车使用随机路径): ", "   Enter WebSocket path (enter for random): ")
-		inputPath = strings.TrimSpace(inputPath)
-		if inputPath != "" {
-			if !strings.HasPrefix(inputPath, "/") {
-				inputPath = "/" + inputPath
-			}
-			wsPath = inputPath
-		}
-	}
+	// 新 Gateway 架构当前仅支持原生 Trojan TLS 字节流；不生成 Trojan-over-WebSocket 路由。
 
 	// 7. 管理面板用户名
 	adminUser := getStdin("7. 设置管理面板用户名 (默认 admin): ", "7. Set admin username (default admin): ")
@@ -553,12 +531,8 @@ func InitDeployWorker() {
 		return
 	}
 
-	// 9. 管理面板监听端口
-	adminPortStr := getStdin("9. 设置管理面板监听端口 (推荐 8080): ", "9. Set admin port (recommended 8080): ")
-	adminPort := 8080
-	if adminPortStr != "" {
-		fmt.Sscanf(adminPortStr, "%d", &adminPort)
-	}
+	// Worker 不部署 admin-service；control-service 固定监听 loopback 8082。
+	adminPort := defaultAdminServicePort // 仅用于结构兼容，不创建 Worker admin-service。
 
 	// 10. 是否启用 Hysteria2 (QUIC/UDP)
 	wh2Enabled := false
@@ -585,10 +559,11 @@ func InitDeployWorker() {
 	// SQLite 作为本地缓存库，路径定为 deployPath/trojan-go.db
 	dbPath := filepath.Join(deployPath, "trojan-go.db")
 
-	// 10. 动态生成 8 位随机字符组成订阅混淆路径
+	const workerPathLetters = "abcdefghijklmnopqrstuvwxyz0123456789"
+	// 动态生成 8 位随机字符组成订阅路径；Worker Gateway 不暴露该路径，字段仅供缓存配置兼容。
 	subChars := make([]byte, 8)
 	for i := range subChars {
-		subChars[i] = wsLetters[r.Intn(len(wsLetters))]
+		subChars[i] = workerPathLetters[r.Intn(len(workerPathLetters))]
 	}
 	subPath := "/sub-" + string(subChars)
 
@@ -617,15 +592,23 @@ func InitDeployWorker() {
 
 	proxyContent, err := buildWorkerProxyConfig(deploymentCoreConfigInput{
 		DeployPath: deployPath, Domain: domain, CertPath: crtPath, KeyPath: keyPath,
-		LocalPort: localPort, AdminPort: adminPort, WSPath: wsPath, WSEnabled: wsEnabled,
-		AdminUser: adminUser, AdminPass: adminPwd, DBPath: dbPath, SubPath: subPath, Fallback: true,
+		GatewayPort: gatewayPort, DataPlanePort: dataPlanePort, AdminPort: adminPort, ControlPort: controlPort,
+		AdminUser: adminUser, AdminPass: adminPwd, DBPath: dbPath, SubPath: subPath,
 		Node: &deploymentNodeConfig{Enabled: true, MasterURL: masterURL, Secret: nodeSecret, SyncInterval: 60},
 	})
 	if err != nil {
 		fmt.Printf("\033[31m❌ 生成从节点 config.yaml 失败: %v\033[0m\n", err)
 		return
 	}
-	webContent, err := buildWorkerWebConfig(adminUser, adminPwd, adminPort, dbPath, subPath)
+	gatewayContent, err := buildGatewayConfig(deploymentCoreConfigInput{
+		DeployPath: deployPath, CertPath: crtPath, KeyPath: keyPath,
+		GatewayPort: gatewayPort, DataPlanePort: dataPlanePort, AdminPort: adminPort, ControlPort: controlPort, SubPath: subPath,
+	}, true)
+	if err != nil {
+		fmt.Printf("\033[31m❌ 生成从节点 gateway.yaml 失败: %v\033[0m\n", err)
+		return
+	}
+	webContent, err := buildWorkerWebConfig(adminUser, adminPwd, controlPort, dbPath, subPath)
 	if err != nil {
 		fmt.Printf("\033[31m❌ 生成从节点 web_config.yaml 失败: %v\033[0m\n", err)
 		return
@@ -637,6 +620,10 @@ func InitDeployWorker() {
 	}
 	if err := os.WriteFile(configPath, proxyContent, 0600); err != nil {
 		fmt.Printf("\033[31m❌ 写入 config.yaml 失败: %v\033[0m\n", err)
+		return
+	}
+	if err := os.WriteFile(filepath.Join(deployPath, "gateway.yaml"), gatewayContent, 0600); err != nil {
+		fmt.Printf("\033[31m❌ 写入 gateway.yaml 失败: %v\033[0m\n", err)
 		return
 	}
 	if err := os.WriteFile(filepath.Join(deployPath, "web_config.yaml"), webContent, 0600); err != nil {
@@ -668,7 +655,7 @@ func InitDeployWorker() {
 		}
 		fmt.Println("✓ Hysteria2 已通过 SHA-256 校验并安装")
 		hysteriaConfig, err := buildHysteriaConfig(deploymentHysteriaConfigInput{
-			ListenPort: wh2Port, CertPath: crtPath, KeyPath: keyPath, AdminPort: adminPort, UpMbps: wh2Up, DownMbps: wh2Down,
+			ListenPort: wh2Port, CertPath: crtPath, KeyPath: keyPath, ControlPort: controlPort, UpMbps: wh2Up, DownMbps: wh2Down,
 		})
 		if err != nil {
 			fmt.Printf("\033[31m❌ 生成 Hysteria2 从节点配置失败: %v\033[0m\n", err)
@@ -692,9 +679,9 @@ func InitDeployWorker() {
 	}
 
 	fmt.Println("\n\033[32m=== 从节点部署成功 ! ===\033[0m")
-	fmt.Printf("1. 服务已就绪: 从节点 Trojan TCP/%d、Web 后端仅监听 127.0.0.1:%d\n", localPort, adminPort)
-	fmt.Printf("2. 管理后台入口: https://%s/admin/\n", domain)
-	fmt.Println("   8080 不开放公网，仅供本机 Hysteria2 HTTP Auth；调试时可使用 SSH 本地端口转发。")
-	fmt.Println("3. 从节点不提供订阅；订阅由主节点 HTTPS 服务统一输出。")
-	fmt.Println("4. 证书自动续期已启用: systemctl status trojan-cert-renew.timer")
+	fmt.Printf("1. Worker Gateway: TCP/%d；Trojan data-plane: 127.0.0.1:%d\n", gatewayPort, dataPlanePort)
+	fmt.Printf("2. Worker control-service: 127.0.0.1:%d；不部署 admin-service。\n", controlPort)
+	fmt.Println("3. Worker 不提供 /admin 与订阅；管理和订阅由 Master Gateway 统一输出。")
+	fmt.Println("4. 节点同步使用 /control/v1/nodes/sync，Hysteria2 Auth 使用本机 control-service。")
+	fmt.Println("5. 证书自动续期已启用: systemctl status trojan-cert-renew.timer")
 }

@@ -1,6 +1,7 @@
 package webserver
 
 import (
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -11,12 +12,37 @@ import (
 	"github.com/voidluo/trojan-go/log"
 )
 
-// registerRoutes registers the panel's public, node, and administrator routes.
-// Route paths, methods, authentication rules, and handler bindings are kept
-// compatible with the pre-refactor implementation.
-func (s *AdminServer) registerRoutes(r *gin.Engine, mountPath string) {
-	r.Use(gin.Recovery(), s.limitRequestBody())
+// RouteMode identifies the public service boundary that is being started.
+// The all mode is retained only for the legacy embedded runtime. New deployments
+// run the admin and control modes as separate loopback services.
+type RouteMode uint8
 
+const (
+	RouteModeAll RouteMode = iota
+	RouteModeAdmin
+	RouteModeControl
+)
+
+// registerRoutes keeps the embedded runtime compatible while sharing the exact
+// same route definitions with the standalone admin/control service processes.
+func (s *AdminServer) registerRoutes(r *gin.Engine, mountPath string) {
+	s.registerRoutesForMode(r, mountPath, RouteModeAll)
+}
+
+func (s *AdminServer) registerRoutesForMode(r *gin.Engine, mountPath string, mode RouteMode) {
+	r.Use(gin.Recovery(), s.limitRequestBody())
+	if mode == RouteModeAll || mode == RouteModeAdmin {
+		s.registerAdminRoutes(r, mountPath)
+		// Internal control endpoints are only reachable through the loopback
+		// admin-service listener. The public TLS router never exposes this prefix.
+		s.registerInternalControlRoutes(r)
+	}
+	if mode == RouteModeAll || mode == RouteModeControl {
+		s.registerControlRoutes(r, mode == RouteModeAll)
+	}
+}
+
+func (s *AdminServer) registerAdminRoutes(r *gin.Engine, mountPath string) {
 	if mountPath == "" {
 		mountPath = "/"
 	}
@@ -25,31 +51,20 @@ func (s *AdminServer) registerRoutes(r *gin.Engine, mountPath string) {
 		data, _ := webui.ReadIndex()
 		c.Data(http.StatusOK, "text/html; charset=utf-8", data)
 	}
-
 	if mountPath == "/" {
 		r.GET("/", serveIndex)
 	} else {
 		r.GET(mountPath, serveIndex)
 		trimmedPath := strings.TrimSuffix(mountPath, "/")
 		if trimmedPath != mountPath && trimmedPath != "" {
-			r.GET(trimmedPath, func(c *gin.Context) {
-				c.Redirect(http.StatusFound, mountPath)
-			})
+			r.GET(trimmedPath, func(c *gin.Context) { c.Redirect(http.StatusFound, mountPath) })
 		}
 		r.GET("/", s.serveMaskPage)
 	}
 
-	r.NoRoute(s.serveMaskPage)
-
 	apiGroup := r.Group("/admin/api")
 	apiGroup.POST("/login", s.enforceLoginRateLimit(), s.handleLogin)
-	apiGroup.POST("/node/sync", s.handleNodeSync)
-	apiGroup.POST("/node/heartbeat", s.handleNodeHeartbeat)
-	apiGroup.POST("/auth", s.handleHysteriaAuth)
-	apiGroup.POST("/hysteria/auth", s.handleHysteriaAuth)
-
-	auth := apiGroup.Group("/", s.enforceAdminRateLimit(), s.invalidateSubscriptionAfterMutation(), s.requireAdminOrNode())
-
+	auth := apiGroup.Group("/", s.enforceAdminRateLimit(), s.invalidateSubscriptionAfterMutation(), s.requireAdminSession())
 	auth.GET("/settings", s.handleGetSettings)
 	auth.POST("/settings", s.handleUpdateSettings)
 	auth.POST("/settings/admin", s.handleUpdateAdmin)
@@ -57,16 +72,8 @@ func (s *AdminServer) registerRoutes(r *gin.Engine, mountPath string) {
 	auth.POST("/settings/restore", s.handleRestore)
 	auth.GET("/settings/websocket", s.handleGetWebSocket)
 	auth.POST("/settings/websocket", s.handleUpdateWebSocket)
-
 	auth.GET("/status", s.handleGetStatus)
 	auth.GET("/server-info", s.handleGetServerInfo)
-
-	subRoute := "/sub"
-	if s.subPath != "" {
-		subRoute = s.subPath
-	}
-	r.GET(subRoute, s.handleSub)
-
 	auth.GET("/users", s.handleListUsers)
 	auth.POST("/users", s.handleAddUser)
 	auth.PUT("/users/:id", s.handleUpdateUser)
@@ -76,21 +83,61 @@ func (s *AdminServer) registerRoutes(r *gin.Engine, mountPath string) {
 	auth.POST("/users/:id/expire", s.handleSetExpire)
 	auth.DELETE("/users/:id/expire", s.handleCancelExpire)
 	auth.GET("/users/:id/share", s.handleShare)
-
 	auth.GET("/nodes", s.handleListNodes)
 	auth.POST("/nodes", s.handleAddNode)
 	auth.PUT("/nodes/:id", s.handleUpdateNode)
-	auth.POST("/nodes/:id/secret/rotate", s.requireAdminSession(), s.handleRotateNodeSecret)
+	auth.POST("/nodes/:id/secret/rotate", s.handleRotateNodeSecret)
 	auth.DELETE("/nodes/:id", s.handleDeleteNode)
 	auth.POST("/nodes/:id/ping", s.handlePingNode)
 	auth.GET("/node/master-config", s.handleGetMasterConfig)
 	auth.POST("/node/test-sync", s.handleTestSync)
-
 	auth.GET("/logs", s.handleGetLogs)
 	auth.POST("/service", s.handleServiceControl)
 	auth.POST("/restart", s.handleRestart)
 	auth.GET("/settings/hysteria", s.handleGetHysteriaConfig)
 	auth.POST("/settings/hysteria", s.handleSaveHysteriaConfig)
+
+	subRoute := "/sub"
+	if s.subPath != "" {
+		subRoute = s.subPath
+	}
+	r.GET(subRoute, s.handleSub)
+	r.NoRoute(s.serveMaskPage)
+}
+
+func (s *AdminServer) registerControlRoutes(r *gin.Engine, includeLegacy bool) {
+	control := r.Group("/control/v1")
+	control.POST("/nodes/sync", s.handleNodeSync)
+	control.POST("/nodes/heartbeat", s.handleNodeHeartbeat)
+	control.POST("/hysteria/auth", s.handleHysteriaAuth)
+	if !includeLegacy {
+		return
+	}
+	legacy := r.Group("/admin/api")
+	legacy.POST("/node/sync", s.handleNodeSync)
+	legacy.POST("/node/heartbeat", s.handleNodeHeartbeat)
+	legacy.POST("/auth", s.handleHysteriaAuth)
+	legacy.POST("/hysteria/auth", s.handleHysteriaAuth)
+}
+
+func (s *AdminServer) registerInternalControlRoutes(r *gin.Engine) {
+	internal := r.Group("/internal/control/v1", s.requireLoopbackControl())
+	internal.POST("/nodes/sync", s.handleNodeSync)
+	internal.POST("/nodes/heartbeat", s.handleNodeHeartbeat)
+	internal.POST("/hysteria/auth", s.handleHysteriaAuth)
+	internal.POST("/data-plane/traffic", s.handleDataPlaneTraffic)
+}
+
+func (s *AdminServer) requireLoopbackControl() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		host, _, err := net.SplitHostPort(c.Request.RemoteAddr)
+		if err != nil || (host != "127.0.0.1" && host != "::1") {
+			c.JSON(http.StatusForbidden, gin.H{"error": "internal control endpoint requires loopback origin"})
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
 }
 
 // requireAdminOrNode permits an authenticated management session or a known

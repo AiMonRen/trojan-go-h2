@@ -2,10 +2,23 @@ package actions
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 )
 
-var services = []string{"trojan-go", "trojan-web"}
+var coreServices = []string{"control-service", "trojan-data-plane", "gateway-service"}
+
+func managedServices() []string {
+	services := make([]string, 0, 5)
+	if _, err := os.Stat("/etc/systemd/system/admin-service.service"); err == nil {
+		services = append(services, "admin-service")
+	}
+	services = append(services, coreServices...)
+	if _, err := os.Stat("/etc/systemd/system/hysteria.service"); err == nil {
+		services = append(services, "hysteria")
+	}
+	return services
+}
 
 func runSystemctl(cmd string, svc string) {
 	out, err := exec.Command("systemctl", cmd, svc).CombinedOutput()
@@ -17,7 +30,7 @@ func runSystemctl(cmd string, svc string) {
 
 // TrojanStart 启动服务
 func TrojanStart() {
-	for _, svc := range services {
+	for _, svc := range managedServices() {
 		fmt.Printf("正在启动 %s...\n", svc)
 		runSystemctl("start", svc)
 	}
@@ -27,7 +40,7 @@ func TrojanStart() {
 
 // TrojanStop 停止服务
 func TrojanStop() {
-	for _, svc := range services {
+	for _, svc := range managedServices() {
 		fmt.Printf("正在停止 %s...\n", svc)
 		runSystemctl("stop", svc)
 	}
@@ -37,7 +50,7 @@ func TrojanStop() {
 
 // TrojanRestart 重启服务
 func TrojanRestart() {
-	for _, svc := range services {
+	for _, svc := range managedServices() {
 		fmt.Printf("正在重启 %s...\n", svc)
 		runSystemctl("restart", svc)
 	}
@@ -47,7 +60,7 @@ func TrojanRestart() {
 
 // TrojanStatus 查看服务状态
 func TrojanStatus() {
-	for _, svc := range services {
+	for _, svc := range managedServices() {
 		fmt.Printf("[ %s 服务状态 ]\n\n", svc)
 		out, _ := exec.Command("systemctl", "status", svc, "--no-pager", "-l").CombinedOutput()
 		fmt.Println(string(out))

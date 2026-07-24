@@ -7,42 +7,40 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// deploymentProxyConfig is the installer-owned representation of config.yaml.
-// It deliberately contains only fields the installer writes, so installation
-// defaults remain explicit and are independently testable from runtime parsing.
-type deploymentProxyConfig struct {
-	RunType    string                `yaml:"run_type"`
-	LocalAddr  string                `yaml:"local_addr"`
-	LocalPort  int                   `yaml:"local_port"`
-	RemoteAddr string                `yaml:"remote_addr"`
-	RemotePort int                   `yaml:"remote_port"`
-	SSL        deploymentSSLConfig   `yaml:"ssl"`
-	Mux        deploymentMuxConfig   `yaml:"mux"`
-	WebSocket  deploymentWebSocket   `yaml:"websocket"`
-	Admin      deploymentAdminConfig `yaml:"admin"`
-	Node       *deploymentNodeConfig `yaml:"node,omitempty"`
-	Log        deploymentLogConfig   `yaml:"log"`
+const (
+	defaultGatewayPort        = 443
+	defaultAdminServicePort   = 8081
+	defaultControlServicePort = 8082
+	defaultDataPlanePort      = 14443
+)
+
+// deploymentDataPlaneConfig is the installer-owned representation of the
+// loopback-only Trojan data-plane config.yaml.
+type deploymentDataPlaneConfig struct {
+	RunType          string                    `yaml:"run_type"`
+	LocalAddr        string                    `yaml:"local_addr"`
+	LocalPort        int                       `yaml:"local_port"`
+	RemoteAddr       string                    `yaml:"remote_addr"`
+	RemotePort       int                       `yaml:"remote_port"`
+	DisableHTTPCheck bool                      `yaml:"disable_http_check"`
+	AuthDB           string                    `yaml:"auth_db"`
+	AuthRefresh      int                       `yaml:"auth_refresh"`
+	TrafficReport    string                    `yaml:"traffic_report,omitempty"`
+	TrafficInterval  int                       `yaml:"traffic_interval,omitempty"`
+	ProxyProtocol    bool                      `yaml:"proxy_protocol"`
+	TransportPlugin  deploymentTransportPlugin `yaml:"transport_plugin"`
+	Mux              deploymentMuxConfig       `yaml:"mux"`
+	Node             *deploymentNodeConfig     `yaml:"node,omitempty"`
+	Log              deploymentLogConfig       `yaml:"log"`
 }
 
-type deploymentSSLConfig struct {
-	Cert              string `yaml:"cert"`
-	Key               string `yaml:"key"`
-	SNI               string `yaml:"sni"`
-	Verify            bool   `yaml:"verify"`
-	VerifyHostname    bool   `yaml:"verify_hostname"`
-	FallbackAddr      string `yaml:"fallback_addr,omitempty"`
-	FallbackPort      int    `yaml:"fallback_port,omitempty"`
-	PlainHTTPResponse string `yaml:"plain_http_response"`
+type deploymentTransportPlugin struct {
+	Enabled bool   `yaml:"enabled"`
+	Type    string `yaml:"type"`
 }
 
 type deploymentMuxConfig struct {
 	Enabled bool `yaml:"enabled"`
-}
-
-type deploymentWebSocket struct {
-	Enabled bool   `yaml:"enabled"`
-	Path    string `yaml:"path"`
-	Host    string `yaml:"host"`
 }
 
 type deploymentAdminConfig struct {
@@ -76,6 +74,30 @@ type deploymentWebConfig struct {
 
 type deploymentWebNode struct {
 	Enabled bool `yaml:"enabled"`
+}
+
+type deploymentGatewayConfig struct {
+	Gateway deploymentGatewayServiceConfig `yaml:"gateway"`
+	SSL     deploymentGatewayTLSConfig     `yaml:"ssl"`
+	Routes  deploymentGatewayRoutes        `yaml:"routes"`
+}
+
+type deploymentGatewayServiceConfig struct {
+	Listen         string `yaml:"listen"`
+	AdminService   string `yaml:"admin_service,omitempty"`
+	ControlService string `yaml:"control_service"`
+	TrojanService  string `yaml:"trojan_service"`
+	AdminDisabled  bool   `yaml:"admin_disabled,omitempty"`
+}
+
+type deploymentGatewayTLSConfig struct {
+	Cert string `yaml:"cert"`
+	Key  string `yaml:"key"`
+}
+
+type deploymentGatewayRoutes struct {
+	AdminPrefix string `yaml:"admin_prefix"`
+	SubPath     string `yaml:"sub_path"`
 }
 
 type deploymentHysteriaConfig struct {
@@ -127,85 +149,105 @@ type deploymentHysteriaBandwidth struct {
 }
 
 type deploymentCoreConfigInput struct {
-	DeployPath string
-	Domain     string
-	CertPath   string
-	KeyPath    string
-	LocalPort  int
-	AdminPort  int
-	WSPath     string
-	WSEnabled  bool
-	AdminUser  string
-	AdminPass  string
-	DBPath     string
-	SubPath    string
-	Node       *deploymentNodeConfig
-	Fallback   bool
+	DeployPath       string
+	Domain           string
+	CertPath         string
+	KeyPath          string
+	GatewayPort      int
+	DataPlanePort    int
+	AdminPort        int
+	ControlPort      int
+	AdminUser        string
+	AdminPass        string
+	DBPath           string
+	SubPath          string
+	Node             *deploymentNodeConfig
+	TrafficReporting bool
 }
 
 type deploymentHysteriaConfigInput struct {
-	ListenPort int
-	CertPath   string
-	KeyPath    string
-	AdminPort  int
-	UpMbps     int
-	DownMbps   int
+	ListenPort  int
+	CertPath    string
+	KeyPath     string
+	ControlPort int
+	UpMbps      int
+	DownMbps    int
+}
+
+func normalizeDeploymentPorts(input deploymentCoreConfigInput) deploymentCoreConfigInput {
+	if input.GatewayPort <= 0 {
+		input.GatewayPort = defaultGatewayPort
+	}
+	if input.DataPlanePort <= 0 {
+		input.DataPlanePort = defaultDataPlanePort
+	}
+	if input.AdminPort <= 0 {
+		input.AdminPort = defaultAdminServicePort
+	}
+	if input.ControlPort <= 0 {
+		input.ControlPort = defaultControlServicePort
+	}
+	return input
 }
 
 func buildMasterProxyConfig(input deploymentCoreConfigInput) ([]byte, error) {
-	return marshalDeploymentYAML(newDeploymentProxyConfig(input))
+	input = normalizeDeploymentPorts(input)
+	input.TrafficReporting = true
+	return marshalDeploymentYAML(newDeploymentDataPlaneConfig(input))
 }
 
 func buildWorkerProxyConfig(input deploymentCoreConfigInput) ([]byte, error) {
 	if input.Node == nil {
-		return nil, fmt.Errorf("worker proxy configuration requires node synchronization settings")
+		return nil, fmt.Errorf("worker data-plane configuration requires node synchronization settings")
 	}
-	return marshalDeploymentYAML(newDeploymentProxyConfig(input))
+	input = normalizeDeploymentPorts(input)
+	input.TrafficReporting = false
+	return marshalDeploymentYAML(newDeploymentDataPlaneConfig(input))
 }
 
-func newDeploymentProxyConfig(input deploymentCoreConfigInput) deploymentProxyConfig {
-	ssl := deploymentSSLConfig{
-		Cert:              input.CertPath,
-		Key:               input.KeyPath,
-		SNI:               input.Domain,
-		Verify:            false,
-		VerifyHostname:    false,
-		PlainHTTPResponse: filepath.Join(input.DeployPath, "index.html"),
-	}
-	if input.Fallback {
-		ssl.FallbackAddr = "127.0.0.1"
-		ssl.FallbackPort = input.AdminPort
-	}
-
-	return deploymentProxyConfig{
-		RunType:    "server",
-		LocalAddr:  "0.0.0.0",
-		LocalPort:  input.LocalPort,
-		RemoteAddr: "127.0.0.1",
-		RemotePort: input.AdminPort,
-		SSL:        ssl,
-		Mux:        deploymentMuxConfig{Enabled: true},
-		WebSocket: deploymentWebSocket{
-			Enabled: input.WSEnabled,
-			Path:    input.WSPath,
-			Host:    input.Domain,
-		},
-		Admin: deploymentAdminConfig{
-			Enabled:  true,
-			Username: input.AdminUser,
-			Password: input.AdminPass,
-			Port:     0,
-			DB:       input.DBPath,
-			Path:     "/admin",
-			SubPath:  input.SubPath,
-		},
-		Node: input.Node,
+func newDeploymentDataPlaneConfig(input deploymentCoreConfigInput) deploymentDataPlaneConfig {
+	cfg := deploymentDataPlaneConfig{
+		RunType:          "server",
+		LocalAddr:        "127.0.0.1",
+		LocalPort:        input.DataPlanePort,
+		RemoteAddr:       "127.0.0.1",
+		RemotePort:       0,
+		DisableHTTPCheck: true,
+		AuthDB:           input.DBPath,
+		AuthRefresh:      30,
+		ProxyProtocol:    true,
+		TransportPlugin:  deploymentTransportPlugin{Enabled: true, Type: "plaintext"},
+		Mux:              deploymentMuxConfig{Enabled: true},
+		Node:             input.Node,
 		Log: deploymentLogConfig{
 			Level:  1,
-			Access: filepath.Join(input.DeployPath, "log", "trojan-go", "access.log"),
-			Error:  filepath.Join(input.DeployPath, "log", "trojan-go", "error.log"),
+			Access: filepath.Join(input.DeployPath, "log", "trojan-data-plane", "access.log"),
+			Error:  filepath.Join(input.DeployPath, "log", "trojan-data-plane", "error.log"),
 		},
 	}
+	if input.TrafficReporting {
+		cfg.TrafficReport = fmt.Sprintf("http://127.0.0.1:%d/internal/control/v1/data-plane/traffic", input.AdminPort)
+		cfg.TrafficInterval = 30
+	}
+	return cfg
+}
+
+func buildGatewayConfig(input deploymentCoreConfigInput, adminDisabled bool) ([]byte, error) {
+	input = normalizeDeploymentPorts(input)
+	cfg := deploymentGatewayConfig{
+		Gateway: deploymentGatewayServiceConfig{
+			Listen:         fmt.Sprintf("0.0.0.0:%d", input.GatewayPort),
+			ControlService: fmt.Sprintf("127.0.0.1:%d", input.ControlPort),
+			TrojanService:  fmt.Sprintf("127.0.0.1:%d", input.DataPlanePort),
+			AdminDisabled:  adminDisabled,
+		},
+		SSL:    deploymentGatewayTLSConfig{Cert: input.CertPath, Key: input.KeyPath},
+		Routes: deploymentGatewayRoutes{AdminPrefix: "/admin/", SubPath: input.SubPath},
+	}
+	if !adminDisabled {
+		cfg.Gateway.AdminService = fmt.Sprintf("127.0.0.1:%d", input.AdminPort)
+	}
+	return marshalDeploymentYAML(cfg)
 }
 
 func buildMasterWebConfig(adminUser, adminPass string, adminPort int, dbPath, subPath string) ([]byte, error) {
@@ -218,11 +260,11 @@ func buildMasterWebConfig(adminUser, adminPass string, adminPort int, dbPath, su
 	})
 }
 
-func buildWorkerWebConfig(adminUser, adminPass string, adminPort int, dbPath, subPath string) ([]byte, error) {
+func buildWorkerWebConfig(adminUser, adminPass string, controlPort int, dbPath, subPath string) ([]byte, error) {
 	return marshalDeploymentYAML(deploymentWebConfig{
 		RunType: "server",
 		Admin: deploymentAdminConfig{
-			Enabled: true, Username: adminUser, Password: adminPass, Port: adminPort,
+			Enabled: true, Username: adminUser, Password: adminPass, Port: controlPort,
 			DB: dbPath, Path: "/admin/", SubPath: subPath,
 		},
 		Node: &deploymentWebNode{Enabled: true},
@@ -230,13 +272,16 @@ func buildWorkerWebConfig(adminUser, adminPass string, adminPort int, dbPath, su
 }
 
 func buildHysteriaConfig(input deploymentHysteriaConfigInput) ([]byte, error) {
+	if input.ControlPort <= 0 {
+		input.ControlPort = defaultControlServicePort
+	}
 	return marshalDeploymentYAML(deploymentHysteriaConfig{
 		Listen: fmt.Sprintf(":%d", input.ListenPort),
 		TLS:    deploymentHysteriaTLS{Cert: input.CertPath, Key: input.KeyPath},
 		Auth: deploymentHysteriaAuth{
 			Type: "http",
 			HTTP: deploymentHysteriaHTTPAuth{
-				URL: fmt.Sprintf("http://127.0.0.1:%d/admin/api/hysteria/auth", input.AdminPort), Insecure: true,
+				URL: fmt.Sprintf("http://127.0.0.1:%d/control/v1/hysteria/auth", input.ControlPort), Insecure: true,
 			},
 		},
 		Masquerade: deploymentHysteriaMask{

@@ -38,16 +38,17 @@ func TestTransport(t *testing.T) {
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 	var conn1, conn2 net.Conn
+	var acceptErr error
 	go func() {
-		conn2, err = s.AcceptConn(nil)
-		common.Must(err)
-		wg.Done()
+		defer wg.Done()
+		conn2, acceptErr = s.AcceptConn(nil)
 	}()
 	conn1, err = c.DialConn(nil, nil)
 	common.Must(err)
 
 	common.Must2(conn1.Write([]byte("12345678\r\n")))
 	wg.Wait()
+	common.Must(acceptErr)
 	buf := [10]byte{}
 	conn2.Read(buf[:])
 	if !util.CheckConn(conn1, conn2) {

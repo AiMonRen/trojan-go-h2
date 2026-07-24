@@ -1,22 +1,25 @@
+# Legacy compatibility unit only.
+# New deployments must use the generated units:
+#   admin-service.service
+#   control-service.service
+#   trojan-data-plane.service
+#   gateway-service.service
+# This file keeps the historical embedded `web` command available for manual
+# compatibility testing; it is not installed by the service-oriented deployer.
+
 [Unit]
-Description=Trojan-Go Web Management Service
-After=network.target trojan-go.service
-Documentation=https://github.com/p4gefau1t/trojan-go
+Description=Trojan-Go Legacy Embedded Web Service (Compatibility Only)
+After=network.target
+Documentation=https://github.com/voidluo/trojan-go
 
 [Service]
 Type=simple
 User=root
-# 赋予监听 80 端口权限
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
-
-# 使用 web 子命令启动独立后台
 ExecStart=/usr/local/bin/trojan-go web -config /etc/trojan-go/server.yaml
-
 Restart=on-failure
 RestartSec=10s
-LimitNOFILE=infinity
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target

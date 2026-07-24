@@ -1,0 +1,297 @@
+package webserver
+
+import (
+	"bufio"
+	"context"
+	"crypto/tls"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/voidluo/trojan-go/common"
+	"github.com/voidluo/trojan-go/log"
+	"gopkg.in/yaml.v3"
+)
+
+const (
+	defaultGatewayListenAddress = "0.0.0.0:443"
+	defaultTrojanDataPlane      = "127.0.0.1:14443"
+	gatewayHandshakeTimeout     = 10 * time.Second
+	gatewayBackendDialTimeout   = 5 * time.Second
+)
+
+// GatewayConfig defines the independently deployable TCP/443 edge gateway.
+// HTTP routes are handled by ServiceRouter. Non-HTTP traffic is delivered as
+// decrypted Trojan bytes to a loopback-only data-plane listener.
+type GatewayConfig struct {
+	ListenAddress  string
+	CertPath       string
+	KeyPath        string
+	AdminAddress   string
+	AdminDisabled  bool
+	ControlAddress string
+	TrojanAddress  string
+	AdminPrefix    string
+	SubPath        string
+}
+
+// Gateway owns the public TLS listener and keeps all service backends private.
+type Gateway struct {
+	listener      net.Listener
+	tlsConfig     *tls.Config
+	serviceRouter *ServiceRouter
+	trojanAddress string
+	dialer        net.Dialer
+	done          chan struct{}
+	closeOnce     sync.Once
+	workers       sync.WaitGroup
+}
+
+// gatewayFileConfig is intentionally independent from admin-service database
+// settings. The edge gateway needs only TLS material, private upstreams, and
+// public route prefixes.
+type gatewayFileConfig struct {
+	SSL struct {
+		Cert string `yaml:"cert"`
+		Key  string `yaml:"key"`
+	} `yaml:"ssl"`
+	Gateway struct {
+		Listen         string `yaml:"listen"`
+		AdminService   string `yaml:"admin_service"`
+		AdminDisabled  bool   `yaml:"admin_disabled"`
+		ControlService string `yaml:"control_service"`
+		TrojanService  string `yaml:"trojan_service"`
+	} `yaml:"gateway"`
+	Routes struct {
+		AdminPrefix string `yaml:"admin_prefix"`
+		SubPath     string `yaml:"sub_path"`
+	} `yaml:"routes"`
+}
+
+func loadGatewayConfig(configPath string) (gatewayFileConfig, error) {
+	var cfg gatewayFileConfig
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return cfg, fmt.Errorf("读取 Gateway 配置失败: %w", err)
+	}
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return cfg, fmt.Errorf("解析 Gateway 配置失败: %w", err)
+	}
+	if cfg.SSL.Cert == "" || cfg.SSL.Key == "" {
+		return cfg, fmt.Errorf("Gateway 配置必须包含 ssl.cert 和 ssl.key")
+	}
+	return cfg, nil
+}
+
+func RunGatewayService(configPath, listenAddress string) error {
+	gatewayFile, err := loadGatewayConfig(configPath)
+	if err != nil {
+		return err
+	}
+	if listenAddress == "" {
+		listenAddress = gatewayFile.Gateway.Listen
+	}
+	if listenAddress == "" {
+		listenAddress = defaultGatewayListenAddress
+	}
+	adminAddress := gatewayFile.Gateway.AdminService
+	if gatewayFile.Gateway.AdminDisabled {
+		adminAddress = ""
+	} else if adminAddress == "" {
+		adminAddress = "127.0.0.1:8081"
+	}
+	controlAddress := gatewayFile.Gateway.ControlService
+	if controlAddress == "" {
+		controlAddress = "127.0.0.1:8082"
+	}
+	trojanAddress := gatewayFile.Gateway.TrojanService
+	if trojanAddress == "" {
+		trojanAddress = defaultTrojanDataPlane
+	}
+	gateway, err := NewGateway(GatewayConfig{
+		ListenAddress:  listenAddress,
+		CertPath:       gatewayFile.SSL.Cert,
+		KeyPath:        gatewayFile.SSL.Key,
+		AdminAddress:   adminAddress,
+		AdminDisabled:  gatewayFile.Gateway.AdminDisabled,
+		ControlAddress: controlAddress,
+		TrojanAddress:  trojanAddress,
+		AdminPrefix:    gatewayFile.Routes.AdminPrefix,
+		SubPath:        gatewayFile.Routes.SubPath,
+	})
+	if err != nil {
+		return err
+	}
+	defer gateway.Close()
+	go func() {
+		<-common.ShutdownContext().Done()
+		_ = gateway.Close()
+	}()
+	log.Infof("gateway-service started on %s: admin=%s control=%s trojan=%s", gateway.listener.Addr(), adminAddress, controlAddress, trojanAddress)
+	return gateway.Serve()
+}
+
+// NewGateway validates all private upstreams before opening the public listener.
+func NewGateway(cfg GatewayConfig) (*Gateway, error) {
+	if cfg.ListenAddress == "" {
+		cfg.ListenAddress = defaultGatewayListenAddress
+	}
+	if cfg.AdminDisabled {
+		cfg.AdminAddress = ""
+	} else if cfg.AdminAddress == "" {
+		cfg.AdminAddress = "127.0.0.1:8081"
+	}
+	if cfg.ControlAddress == "" {
+		cfg.ControlAddress = "127.0.0.1:8082"
+	}
+	if cfg.TrojanAddress == "" {
+		cfg.TrojanAddress = defaultTrojanDataPlane
+	}
+	if err := requireLoopbackAddress(cfg.TrojanAddress, "trojan data-plane"); err != nil {
+		return nil, err
+	}
+	cert, err := tls.LoadX509KeyPair(cfg.CertPath, cfg.KeyPath)
+	if err != nil {
+		return nil, fmt.Errorf("加载 Gateway TLS 证书失败: %w", err)
+	}
+	router, err := NewServiceRouter(cfg.AdminAddress, cfg.ControlAddress, cfg.AdminPrefix, cfg.SubPath)
+	if err != nil {
+		return nil, err
+	}
+	listener, err := net.Listen("tcp", cfg.ListenAddress)
+	if err != nil {
+		_ = router.Close()
+		return nil, fmt.Errorf("监听 Gateway 失败: %w", err)
+	}
+	return &Gateway{
+		listener:      listener,
+		tlsConfig:     &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"http/1.1"}, MinVersion: tls.VersionTLS12},
+		serviceRouter: router,
+		trojanAddress: cfg.TrojanAddress,
+		dialer:        net.Dialer{Timeout: gatewayBackendDialTimeout, KeepAlive: 30 * time.Second},
+		done:          make(chan struct{}),
+	}, nil
+}
+
+func requireLoopbackAddress(address, serviceName string) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("invalid %s address %q: %w", serviceName, address, err)
+	}
+	ip := net.ParseIP(host)
+	if host != "localhost" && (ip == nil || !ip.IsLoopback()) {
+		return fmt.Errorf("%s must use a loopback address, got %q", serviceName, address)
+	}
+	return nil
+}
+
+func (g *Gateway) Serve() error {
+	for {
+		conn, err := g.listener.Accept()
+		if err != nil {
+			select {
+			case <-g.done:
+				return nil
+			default:
+				return fmt.Errorf("Gateway 接收连接失败: %w", err)
+			}
+		}
+		g.workers.Add(1)
+		go func() {
+			defer g.workers.Done()
+			g.handleConn(conn)
+		}()
+	}
+}
+
+func (g *Gateway) handleConn(rawConn net.Conn) {
+	_ = rawConn.SetDeadline(time.Now().Add(gatewayHandshakeTimeout))
+	tlsConn := tls.Server(rawConn, g.tlsConfig)
+	if err := tlsConn.Handshake(); err != nil {
+		_ = rawConn.Close()
+		return
+	}
+	_ = rawConn.SetDeadline(time.Now().Add(gatewayHandshakeTimeout))
+
+	rewindConn := common.NewRewindConn(tlsConn)
+	rewindConn.SetBufferSize(16 * 1024)
+	request, err := http.ReadRequest(bufio.NewReader(rewindConn))
+	rewindConn.Rewind()
+	rewindConn.StopBuffering()
+	_ = rawConn.SetDeadline(time.Time{})
+	if err == nil {
+		if g.serviceRouter.Matches(request.URL.Path) {
+			g.serviceRouter.ServeConn(rewindConn)
+			return
+		}
+		writeGatewayNotFound(rewindConn)
+		return
+	}
+	g.forwardTrojan(rewindConn)
+}
+
+func writeGatewayNotFound(conn net.Conn) {
+	body := "Not Found\n"
+	_, _ = fmt.Fprintf(conn, "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
+	_ = conn.Close()
+}
+
+func (g *Gateway) forwardTrojan(client net.Conn) {
+	backend, err := g.dialer.DialContext(context.Background(), "tcp", g.trojanAddress)
+	if err != nil {
+		log.Warnf("gateway-service: Trojan data-plane unavailable: %v", err)
+		_ = client.Close()
+		return
+	}
+	if err := writeProxyHeader(backend, client.RemoteAddr(), client.LocalAddr()); err != nil {
+		_ = backend.Close()
+		_ = client.Close()
+		return
+	}
+	relayGatewayConnections(client, backend)
+}
+
+func writeProxyHeader(w io.Writer, source, destination net.Addr) error {
+	src, srcOK := source.(*net.TCPAddr)
+	dst, dstOK := destination.(*net.TCPAddr)
+	if !srcOK || !dstOK || src.IP == nil || dst.IP == nil {
+		_, err := io.WriteString(w, "PROXY UNKNOWN\r\n")
+		return err
+	}
+	family := "TCP6"
+	if src.IP.To4() != nil && dst.IP.To4() != nil {
+		family = "TCP4"
+	}
+	_, err := fmt.Fprintf(w, "PROXY %s %s %s %d %d\r\n", family, src.IP.String(), dst.IP.String(), src.Port, dst.Port)
+	return err
+}
+
+func relayGatewayConnections(client, backend net.Conn) {
+	defer client.Close()
+	defer backend.Close()
+	done := make(chan struct{}, 2)
+	copyConn := func(dst, src net.Conn) {
+		_, _ = io.Copy(dst, src)
+		if tcp, ok := dst.(*net.TCPConn); ok {
+			_ = tcp.CloseWrite()
+		}
+		done <- struct{}{}
+	}
+	go copyConn(backend, client)
+	go copyConn(client, backend)
+	<-done
+}
+
+func (g *Gateway) Close() error {
+	g.closeOnce.Do(func() {
+		close(g.done)
+		_ = g.listener.Close()
+		_ = g.serviceRouter.Close()
+	})
+	g.workers.Wait()
+	return nil
+}

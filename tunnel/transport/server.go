@@ -19,14 +19,15 @@ import (
 )
 
 type Server struct {
-	tcpListener net.Listener
-	cmd         *exec.Cmd
-	connChan    chan tunnel.Conn
-	wsChan      chan tunnel.Conn
-	httpLock    sync.RWMutex
-	nextHTTP    bool
-	ctx         context.Context
-	cancel      context.CancelFunc
+	tcpListener   net.Listener
+	cmd           *exec.Cmd
+	connChan      chan tunnel.Conn
+	wsChan        chan tunnel.Conn
+	httpLock      sync.RWMutex
+	nextHTTP      bool
+	proxyProtocol bool
+	ctx           context.Context
+	cancel        context.CancelFunc
 }
 
 func (s *Server) Close() error {
@@ -49,6 +50,15 @@ func (s *Server) acceptLoop() {
 			return
 		}
 		go func(tcpConn net.Conn) {
+			if s.proxyProtocol {
+				proxiedConn, err := readProxyProtocolV1(tcpConn)
+				if err != nil {
+					log.Warn(common.NewError("transport rejected invalid PROXY protocol header").Base(err))
+					_ = tcpConn.Close()
+					return
+				}
+				tcpConn = proxiedConn
+			}
 			s.httpLock.RLock()
 			plaintext := s.nextHTTP
 			s.httpLock.RUnlock()
@@ -135,6 +145,12 @@ func NewServer(ctx context.Context, _ tunnel.Server) (*Server, error) {
 	if !ok || cfg == nil {
 		return nil, common.NewError("transport server configuration not found")
 	}
+	if cfg.ProxyProtocol {
+		ip := net.ParseIP(cfg.LocalHost)
+		if cfg.LocalHost != "localhost" && (ip == nil || !ip.IsLoopback()) {
+			return nil, common.NewError("transport proxy_protocol requires a loopback local_addr")
+		}
+	}
 	listenAddress := tunnel.NewAddressFromHostPort("tcp", cfg.LocalHost, cfg.LocalPort)
 	cmd, err := (&Server{}).startPlugin(cfg)
 	if err != nil {
@@ -149,7 +165,7 @@ func NewServer(ctx context.Context, _ tunnel.Server) (*Server, error) {
 		return nil, common.NewError("failed to listen transport").Base(err)
 	}
 	childCtx, cancel := context.WithCancel(ctx)
-	s := &Server{tcpListener: listener, cmd: cmd, connChan: make(chan tunnel.Conn, 32), wsChan: make(chan tunnel.Conn, 32), ctx: childCtx, cancel: cancel}
+	s := &Server{tcpListener: listener, cmd: cmd, connChan: make(chan tunnel.Conn, 32), wsChan: make(chan tunnel.Conn, 32), proxyProtocol: cfg.ProxyProtocol, ctx: childCtx, cancel: cancel}
 	go s.acceptLoop()
 	return s, nil
 }

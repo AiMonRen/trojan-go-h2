@@ -442,19 +442,27 @@ func (m *NodeSyncManager) heartbeatLoop(ctx context.Context) {
 	}
 }
 
-const syncEndpointPath = "/admin/api/node/sync"
+const (
+	syncEndpointPath       = "/control/v1/nodes/sync"
+	legacySyncEndpointPath = "/admin/api/node/sync"
+)
 
-// heartbeatURL derives the heartbeat endpoint only from a valid absolute sync URL.
-// It avoids string slicing so malformed worker configuration cannot panic the process.
+// heartbeatURL derives the heartbeat endpoint from either the service boundary
+// URL or the pre-service legacy URL so existing cold data deployments remain
+// readable while new generated configurations use /control/v1.
 func heartbeatURL(masterURL string) (string, error) {
 	u, err := url.Parse(masterURL)
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return "", fmt.Errorf("invalid master sync URL %q", masterURL)
 	}
-	if !strings.HasSuffix(u.Path, syncEndpointPath) {
+	switch {
+	case strings.HasSuffix(u.Path, syncEndpointPath):
+		u.Path = strings.TrimSuffix(u.Path, syncEndpointPath) + "/control/v1/nodes/heartbeat"
+	case strings.HasSuffix(u.Path, legacySyncEndpointPath):
+		u.Path = strings.TrimSuffix(u.Path, legacySyncEndpointPath) + "/admin/api/node/heartbeat"
+	default:
 		return "", fmt.Errorf("master sync URL path must end with %s", syncEndpointPath)
 	}
-	u.Path = strings.TrimSuffix(u.Path, syncEndpointPath) + "/admin/api/node/heartbeat"
 	u.RawQuery = ""
 	u.Fragment = ""
 	return u.String(), nil

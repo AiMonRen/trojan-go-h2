@@ -74,7 +74,8 @@ type AdminServer struct {
 	cacheValid      bool
 
 	// 代理核心认证器引用（支持多条代理链路聚合），用于同步面板用户到代理层
-	auths []statistic.Authenticator
+	auths            []statistic.Authenticator
+	authRefreshEvery time.Duration
 
 	// 传输层特性，用于订阅配置生成
 	wsEnabled  bool
@@ -104,31 +105,51 @@ type AdminServer struct {
 // 这是连接 Web 面板（SQLite）与代理核心（内存认证）的关键桥梁。
 func (s *AdminServer) SetAuth(auth statistic.Authenticator) {
 	s.auths = append(s.auths, auth)
-	// 从数据库加载所有用户，注入认证器
-	var users []database.User
-	// 只加载状态为正常 (Status=0) 且未过期的用户
-	now := time.Now()
-	s.db.Where("status = ?", 0).Find(&users)
-
-	count := 0
-	for _, u := range users {
-		// 检查是否过期
-		if u.ExpiryTime != nil && !u.ExpiryTime.IsZero() && u.ExpiryTime.Before(now) {
-			continue
-		}
-		if u.Hash != "" {
-			if err := auth.AddUser(u.Hash); err == nil {
-				count++
-			} else {
-				log.Debugf("sync user %s to auth: %v (may already exist)", u.Username, err)
+	if err := SyncAuthenticatorFromDatabase(s.db, auth); err != nil {
+		log.Errorf("sync active users to proxy authenticator: %v", err)
+		return
+	}
+	log.Info("synced active users from database to proxy authenticator")
+	if s.authRefreshEvery <= 0 {
+		return
+	}
+	s.workers.Add(1)
+	go func() {
+		defer s.workers.Done()
+		ticker := time.NewTicker(s.authRefreshEvery)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := SyncAuthenticatorFromDatabase(s.db, auth); err != nil {
+					log.Warnf("refresh proxy authenticator from database: %v", err)
+				}
+			case <-s.done:
+				return
 			}
 		}
-	}
-	log.Infof("synced %d active users from database to proxy authenticator", count)
+	}()
 }
 
-// New 创建管理面板服务器
+// New creates the full embedded management server used by the legacy runtime.
 func New(db *gorm.DB, username, password, mountPath string, port int, wsEnabled bool, wsPath string, muxEnabled bool, isNode bool, maskHtmlPath string, subPath string, serverDomain string) *AdminServer {
+	return newAdminServer(db, username, password, mountPath, port, wsEnabled, wsPath, muxEnabled, isNode, maskHtmlPath, subPath, serverDomain, true)
+}
+
+// NewDataPlaneAuthBridge loads existing database users into the in-process
+// Trojan authenticator without starting any database-writing background worker.
+// It is used only when service_mode routes HTTP to standalone services.
+func NewDataPlaneAuthBridge(db *gorm.DB, username, password string, isNode bool) *AdminServer {
+	return NewDataPlaneAuthBridgeWithRefresh(db, username, password, isNode, 30*time.Second)
+}
+
+func NewDataPlaneAuthBridgeWithRefresh(db *gorm.DB, username, password string, isNode bool, refreshEvery time.Duration) *AdminServer {
+	srv := newAdminServer(db, username, password, "/admin/", 0, false, "", false, isNode, "", "", "", false)
+	srv.authRefreshEvery = refreshEvery
+	return srv
+}
+
+func newAdminServer(db *gorm.DB, username, password, mountPath string, port int, wsEnabled bool, wsPath string, muxEnabled bool, isNode bool, maskHtmlPath string, subPath string, serverDomain string, startWorkers bool) *AdminServer {
 	srv := &AdminServer{
 		db:                db,
 		connChan:          make(chan net.Conn, 64),
@@ -169,26 +190,28 @@ func New(db *gorm.DB, username, password, mountPath string, port int, wsEnabled 
 	srv.registerRoutes(r, mountPath)
 	srv.handler = r
 
-	srv.workers.Add(2)
-	go func() {
-		defer srv.workers.Done()
-		srv.resetTrafficWorker()
-	}()
-	go func() {
-		defer srv.workers.Done()
-		srv.trafficSyncWorker()
-	}()
+	if startWorkers {
+		srv.workers.Add(2)
+		go func() {
+			defer srv.workers.Done()
+			srv.resetTrafficWorker()
+		}()
+		go func() {
+			defer srv.workers.Done()
+			srv.trafficSyncWorker()
+		}()
 
-	// Consume decrypted connections routed from the TLS layer.
-	srv.httpServer = &http.Server{Handler: r}
-	go func() {
-		if err := srv.httpServer.Serve(srv); err != nil && err != http.ErrServerClosed && srv.doneOpen() {
-			log.Error("admin panel: TLS-shared HTTP server failed:", err)
-		}
-	}()
+		// Consume decrypted connections routed from the TLS layer.
+		srv.httpServer = &http.Server{Handler: r}
+		go func() {
+			if err := srv.httpServer.Serve(srv); err != nil && err != http.ErrServerClosed && srv.doneOpen() {
+				log.Error("admin panel: TLS-shared HTTP server failed:", err)
+			}
+		}()
+	}
 
 	// Start an independently controllable listener when configured.
-	if port > 0 {
+	if startWorkers && port > 0 {
 		// 独立管理后端仅供本机 HY2 认证接口使用；HTTPS 面板与订阅由 TLS/443
 		// 在进程内复用，绝不需要暴露独立 HTTP 端口到公网。
 		listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))

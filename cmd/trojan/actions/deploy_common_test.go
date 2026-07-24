@@ -6,67 +6,52 @@ import (
 	"testing"
 )
 
-func TestDeploymentUnitContentsPreservesRoleSpecificDescriptions(t *testing.T) {
+func TestDeploymentUnitContentsPreservesServiceBoundaries(t *testing.T) {
 	deployPath := "/etc/trojan-go"
-	tests := []struct {
-		name             string
-		role             deploymentRole
-		hysteriaEnabled  bool
-		proxyDescription string
-		webDescription   string
-		h2Description    string
-	}{
-		{
-			name:             "master without Hysteria2",
-			role:             deploymentMaster,
-			proxyDescription: "Description=Trojan-Go Proxy Service",
-			webDescription:   "Description=Trojan-Go Web Management Service",
-		},
-		{
-			name:             "worker with Hysteria2",
-			role:             deploymentWorker,
-			hysteriaEnabled:  true,
-			proxyDescription: "Description=Trojan-Go Worker Proxy Service",
-			webDescription:   "Description=Trojan-Go Worker Web Management Service",
-			h2Description:    "Description=Hysteria2 QUIC/UDP Server (Worker)",
-		},
+	master := deploymentUnitContents(deploymentMaster, deployPath, true)
+	for _, name := range []string{"admin-service.service", "control-service.service", "trojan-data-plane.service", "gateway-service.service", "hysteria.service"} {
+		if _, ok := master[name]; !ok {
+			t.Fatalf("master missing %s", name)
+		}
+	}
+	if got := master["admin-service.service"]; !strings.Contains(got, "admin-service -config "+filepath.Join(deployPath, "web_config.yaml")+" -listen 127.0.0.1:8081") {
+		t.Fatalf("admin unit has unexpected command:\n%s", got)
+	}
+	if got := master["control-service.service"]; !strings.Contains(got, "control-service -listen 127.0.0.1:8082 -admin 127.0.0.1:8081") || !strings.Contains(got, "Requires=admin-service.service") {
+		t.Fatalf("control unit has unexpected dependency or command:\n%s", got)
+	}
+	if got := master["trojan-data-plane.service"]; !strings.Contains(got, "ExecStart=/usr/bin/trojan-go -config "+filepath.Join(deployPath, "config.yaml")) {
+		t.Fatalf("data-plane unit has unexpected command:\n%s", got)
+	}
+	if got := master["gateway-service.service"]; !strings.Contains(got, "gateway-service -config "+filepath.Join(deployPath, "gateway.yaml")) || !strings.Contains(got, "Requires=admin-service.service control-service.service trojan-data-plane.service") {
+		t.Fatalf("gateway unit has unexpected dependency or command:\n%s", got)
+	}
+	if got := master["hysteria.service"]; !strings.Contains(got, "Requires=control-service.service") {
+		t.Fatalf("Hysteria2 must depend on control-service:\n%s", got)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			units := deploymentUnitContents(tt.role, deployPath, tt.hysteriaEnabled)
-			if got := units["trojan-go.service"]; !strings.Contains(got, tt.proxyDescription) {
-				t.Fatalf("proxy unit missing role description %q:\n%s", tt.proxyDescription, got)
-			}
-			if got := units["trojan-go.service"]; !strings.Contains(got, "ExecStart=/usr/bin/trojan-go -config "+filepath.Join(deployPath, "config.yaml")) {
-				t.Fatalf("proxy unit has unexpected config path:\n%s", got)
-			}
-			if got := units["trojan-web.service"]; !strings.Contains(got, tt.webDescription) {
-				t.Fatalf("web unit missing role description %q:\n%s", tt.webDescription, got)
-			}
-			if got := units["trojan-web.service"]; !strings.Contains(got, "ExecStart=/usr/bin/trojan-go web -config "+filepath.Join(deployPath, "web_config.yaml")) {
-				t.Fatalf("web unit has unexpected config path:\n%s", got)
-			}
-			if tt.hysteriaEnabled {
-				got, ok := units["hysteria.service"]
-				if !ok || !strings.Contains(got, tt.h2Description) {
-					t.Fatalf("Hysteria2 unit missing role description %q:\n%s", tt.h2Description, got)
-				}
-				if !strings.Contains(got, "ExecStart=/usr/local/bin/hysteria server -c "+filepath.Join(deployPath, "hysteria.yaml")) {
-					t.Fatalf("Hysteria2 unit has unexpected config path:\n%s", got)
-				}
-			} else if _, ok := units["hysteria.service"]; ok {
-				t.Fatal("Hysteria2 disabled deployment must not create a hysteria unit")
-			}
-		})
+	worker := deploymentUnitContents(deploymentWorker, deployPath, false)
+	if _, ok := worker["admin-service.service"]; ok {
+		t.Fatal("worker must not create admin-service")
+	}
+	for _, name := range []string{"control-service.service", "trojan-data-plane.service", "gateway-service.service"} {
+		if _, ok := worker[name]; !ok {
+			t.Fatalf("worker missing %s", name)
+		}
+	}
+	if got := worker["control-service.service"]; !strings.Contains(got, "control-service -worker -config "+filepath.Join(deployPath, "web_config.yaml")+" -listen 127.0.0.1:8082") {
+		t.Fatalf("worker control unit has unexpected command:\n%s", got)
+	}
+	if got := worker["gateway-service.service"]; strings.Contains(got, "admin-service.service") || !strings.Contains(got, "Requires=control-service.service trojan-data-plane.service") {
+		t.Fatalf("worker gateway has unexpected dependencies:\n%s", got)
 	}
 }
 
 func TestDeploymentServiceNamesPreservesDependencyOrder(t *testing.T) {
-	if got, want := deploymentServiceNames(false), []string{"trojan-web", "trojan-go"}; strings.Join(got, ",") != strings.Join(want, ",") {
-		t.Fatalf("services without Hysteria2 = %v, want %v", got, want)
+	if got, want := deploymentServiceNames(deploymentMaster, false), []string{"admin-service", "control-service", "trojan-data-plane", "gateway-service"}; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("master services = %v, want %v", got, want)
 	}
-	if got, want := deploymentServiceNames(true), []string{"trojan-web", "trojan-go", "hysteria"}; strings.Join(got, ",") != strings.Join(want, ",") {
-		t.Fatalf("services with Hysteria2 = %v, want %v", got, want)
+	if got, want := deploymentServiceNames(deploymentWorker, true), []string{"control-service", "trojan-data-plane", "gateway-service", "hysteria"}; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("worker services = %v, want %v", got, want)
 	}
 }

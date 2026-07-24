@@ -52,7 +52,8 @@ func (MigrationAudit) TableName() string {
 }
 
 // MigrationLock is a short-lived database lease. It serializes migration runs
-// across independently started trojan-web and trojan-go processes.
+// across compatibility runtimes while admin-service owns migrations in the
+// standalone Gateway architecture.
 type MigrationLock struct {
 	Name      string    `gorm:"primaryKey;size:255"`
 	Token     string    `gorm:"not null;size:64"`

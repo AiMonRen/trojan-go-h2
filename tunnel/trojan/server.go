@@ -7,10 +7,12 @@ import (
 	"io"
 	"net"
 	"sync/atomic"
+	"time"
 
 	"github.com/voidluo/trojan-go/api"
 	"github.com/voidluo/trojan-go/common"
 	"github.com/voidluo/trojan-go/config"
+	"github.com/voidluo/trojan-go/internal/database"
 	"github.com/voidluo/trojan-go/internal/nodesync"
 	"github.com/voidluo/trojan-go/internal/webserver"
 	"github.com/voidluo/trojan-go/log"
@@ -20,6 +22,7 @@ import (
 	"github.com/voidluo/trojan-go/statistic/mysql"
 	"github.com/voidluo/trojan-go/tunnel"
 	"github.com/voidluo/trojan-go/tunnel/mux"
+	"gorm.io/gorm"
 )
 
 // InboundConn is a trojan inbound connection
@@ -263,9 +266,58 @@ func NewServer(ctx context.Context, underlay tunnel.Server) (*Server, error) {
 		return nil, common.NewError("trojan failed to create authenticator")
 	}
 
-	// 尝试从 underlay 链中获取 AdminServer，将数据库用户同步到认证器
-	// underlay 可能是 TLS Server（直接），也可能是 WebSocket Server（间接）
-	syncAdminAuth(underlay, auth)
+	// Standalone data-plane processes skip the TLS layer, so they cannot obtain
+	// the database bridge through the underlay chain. Bind it explicitly when
+	// auth_db is configured; otherwise retain the embedded compatibility path.
+	if cfg.AuthDB != "" {
+		var db *gorm.DB
+		var dbErr error
+		workerMode := false
+		if nodeCfgAny := config.FromContext(ctx, nodesync.Name); nodeCfgAny != nil {
+			if nodeCfg, ok := nodeCfgAny.(*nodesync.Config); ok {
+				workerMode = nodeCfg.Node.Enabled
+			}
+		}
+		if workerMode {
+			db, dbErr = database.InitDb(cfg.AuthDB)
+			if mgr := nodesync.GetManager(); mgr != nil {
+				mgr.SetDB(db)
+			}
+		} else {
+			db, dbErr = database.OpenReadOnly(cfg.AuthDB)
+		}
+		if dbErr != nil {
+			cancel()
+			return nil, common.NewError("trojan data-plane failed to open auth database").Base(dbErr)
+		}
+		refresh := time.Duration(cfg.AuthRefresh) * time.Second
+		if refresh <= 0 {
+			refresh = 30 * time.Second
+		}
+		if syncErr := webserver.SyncAuthenticatorFromDatabase(db, auth); syncErr != nil {
+			cancel()
+			return nil, common.NewError("trojan data-plane failed to load auth database").Base(syncErr)
+		}
+		go refreshDataPlaneAuthenticator(ctx, db, auth, refresh)
+		log.Infof("trojan data-plane auth database enabled: %s (refresh %s)", cfg.AuthDB, refresh)
+	} else {
+		// Embedded mode obtains AdminServer through TLS or WebSocket underlays.
+		syncAdminAuth(underlay, auth)
+	}
+
+	if cfg.TrafficReport != "" {
+		reporter, reporterErr := newDataPlaneTrafficReporter(auth, cfg.TrafficReport)
+		if reporterErr != nil {
+			cancel()
+			return nil, common.NewError("trojan data-plane invalid traffic reporting configuration").Base(reporterErr)
+		}
+		interval := time.Duration(cfg.TrafficInterval) * time.Second
+		if interval <= 0 {
+			interval = 30 * time.Second
+		}
+		go reporter.run(ctx, interval)
+		log.Infof("trojan data-plane traffic reporting enabled: %s (interval %s)", cfg.TrafficReport, interval)
+	}
 
 	// 如果开启了多节点从节点模式，将 authenticator 注册到节点同步管理器中
 	if nodeCfgAny := config.FromContext(ctx, nodesync.Name); nodeCfgAny != nil {
@@ -321,6 +373,21 @@ type underlayProvider interface {
 }
 
 // syncAdminAuth 尝试从 underlay 链中找到 AdminServer 并绑定认证器。
+func refreshDataPlaneAuthenticator(ctx context.Context, db *gorm.DB, auth statistic.Authenticator, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if err := webserver.SyncAuthenticatorFromDatabase(db, auth); err != nil {
+				log.Warnf("trojan data-plane auth refresh failed: %v", err)
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
 func syncAdminAuth(underlay tunnel.Server, auth statistic.Authenticator) {
 	// 直接检查 underlay 是否提供 AdminServer（TLS Server）
 	if p, ok := underlay.(adminServerProvider); ok {

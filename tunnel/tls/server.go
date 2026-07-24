@@ -49,6 +49,7 @@ type Server struct {
 	connChan           chan tunnel.Conn
 	wsChan             chan tunnel.Conn
 	adminServer        *webserver.AdminServer
+	serviceRouter      *webserver.ServiceRouter
 	adminPath          string
 	subPath            string
 	unauthRedirect     string
@@ -62,14 +63,21 @@ type Server struct {
 
 func (s *Server) Close() error {
 	s.cancel()
+	if s.serviceRouter != nil {
+		_ = s.serviceRouter.Close()
+	}
+	if s.adminServer != nil {
+		_ = s.adminServer.Close()
+	}
 	if s.keyLogger != nil {
-		s.keyLogger.Close()
+		_ = s.keyLogger.Close()
 	}
 	return s.underlay.Close()
 }
 
-// GetAdminServer 返回管理面板服务器实例（如果已启用），
-// 供上层（如 Trojan 协议层）绑定认证器。
+// GetAdminServer returns the database reader bridge used to synchronize the
+// in-process Trojan authenticator. In service mode this bridge does not expose
+// HTTP routes or start database-writing workers.
 func (s *Server) GetAdminServer() *webserver.AdminServer {
 	return s.adminServer
 }
@@ -182,8 +190,13 @@ func (s *Server) acceptLoop() {
 					Conn: rewindConn,
 				}
 			} else {
+				if s.serviceRouter != nil && s.serviceRouter.Matches(httpReq.URL.Path) {
+					log.Debug("incoming http request, routing to standalone control-plane service")
+					s.serviceRouter.ServeConn(rewindConn)
+					return
+				}
 				if s.adminServer != nil && (s.subPath != "" && httpReq.URL.Path == s.subPath || s.adminPath != "" && strings.HasPrefix(httpReq.URL.Path, s.adminPath)) {
-					log.Debug("incoming http request, routing to admin panel")
+					log.Debug("incoming http request, routing to embedded admin panel")
 					s.adminServer.ServeConn(rewindConn)
 					return
 				}
@@ -417,33 +430,47 @@ func NewServer(ctx context.Context, underlay tunnel.Server) (*Server, error) {
 		if err != nil {
 			log.Warn("admin panel: failed to init db:", err)
 		} else {
-			wsEnabled := false
-			wsPath := "/"
-			if wsCfgAny := config.FromContext(ctx, websocket.Name); wsCfgAny != nil {
-				wsCfg := wsCfgAny.(*websocket.Config)
-				wsEnabled = wsCfg.Websocket.Enabled
-				wsPath = wsCfg.Websocket.Path
-			}
-			muxEnabled := false
-			if muxCfgAny := config.FromContext(ctx, mux.Name); muxCfgAny != nil {
-				muxCfg := muxCfgAny.(*mux.Config)
-				muxEnabled = muxCfg.Mux.Enabled
-			}
-
 			isNode := false
 			if nodeCfgAny := config.FromContext(ctx, nodesync.Name); nodeCfgAny != nil {
 				nodeCfg := nodeCfgAny.(*nodesync.Config)
 				isNode = nodeCfg.Node.Enabled
 			}
-
-			serverDomain := cfg.TLS.SNI
-			if serverDomain == "" {
-				serverDomain = cfg.RemoteHost
+			if cfg.Admin.ServiceMode {
+				adminAddress := cfg.Admin.AdminService
+				if adminAddress == "" {
+					adminAddress = "127.0.0.1:8081"
+				}
+				controlAddress := cfg.Admin.ControlService
+				if controlAddress == "" {
+					controlAddress = "127.0.0.1:8082"
+				}
+				router, err := webserver.NewServiceRouter(adminAddress, controlAddress, cfg.Admin.Path, cfg.Admin.SubPath)
+				if err != nil {
+					return nil, common.NewError("create standalone service router").Base(err)
+				}
+				server.serviceRouter = router
+				server.adminServer = webserver.NewDataPlaneAuthBridge(db, cfg.Admin.Username, cfg.Admin.Password, isNode)
+				server.adminPath = cfg.Admin.Path
+				log.Infof("control-plane service routing enabled: admin=%s control=%s", adminAddress, controlAddress)
+			} else {
+				wsEnabled := false
+				wsPath := "/"
+				if wsCfgAny := config.FromContext(ctx, websocket.Name); wsCfgAny != nil {
+					wsCfg := wsCfgAny.(*websocket.Config)
+					wsEnabled, wsPath = wsCfg.Websocket.Enabled, wsCfg.Websocket.Path
+				}
+				muxEnabled := false
+				if muxCfgAny := config.FromContext(ctx, mux.Name); muxCfgAny != nil {
+					muxEnabled = muxCfgAny.(*mux.Config).Mux.Enabled
+				}
+				serverDomain := cfg.TLS.SNI
+				if serverDomain == "" {
+					serverDomain = cfg.RemoteHost
+				}
+				server.adminServer = webserver.New(db, cfg.Admin.Username, cfg.Admin.Password, cfg.Admin.Path, cfg.Admin.Port, wsEnabled, wsPath, muxEnabled, isNode, cfg.Admin.MaskHtmlPath, cfg.Admin.SubPath, serverDomain)
+				server.adminPath = cfg.Admin.Path
+				log.Infof("embedded admin panel enabled on https://[domain]%s (user: %s)", cfg.Admin.Path, cfg.Admin.Username)
 			}
-
-			server.adminServer = webserver.New(db, cfg.Admin.Username, cfg.Admin.Password, cfg.Admin.Path, cfg.Admin.Port, wsEnabled, wsPath, muxEnabled, isNode, cfg.Admin.MaskHtmlPath, cfg.Admin.SubPath, serverDomain)
-			server.adminPath = cfg.Admin.Path
-			log.Infof("admin panel enabled on https://[domain]%s (user: %s)", cfg.Admin.Path, cfg.Admin.Username)
 		}
 	}
 

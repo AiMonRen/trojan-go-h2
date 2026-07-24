@@ -23,6 +23,9 @@ type AdminConfig struct {
 	SubPath        string `json:"sub_path" yaml:"sub_path"`               // 混淆后的安全订阅下载路径，如果为空，系统启动将自动生成
 	UnauthRedirect string `json:"unauth_redirect" yaml:"unauth_redirect"` // 仅用于未认证请求 302 外部重定向跳转到的 URL
 	MaskHtmlPath   string `json:"mask_html_path" yaml:"mask_html_path"`   // 自定义本地网页伪装文件路径
+	ServiceMode    bool   `json:"service_mode" yaml:"service_mode"`       // 将 HTTP 控制面转发到独立服务进程
+	AdminService   string `json:"admin_service" yaml:"admin_service"`     // admin-service 回环地址
+	ControlService string `json:"control_service" yaml:"control_service"` // control-service 回环地址
 }
 
 type WebsocketConfig struct {

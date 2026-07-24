@@ -215,8 +215,8 @@ func RenewCertificateFromConfig(configPath string) error {
 	if err := writeCertificateFiles(config.CertificatePath, config.PrivateKeyPath, certificate.Certificate, certificate.PrivateKey); err != nil {
 		return err
 	}
-	if err := runCmd("systemctl", "restart", "trojan-web", "trojan-go"); err != nil {
-		return fmt.Errorf("restart Trojan-Go services after certificate renewal: %w", err)
+	if err := runCmd("systemctl", "restart", "gateway-service"); err != nil {
+		return fmt.Errorf("restart Gateway after certificate renewal: %w", err)
 	}
 	if config.ReloadHysteria {
 		if err := runCmd("systemctl", "restart", "hysteria"); err != nil {

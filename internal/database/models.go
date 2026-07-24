@@ -71,7 +71,18 @@ type NodeSyncReceipt struct {
 	SyncID    string    `gorm:"size:64;not null;uniqueIndex:idx_node_sync_receipt"`
 }
 
-const NodeSyncReceiptRetention = 30 * 24 * time.Hour
+// DataPlaneSyncReceipt stores accepted traffic batch IDs from the local
+// standalone Trojan data-plane. SyncID is globally unique per master database.
+type DataPlaneSyncReceipt struct {
+	ID        uint      `gorm:"primaryKey"`
+	CreatedAt time.Time `gorm:"index"`
+	SyncID    string    `gorm:"size:64;not null;uniqueIndex"`
+}
+
+const (
+	NodeSyncReceiptRetention      = 30 * 24 * time.Hour
+	DataPlaneSyncReceiptRetention = 30 * 24 * time.Hour
+)
 
 // CleanupExpiredNodeSyncReceipts removes old idempotency receipts after their
 // retry safety window. A 30-day retention keeps normal worker retry protection
@@ -81,6 +92,16 @@ func CleanupExpiredNodeSyncReceipts(db *gorm.DB, now time.Time) (int64, error) {
 		return 0, nil
 	}
 	result := db.Where("created_at < ?", now.Add(-NodeSyncReceiptRetention)).Delete(&NodeSyncReceipt{})
+	return result.RowsAffected, result.Error
+}
+
+// CleanupExpiredDataPlaneSyncReceipts bounds the local data-plane idempotency
+// table while retaining the same retry-safety window as worker sync receipts.
+func CleanupExpiredDataPlaneSyncReceipts(db *gorm.DB, now time.Time) (int64, error) {
+	if db == nil {
+		return 0, nil
+	}
+	result := db.Where("created_at < ?", now.Add(-DataPlaneSyncReceiptRetention)).Delete(&DataPlaneSyncReceipt{})
 	return result.RowsAffected, result.Error
 }
 
@@ -128,6 +149,35 @@ func prioritizeAIRules(rules string) string {
 	return strings.Join(ordered, "\n")
 }
 
+// OpenReadOnly opens an existing deployment database without migrations,
+// seed writes, or schema changes. It is used by standalone data-plane readers
+// so admin-service remains the sole direct writer of the Master database.
+func OpenReadOnly(dbPath string) (*gorm.DB, error) {
+	isMySQL := strings.HasPrefix(dbPath, "mysql:")
+	var dialector gorm.Dialector
+	if isMySQL {
+		dialector = mysql.Open(strings.TrimPrefix(dbPath, "mysql:"))
+	} else {
+		dialector = sqlite.Open(dbPath)
+	}
+	db, err := gorm.Open(dialector, &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	if err != nil {
+		return nil, err
+	}
+	if !isMySQL {
+		if err := db.Exec("PRAGMA query_only=ON;").Error; err != nil {
+			return nil, err
+		}
+		if sqlDB, sqlErr := db.DB(); sqlErr == nil {
+			// SQLite query_only is connection-scoped. A single pooled connection
+			// guarantees every data-plane query remains on the protected session.
+			sqlDB.SetMaxOpenConns(1)
+			sqlDB.SetMaxIdleConns(1)
+		}
+	}
+	return db, nil
+}
+
 // InitDb 初始化数据库
 func InitDb(dbPath string) (*gorm.DB, error) {
 	var dialector gorm.Dialector
@@ -152,11 +202,15 @@ func InitDb(dbPath string) (*gorm.DB, error) {
 	}
 
 	// 自动迁移模型
-	err = db.AutoMigrate(&User{}, &Config{}, &Node{}, &NodeSyncReceipt{})
+	err = db.AutoMigrate(&User{}, &Config{}, &Node{}, &NodeSyncReceipt{}, &DataPlaneSyncReceipt{})
 	if err != nil {
 		return nil, err
 	}
-	if _, cleanupErr := CleanupExpiredNodeSyncReceipts(db, time.Now()); cleanupErr != nil {
+	now := time.Now()
+	if _, cleanupErr := CleanupExpiredNodeSyncReceipts(db, now); cleanupErr != nil {
+		return nil, cleanupErr
+	}
+	if _, cleanupErr := CleanupExpiredDataPlaneSyncReceipts(db, now); cleanupErr != nil {
 		return nil, cleanupErr
 	}
 

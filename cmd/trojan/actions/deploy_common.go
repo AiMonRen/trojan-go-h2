@@ -16,35 +16,40 @@ const (
 )
 
 type deploymentServices struct {
-	Proxy    string
-	Web      string
-	Hysteria string
+	Gateway   string
+	Admin     string
+	Control   string
+	DataPlane string
+	Hysteria  string
 }
 
 func deploymentServiceDescriptions(role deploymentRole) deploymentServices {
 	if role == deploymentWorker {
 		return deploymentServices{
-			Proxy:    "Trojan-Go Worker Proxy Service",
-			Web:      "Trojan-Go Worker Web Management Service",
-			Hysteria: "Hysteria2 QUIC/UDP Server (Worker)",
+			Gateway:   "Trojan-Go Worker Edge Gateway",
+			Control:   "Trojan-Go Worker Control Service",
+			DataPlane: "Trojan-Go Worker Data Plane",
+			Hysteria:  "Hysteria2 QUIC/UDP Server (Worker)",
 		}
 	}
 	return deploymentServices{
-		Proxy:    "Trojan-Go Proxy Service",
-		Web:      "Trojan-Go Web Management Service",
-		Hysteria: "Hysteria2 QUIC/UDP Server",
+		Gateway:   "Trojan-Go Edge Gateway",
+		Admin:     "Trojan-Go Admin Service",
+		Control:   "Trojan-Go Control Service",
+		DataPlane: "Trojan-Go Data Plane",
+		Hysteria:  "Hysteria2 QUIC/UDP Server",
 	}
 }
 
 // deploymentUnitContents creates all unit files without writing to the host.
-// Keeping rendering separate makes both roles testable and prevents service
-// definitions from drifting when a common property changes.
+// Rendering units in one place keeps Master and Worker dependency ordering
+// explicit and prevents the public Gateway from starting before private backends.
 func deploymentUnitContents(role deploymentRole, deployPath string, hysteriaEnabled bool) map[string]string {
 	descriptions := deploymentServiceDescriptions(role)
 	units := map[string]string{
-		"trojan-go.service": fmt.Sprintf(`[Unit]
+		"trojan-data-plane.service": fmt.Sprintf(`[Unit]
 Description=%s
-After=network.target trojan-web.service
+After=network.target
 
 [Service]
 Type=simple
@@ -55,26 +60,91 @@ RestartSec=10s
 
 [Install]
 WantedBy=multi-user.target
-`, descriptions.Proxy, filepath.Join(deployPath, "config.yaml")),
-		"trojan-web.service": fmt.Sprintf(`[Unit]
+`, descriptions.DataPlane, filepath.Join(deployPath, "config.yaml")),
+	}
+
+	if role == deploymentWorker {
+		units["control-service.service"] = fmt.Sprintf(`[Unit]
 Description=%s
 After=network.target
 
 [Service]
 Type=simple
 LimitNOFILE=65536
-ExecStart=/usr/bin/trojan-go web -config %s
+ExecStart=/usr/bin/trojan-go control-service -worker -config %s -listen 127.0.0.1:%d
 Restart=on-failure
 RestartSec=10s
 
 [Install]
 WantedBy=multi-user.target
-`, descriptions.Web, filepath.Join(deployPath, "web_config.yaml")),
+`, descriptions.Control, filepath.Join(deployPath, "web_config.yaml"), defaultControlServicePort)
+		units["gateway-service.service"] = fmt.Sprintf(`[Unit]
+Description=%s
+After=network.target control-service.service trojan-data-plane.service
+Requires=control-service.service trojan-data-plane.service
+
+[Service]
+Type=simple
+LimitNOFILE=65536
+ExecStart=/usr/bin/trojan-go gateway-service -config %s
+Restart=on-failure
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target
+`, descriptions.Gateway, filepath.Join(deployPath, "gateway.yaml"))
+	} else {
+		units["admin-service.service"] = fmt.Sprintf(`[Unit]
+Description=%s
+After=network.target
+
+[Service]
+Type=simple
+LimitNOFILE=65536
+ExecStart=/usr/bin/trojan-go admin-service -config %s -listen 127.0.0.1:%d
+Restart=on-failure
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target
+`, descriptions.Admin, filepath.Join(deployPath, "web_config.yaml"), defaultAdminServicePort)
+		units["control-service.service"] = fmt.Sprintf(`[Unit]
+Description=%s
+After=network.target admin-service.service
+Requires=admin-service.service
+
+[Service]
+Type=simple
+LimitNOFILE=65536
+ExecStart=/usr/bin/trojan-go control-service -listen 127.0.0.1:%d -admin 127.0.0.1:%d
+Restart=on-failure
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target
+`, descriptions.Control, defaultControlServicePort, defaultAdminServicePort)
+		units["gateway-service.service"] = fmt.Sprintf(`[Unit]
+Description=%s
+After=network.target admin-service.service control-service.service trojan-data-plane.service
+Requires=admin-service.service control-service.service trojan-data-plane.service
+
+[Service]
+Type=simple
+LimitNOFILE=65536
+ExecStart=/usr/bin/trojan-go gateway-service -config %s
+Restart=on-failure
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target
+`, descriptions.Gateway, filepath.Join(deployPath, "gateway.yaml"))
 	}
+
 	if hysteriaEnabled {
 		units["hysteria.service"] = fmt.Sprintf(`[Unit]
 Description=%s
-After=network.target trojan-web.service
+After=network.target control-service.service
+Requires=control-service.service
 
 [Service]
 Type=simple
@@ -98,8 +168,12 @@ func writeDeploymentUnits(systemdDir string, role deploymentRole, deployPath str
 	return nil
 }
 
-func deploymentServiceNames(hysteriaEnabled bool) []string {
-	services := []string{"trojan-web", "trojan-go"}
+func deploymentServiceNames(role deploymentRole, hysteriaEnabled bool) []string {
+	var services []string
+	if role == deploymentMaster {
+		services = append(services, "admin-service")
+	}
+	services = append(services, "control-service", "trojan-data-plane", "gateway-service")
 	if hysteriaEnabled {
 		services = append(services, "hysteria")
 	}
@@ -182,7 +256,7 @@ func configureAndStartDeployment(role deploymentRole, deployPath string, hysteri
 		return fmt.Errorf("enable certificate renewal timer: %w", err)
 	}
 
-	services := deploymentServiceNames(hysteriaEnabled)
+	services := deploymentServiceNames(role, hysteriaEnabled)
 	for _, service := range services {
 		fmt.Printf(" [!] 正在激活 %s...\n", service)
 		if err := runCmd("systemctl", "enable", service); err != nil {

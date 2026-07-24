@@ -74,14 +74,14 @@ websocket:
 # 和运营商 QoS 限速带来的延迟，是提升高丢包链路表现的最直接手段。
 #
 # 启用后需在服务器上额外启动 hysteria-server 进程，认证密码由 trojan-go 的
-# HTTP Auth API (POST /admin/api/hysteria/auth) 统一接管。
+# HTTP Auth API (POST /control/v1/hysteria/auth) 统一接管。
 # hysteria2:
 #   enabled: true
 #   port: 8443
 #   up_mbps: 100
 #   down_mbps: 500
 #   masquerade_url: "https://www.bilibili.com"
-#   auth_api: "http://127.0.0.1:8080/admin/api/hysteria/auth"
+#   auth_api: "http://127.0.0.1:8082/control/v1/hysteria/auth"
 
 # =================================================================
 # [内置 Web 运维管理面板]
