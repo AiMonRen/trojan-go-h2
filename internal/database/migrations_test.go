@@ -162,6 +162,67 @@ func TestCredentialMigrationEncryptsLegacyRows(t *testing.T) {
 	}
 }
 
+// TestPurgeSyncPlaceholderPasswords covers S-08: the placeholder credential a
+// worker node used to cache must be cleared in both its plaintext and its
+// already-encrypted form, while real credentials are left untouched.
+func TestPurgeSyncPlaceholderPasswords(t *testing.T) {
+	keyPath := t.TempDir() + "/credentials.key"
+	t.Setenv(credentialKeyEnvironment, keyPath)
+	if err := EnsureCredentialKey(); err != nil {
+		t.Fatalf("provision credential key: %v", err)
+	}
+	db, err := gorm.Open(sqlite.Open(t.TempDir()+"/placeholder.db"), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	if err := db.AutoMigrate(&User{}, &Node{}, &Config{}); err != nil {
+		t.Fatalf("migrate database: %v", err)
+	}
+
+	plain := User{Username: "sync-user-aaaaaa", Password: legacySyncPlaceholderPassword, Hash: sha224Password("aaa")}
+	encrypted := User{Username: "sync-user-bbbbbb", Password: legacySyncPlaceholderPassword, Hash: sha224Password("bbb")}
+	real := User{Username: "real-user", Password: "a-real-password", Hash: sha224Password("ccc")}
+	for _, u := range []*User{&plain, &encrypted, &real} {
+		if err := db.Create(u).Error; err != nil {
+			t.Fatalf("create %s: %v", u.Username, err)
+		}
+	}
+	// Put one placeholder row through migration 5 so it only exists as
+	// ciphertext, which is the state an already-upgraded worker node is in.
+	if err := SetUserPassword(db, &encrypted, legacySyncPlaceholderPassword); err != nil {
+		t.Fatalf("encrypt placeholder: %v", err)
+	}
+	if err := SetUserPassword(db, &real, "a-real-password"); err != nil {
+		t.Fatalf("encrypt real password: %v", err)
+	}
+
+	if err := purgeSyncPlaceholderPasswords(db); err != nil {
+		t.Fatalf("purgeSyncPlaceholderPasswords: %v", err)
+	}
+
+	for _, id := range []uint{plain.ID, encrypted.ID} {
+		var got User
+		if err := db.First(&got, id).Error; err != nil {
+			t.Fatalf("read user %d: %v", id, err)
+		}
+		if got.Password != "" || got.PasswordCiphertext != "" {
+			t.Errorf("user %d still holds a placeholder credential: %#v", id, got)
+		}
+		password, err := UserPassword(got)
+		if err != nil || password != "" {
+			t.Errorf("UserPassword(user %d) = %q, %v; want empty", id, password, err)
+		}
+	}
+
+	var keptReal User
+	if err := db.First(&keptReal, real.ID).Error; err != nil {
+		t.Fatalf("read real user: %v", err)
+	}
+	if password, err := UserPassword(keptReal); err != nil || password != "a-real-password" {
+		t.Errorf("real credential damaged: %q, %v", password, err)
+	}
+}
+
 func TestRegisteredMigrationsNormalizeLegacyRules(t *testing.T) {
 	db := openMigrationTestDB(t)
 	if err := db.AutoMigrate(&Config{}); err != nil {

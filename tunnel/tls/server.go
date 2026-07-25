@@ -387,6 +387,9 @@ func NewServer(ctx context.Context, underlay tunnel.Server) (*Server, error) {
 
 	var keyLogger io.WriteCloser
 	if cfg.TLS.KeyLogPath != "" {
+		if env := os.Getenv("TROJAN_ENV"); strings.EqualFold(env, "production") {
+			return nil, common.NewError("tls key_log is forbidden in production (TROJAN_ENV=production). key_log compromises TLS forward secrecy and must only be used for debugging")
+		}
 		log.Warn("tls key logging activated. USE OF KEY LOGGING COMPROMISES SECURITY. IT SHOULD ONLY BE USED FOR DEBUGGING.")
 		file, err := os.OpenFile(cfg.TLS.KeyLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 		if err != nil {

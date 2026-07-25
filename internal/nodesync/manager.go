@@ -48,26 +48,22 @@ type NodeSyncManager struct {
 	done            chan struct{}
 }
 
-// KNOWN LIMITATION (L-08): the node-sync manager is a process-global singleton.
+// L-08 migration status: NewManager constructor has been added.
 //
-// Current behaviour, stated explicitly so callers do not have to infer it:
-//   - InitManager only takes effect the first time it is called in a process.
-//     Every later call is silently ignored by managerOnce, so a second call with
-//     a different master_url/secret/interval does NOT reconfigure the manager.
+// The process-global singleton behaviour is preserved for backwards compatibility:
+//   - InitManager still only takes effect the first time it is called in a process,
+//     delegating to NewManager for actual construction.
 //   - GetManager returns nil until InitManager has run, and returns the same
 //     instance for the rest of the process lifetime.
-//   - Because the instance and its outbox file survive for the whole process,
-//     tests cannot get an isolated manager through this API. Tests that need
-//     isolation must construct a NodeSyncManager value directly inside the
-//     package instead of going through InitManager.
+//
+// Migration path (now available):
+//   - Use NewManager(...) (*NodeSyncManager, error) to create isolated instances
+//     for tests and new call sites that need proper isolation.
+//   - Production code can continue using InitManager as before.
 //
 // Removing the singleton entirely requires lifecycle/dependency-injection
-// changes across the data plane and the worker control service, which is out of
-// scope here. The intended migration path is to add an exported
-// NewManager(...) (*NodeSyncManager, error) constructor, let production keep
-// calling InitManager purely as a compatibility wrapper around it, and have new
-// call sites and tests hold their own instance. That change is local and
-// reversible; it is simply not done yet.
+// changes across the data plane and the worker control service, which remains
+// out of scope for this change.
 //
 // Note also that L-08 covered a second item — bounded, forced shutdown of
 // in-flight Gateway/ServiceRouter connections — which is tracked and fixed in
@@ -197,42 +193,67 @@ func (m *NodeSyncManager) getHeartbeatClient() *http.Client {
 	return m.heartbeatClient
 }
 
+// NewManager creates an isolated NodeSyncManager instance.
+//
+// This is the migration path documented in L-08: production code continues to
+// use InitManager (which now delegates here), while tests and new call sites
+// can hold their own instance for proper isolation.
+//
+// Parameters:
+//   - masterURL: the master node's sync endpoint URL
+//   - secret: the node's shared secret for authentication
+//   - intervalSec: sync interval in seconds (0 or negative for default)
+//   - outboxPath: optional path for the persistent traffic outbox file
+//
+// Returns a configured manager and any error encountered during outbox setup.
+func NewManager(masterURL, secret string, intervalSec int, outboxPath ...string) (*NodeSyncManager, error) {
+	interval := normalizedSyncInterval(intervalSec)
+	if intervalSec <= 0 {
+		log.Warnf("node sync manager: invalid sync interval %ds; using default %s", intervalSec, interval)
+	}
+	var path string
+	if len(outboxPath) > 0 {
+		path = outboxPath[0]
+	}
+	outbox, outboxErr := trafficoutbox.NewFile(path)
+	m := &NodeSyncManager{
+		masterURL:       masterURL,
+		secret:          secret,
+		syncInterval:    interval,
+		pendingTraffic:  make(map[string]trafficStats),
+		queuedTraffic:   make(map[string]trafficStats),
+		outbox:          outbox,
+		outboxLoadError: outboxErr,
+		done:            make(chan struct{}),
+	}
+	if outboxErr == nil {
+		outboxErr = m.loadOutbox()
+		m.outboxLoadError = outboxErr
+	}
+	if outboxErr != nil {
+		log.Errorf("node sync manager: traffic outbox unavailable: %v", outboxErr)
+	}
+	log.Infof("node sync manager created: master_url=%s, interval=%s, outbox=%s", masterURL, interval, path)
+	return m, nil
+}
+
 // InitManager creates the process-global manager. It is idempotent by design:
 // only the first call in a process has any effect, and later calls are ignored
 // rather than reconfiguring or replacing the running manager. See the KNOWN
 // LIMITATION (L-08) note next to globalManager for the reasoning and the planned
 // migration to an injectable constructor.
+//
+// This function now delegates to NewManager for the actual construction.
 func InitManager(masterURL, secret string, intervalSec int, outboxPath ...string) {
 	alreadyInitialized := true
 	managerOnce.Do(func() {
 		alreadyInitialized = false
-		interval := normalizedSyncInterval(intervalSec)
-		if intervalSec <= 0 {
-			log.Warnf("node sync manager: invalid sync interval %ds; using default %s", intervalSec, interval)
+		m, err := NewManager(masterURL, secret, intervalSec, outboxPath...)
+		if err != nil {
+			log.Errorf("node sync manager: failed to create manager: %v", err)
+			return
 		}
-		var path string
-		if len(outboxPath) > 0 {
-			path = outboxPath[0]
-		}
-		outbox, outboxErr := trafficoutbox.NewFile(path)
-		globalManager = &NodeSyncManager{
-			masterURL:       masterURL,
-			secret:          secret,
-			syncInterval:    interval,
-			pendingTraffic:  make(map[string]trafficStats),
-			queuedTraffic:   make(map[string]trafficStats),
-			outbox:          outbox,
-			outboxLoadError: outboxErr,
-			done:            make(chan struct{}),
-		}
-		if outboxErr == nil {
-			outboxErr = globalManager.loadOutbox()
-			globalManager.outboxLoadError = outboxErr
-		}
-		if outboxErr != nil {
-			log.Errorf("node sync manager: traffic outbox unavailable: %v", outboxErr)
-		}
-		log.Infof("node sync manager initialized: master_url=%s, interval=%s, outbox=%s", masterURL, interval, path)
+		globalManager = m
 	})
 	// Make the singleton's swallowed re-init observable instead of silent: a
 	// second call with different settings is a configuration bug the operator
@@ -571,9 +592,19 @@ func (m *NodeSyncManager) performSync() {
 				if !errors.Is(err, gorm.ErrRecordNotFound) {
 					return err
 				}
+				// S-08: a worker node caches only the authentication hash the
+				// master sent; it never receives the plaintext password and so
+				// cannot hold a usable credential. Password is therefore left
+				// empty. It used to be the literal "placeholder-pwd", the only
+				// hardcoded credential in the tree, which risked being read
+				// back by any code path that generates client configs and
+				// silently produced a config with a bogus password.
+				// Authentication uses Hash alone, so an empty Password is
+				// correct here; callers that need a real credential must go
+				// through the master.
 				newUser := database.User{
 					Username: "sync-user-" + h[:6],
-					Password: "placeholder-pwd",
+					Password: "",
 					Hash:     h,
 					Status:   0,
 				}

@@ -174,6 +174,21 @@ let searchText = '';
 let isNode = false;
 const API = '/admin/api';
 
+// ── S-01 XSS 防护 ──────────────────────────────────────────────
+// 本页全部用模板字符串拼 innerHTML，任何来自服务端的字符串
+// （节点名/地址/ws_path/用户名/口令）都必须先经这里转义。
+// esc()   : HTML 元素与属性上下文（属性必须用双引号包裹）
+// escJs() : 嵌在 HTML 属性里的 JS 单引号字符串字面量，
+//           例如 onclick="copyText('${escJs(v)}')"
+function esc(s) {
+    return String(s ?? '').replace(/[&<>"']/g, c => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    })[c]);
+}
+function escJs(s) {
+    return esc(String(s ?? '').replace(/\\/g, '\\\\').replace(/'/g, "\\'"));
+}
+
 let isTimeoutTriggered = false;
 function triggerSessionTimeout() {
     if (isTimeoutTriggered) return;
@@ -262,10 +277,10 @@ const Dashboard = {
         <div class="card">
             <h3>服务器基础详情</h3>
             <div style="margin-top:20px; color:var(--text2); font-size:14px; display:grid; grid-template-columns:1fr 1fr; gap:16px">
-                <div>平台: <span style="color:#fff">${srv.host.platform} ${srv.host.platformVersion}</span></div>
-                <div>内核架构: <span style="color:#fff">${srv.host.kernelArch}</span></div>
+                <div>平台: <span style="color:#fff">${esc(srv.host.platform)} ${esc(srv.host.platformVersion)}</span></div>
+                <div>内核架构: <span style="color:#fff">${esc(srv.host.kernelArch)}</span></div>
                 <div>平均负载: <span style="color:#fff">${srv.load.load1.toFixed(2)} / ${srv.load.load5.toFixed(2)} / ${srv.load.load15.toFixed(2)}</span></div>
-                <div>主机名: <span style="color:#fff">${srv.host.hostname}</span></div>
+                <div>主机名: <span style="color:#fff">${esc(srv.host.hostname)}</span></div>
             </div>
         </div>`;
     }
@@ -311,7 +326,7 @@ const ServiceAdmin = {
         const lv = document.getElementById('logLevel')?.value || 'all';
         const ln = document.getElementById('logLines')?.value || '300';
         try {
-            const res = await fetch(`${API}/logs?level=${lv}&lines=${ln}`, { 
+            const res = await fetch(`${API}/logs?level=${encodeURIComponent(lv)}&lines=${encodeURIComponent(ln)}`, { 
                 headers: { 'Authorization': 'Bearer ' + token } 
             });
             if (res.status === 200) {
@@ -351,7 +366,7 @@ function renderUserTableHtml() {
     
     <div class="action-container">
         <div class="search-wrapper">
-            <input type="text" id="userSearch" placeholder="搜索用户名..." value="${searchText}" oninput="updateSearch(this.value)">
+            <input type="text" id="userSearch" placeholder="搜索用户名..." value="${esc(searchText)}" oninput="updateSearch(this.value)">
         </div>
         <div style="color:var(--text2); font-size:13px">共检索到 ${filtered.length} 个用户</div>
     </div>
@@ -373,7 +388,7 @@ function renderUserTableHtml() {
             <tbody>
                 ${filtered.map(u => `
                     <tr>
-                        <td><div style="font-weight:700; font-family:'Inter'">${u.username}</div><div style="font-size:11px; color:var(--text2); margin-top:4px">密码: ${u.password}</div></td>
+                        <td><div style="font-weight:700; font-family:'Inter'">${esc(u.username)}</div><div style="font-size:11px; color:var(--text2); margin-top:4px">密码: ${esc(u.password)}</div></td>
                         <td style="color:var(--text2)">${fmtBytes(u.upload)}</td>
                         <td style="color:var(--text2)">${fmtBytes(u.download)}</td>
                         <td style="font-weight:600">${fmtBytes(u.used)}</td>
@@ -412,8 +427,10 @@ function sortTable(key) {
 
 const Login = {
     render: () => {
+        // S-02: 「记住我」只保留用户名。密码一律不落盘，
+        // 顺带清理历史版本可能残留的明文口令。
+        localStorage.removeItem('remembered_password');
         const savedUser = localStorage.getItem('remembered_username') || 'admin';
-        const savedPass = localStorage.getItem('remembered_password') || '';
         const isRemember = localStorage.getItem('remember_me') === 'true' ? 'checked' : '';
         return `
         <div style="display:flex;align-items:center;justify-content:center;height:100vh;width:100%; background: radial-gradient(circle at center, #1c212c 0%, #0b0e14 100%)">
@@ -429,13 +446,13 @@ const Login = {
                 <div class="form-group">
                     <label for="lgPass">密码</label>
                     <div style="position:relative; display:flex; align-items:center;">
-                        <input id="lgPass" name="password" autocomplete="current-password" type="password" placeholder="Password" style="padding-right:40px; width:100%" value="${savedPass}">
+                        <input id="lgPass" name="password" autocomplete="current-password" type="password" placeholder="Password" style="padding-right:40px; width:100%">
                         <span onclick="togglePasswordVisibility('lgPass', this)" style="position:absolute; right:12px; cursor:pointer; font-size:16px; user-select:none;">👁️</span>
                     </div>
                 </div>
                 <div style="display:flex; align-items:center; margin-bottom:24px; font-size:13px; color:var(--text2)">
                     <input id="lgRemember" type="checkbox" style="width:16px; height:16px; margin-right:8px; cursor:pointer; width:auto" ${isRemember}>
-                    <label for="lgRemember" style="cursor:pointer; user-select:none">记住密码</label>
+                    <label for="lgRemember" style="cursor:pointer; user-select:none">记住账号</label>
                 </div>
                 <button type="submit" class="btn btn-primary" style="width:100%; height:48px; justify-content:center; font-size:15px">进入管理系统</button>
                 <div id="lgErr" style="color:var(--red); font-size:13px; margin-top:20px; text-align:center"></div>
@@ -516,15 +533,16 @@ async function doLogin() {
         token = res.token;
         localStorage.setItem('token', token);
         localStorage.setItem('login_time', Date.now().toString());
+        // S-02: 只持久化用户名。管理员口令绝不写入 localStorage，
+        // 否则任何 XSS 都能读到长期凭据（而非仅 24h 有效的会话 Token）。
         if (remember) {
             localStorage.setItem('remember_me', 'true');
             localStorage.setItem('remembered_username', u);
-            localStorage.setItem('remembered_password', p);
         } else {
             localStorage.setItem('remember_me', 'false');
             localStorage.removeItem('remembered_username');
-            localStorage.removeItem('remembered_password');
         }
+        localStorage.removeItem('remembered_password');
         location.hash = '#/dashboard';
     } else { document.getElementById('lgErr').textContent = '登录失败: 账号或密码不匹配'; }
 }
@@ -610,11 +628,11 @@ const SettingsPage = {
                 </div>
                 <div class="form-group">
                     <label>站点标题</label>
-                    <input id="setSiteTitle" type="text" disabled value="${s.site_title||''}">
+                    <input id="setSiteTitle" type="text" disabled value="${esc(s.site_title||'')}">
                 </div>
                 <div class="form-group">
                     <label>登录有效时间 (分钟)</label>
-                    <input id="setSessionTimeout" type="number" disabled value="${s.session_timeout||'30'}">
+                    <input id="setSessionTimeout" type="number" disabled value="${esc(s.session_timeout||'30')}">
                 </div>
                 <div class="card-save-area" style="display:none; justify-content:flex-end; gap:12px; margin-top:24px">
                     <button class="btn btn-primary" onclick="saveSiteSettings()">保存修改</button>
@@ -629,7 +647,7 @@ const SettingsPage = {
                 </div>
                 <div class="form-group">
                     <label>管理账号</label>
-                    <input id="setAdmUser" type="text" disabled value="${s.admin_username||''}">
+                    <input id="setAdmUser" type="text" disabled value="${esc(s.admin_username||'')}">
                 </div>
                 <div class="form-group">
                     <label>新密码 (不改请留空)</label>
@@ -715,7 +733,7 @@ const SettingsPage = {
                     <button class="btn btn-primary card-edit-btn" onclick="toggleEditCard('card-clash', true)">✏️ 修改配置</button>
                 </div>
                 <div style="font-size:12px; color:var(--text2); margin-bottom:20px">修改后下发的 Clash 订阅文件将采用此规则配置。请按 YAML 语法进行配置。</div>
-                <textarea id="setRulesEditor" class="editor" disabled spellcheck="false" style="height: 350px;">${fullYaml}</textarea>
+                <textarea id="setRulesEditor" class="editor" disabled spellcheck="false" style="height: 350px;">${esc(fullYaml)}</textarea>
                 <div class="card-save-area" style="display:none; justify-content:flex-end; gap:12px; margin-top:24px">
                     <button class="btn btn-primary" onclick="saveRulesConfig()">保存规则配置</button>
                 </div>
@@ -728,7 +746,7 @@ const SettingsPage = {
                     导出所有接入用户的配置到本地 JSON，或者从本地的备份文件恢复用户列表。<strong>警告：导入备份将彻底覆盖现有用户！</strong>
                 </p>
                 <div style="display:flex; gap:16px;">
-                    <button class="btn btn-primary" style="justify-content:center; height:42px; font-size:13px; flex:1" onclick="window.location.href='${API}/settings/backup?token=${token}'">📥 导出用户配置 (JSON)</button>
+                    <button class="btn btn-primary" style="justify-content:center; height:42px; font-size:13px; flex:1" onclick="window.location.href='${API}/settings/backup?token=' + encodeURIComponent('${escJs(token)}')">📥 导出用户配置 (JSON)</button>
                     <button class="btn" style="justify-content:center; border-color:var(--border); height:42px; font-size:13px; flex:1" onclick="triggerRestoreUpload()">📤 导入本地备份</button>
                 </div>
             </div>
@@ -745,12 +763,12 @@ const SettingsPage = {
                 </p>
                 <div class="form-group">
                     <label>主节点同步接口 URL</label>
-                    <input type="text" readonly value="${masterConfig.master_url||''}">
+                    <input type="text" readonly value="${esc(masterConfig.master_url||'')}">
                 </div>
                 <div class="form-group">
                     <label>从节点通信密钥 (Secret)</label>
                     <div style="position:relative; display:flex; align-items:center;">
-                        <input id="mstSecret" type="password" readonly style="padding-right:40px; width:100%" value="${masterConfig.secret||''}">
+                        <input id="mstSecret" type="password" readonly style="padding-right:40px; width:100%" value="${esc(masterConfig.secret||'')}">
                         <span onclick="togglePasswordVisibility('mstSecret', this)" style="position:absolute; right:12px; cursor:pointer; font-size:16px; user-select:none;">👁️</span>
                     </div>
                 </div>
@@ -802,21 +820,21 @@ function renderNodeTableHtml() {
             </thead>
             <tbody>
                 ${nodes.map(n => {
-                    const wsInfo = n.ws_enabled ? `<span style="color:var(--primary)">WS (${n.ws_path})</span>` : '<span style="opacity:0.5">TCP</span>';
+                    const wsInfo = n.ws_enabled ? `<span style="color:var(--primary)">WS (${esc(n.ws_path)})</span>` : '<span style="opacity:0.5">TCP</span>';
                     const isOnline = n.last_heartbeat ? (now - Date.parse(n.last_heartbeat) < 90 * 1000) : false;
                     const statusBadge = `<span class="badge ${isOnline?'badge-green':'badge-red'}">${isOnline?'在线':'离线'}</span>`;
                     return `
                     <tr>
-                        <td style="font-weight:700">${n.name}</td>
-                        <td style="font-family:monospace; color:var(--text2)">${n.address}:${n.port}</td>
+                        <td style="font-weight:700">${esc(n.name)}</td>
+                        <td style="font-family:monospace; color:var(--text2)">${esc(n.address)}:${esc(n.port)}</td>
                         <td>${wsInfo}</td>
-                        <td style="font-weight:600">${n.traffic_rate} x</td>
+                        <td style="font-weight:600">${esc(n.traffic_rate)} x</td>
                         <td>
                             ${n.id === 999999 ? '<span style="opacity:0.5">-</span>' : `
                             <div style="display:flex; gap:6px; align-items:center">
-                                <input type="password" id="sec-${n.id}" value="${n.secret}" readonly style="width:140px; padding:4px 8px; font-size:12px; height:28px; background:var(--surface2); border:1px solid var(--border); color:#fff; border-radius:6px; outline:none">
+                                <input type="password" id="sec-${n.id}" value="${esc(n.secret)}" readonly style="width:140px; padding:4px 8px; font-size:12px; height:28px; background:var(--surface2); border:1px solid var(--border); color:#fff; border-radius:6px; outline:none">
                                 <button class="btn" style="padding:4px 8px; font-size:12px" onclick="togglePasswordVisibility('sec-${n.id}', this)">👁️</button>
-                                <button class="btn" style="padding:4px 8px; font-size:12px" onclick="copyText('${n.secret}')">复制</button>
+                                <button class="btn" style="padding:4px 8px; font-size:12px" onclick="copyText('${escJs(n.secret)}')">复制</button>
                             </div>
                             `}
                         </td>
@@ -904,9 +922,9 @@ window.showEditNodeModal = function(id) {
     if (!n) return;
     if (id === 999999) {
         showModal('编辑主节点', `
-            <div class="form-group"><label>节点名称 (同时作为站点标题)</label><input id="enName" type="text" value="${n.name}"></div>
-            <div class="form-group"><label>节点对外地址 (主节点不支持从后台修改)</label><input readonly type="text" value="${n.address}"></div>
-            <div class="form-group"><label>节点对外端口 (主节点不支持从后台修改)</label><input readonly type="number" value="${n.port}"></div>
+            <div class="form-group"><label>节点名称 (同时作为站点标题)</label><input id="enName" type="text" value="${esc(n.name)}"></div>
+            <div class="form-group"><label>节点对外地址 (主节点不支持从后台修改)</label><input readonly type="text" value="${esc(n.address)}"></div>
+            <div class="form-group"><label>节点对外端口 (主节点不支持从后台修改)</label><input readonly type="number" value="${esc(n.port)}"></div>
         `, async () => {
             const payload = {
                 name: document.getElementById('enName').value
@@ -919,10 +937,10 @@ window.showEditNodeModal = function(id) {
         return;
     }
     showModal('编辑代理节点', `
-        <div class="form-group"><label>节点名称</label><input id="enName" type="text" value="${n.name}"></div>
-        <div class="form-group"><label>节点对外地址 (域名/IP)</label><input id="enAddr" type="text" value="${n.address}"></div>
-        <div class="form-group"><label>节点对外端口</label><input id="enPort" type="number" value="${n.port}"></div>
-        <div class="form-group"><label>流量倍率</label><input id="enRate" type="number" step="0.1" value="${n.traffic_rate}"></div>
+        <div class="form-group"><label>节点名称</label><input id="enName" type="text" value="${esc(n.name)}"></div>
+        <div class="form-group"><label>节点对外地址 (域名/IP)</label><input id="enAddr" type="text" value="${esc(n.address)}"></div>
+        <div class="form-group"><label>节点对外端口</label><input id="enPort" type="number" value="${esc(n.port)}"></div>
+        <div class="form-group"><label>流量倍率</label><input id="enRate" type="number" step="0.1" value="${esc(n.traffic_rate)}"></div>
         <div class="form-group">
             <label>WebSocket 传输</label>
             <select id="enWsEnabled" onchange="document.getElementById('enWsPathGroup').style.display = this.value==='true'?'block':'none'">
@@ -932,11 +950,11 @@ window.showEditNodeModal = function(id) {
         </div>
         <div class="form-group" id="enWsPathGroup" style="display:${n.ws_enabled?'block':'none'}">
             <label>WebSocket 路径</label>
-            <input id="enWsPath" type="text" value="${n.ws_path || '/trojan-go'}">
+            <input id="enWsPath" type="text" value="${esc(n.ws_path || '/trojan-go')}">
         </div>
         <div class="form-group">
             <label>节点通信密钥 (Secret)</label>
-            <input id="enSecret" type="text" value="${n.secret}">
+            <input id="enSecret" type="text" value="${esc(n.secret)}">
         </div>
     `, async () => {
         const payload = {
@@ -1160,12 +1178,12 @@ async function showEditUserModal(id) {
     showModal('编辑用户', `
         <div class="form-group">
             <label>用户名/备注</label>
-            <input id="eName" type="text" value="${u.username}">
+            <input id="eName" type="text" value="${esc(u.username)}">
         </div>
         <div class="form-group">
             <label>密码</label>
             <div style="display:flex;gap:8px">
-                <input id="ePass" type="text" value="${u.password}">
+                <input id="ePass" type="text" value="${esc(u.password)}">
                 <button class="btn" onclick="document.getElementById('ePass').value=randStr(16)">自动生成</button>
             </div>
         </div>
@@ -1178,15 +1196,15 @@ async function showEditUserModal(id) {
         </div>
         <div class="form-group">
             <label>流量限额 (GB, -1为无限制)</label>
-            <input id="eQuota" type="number" value="${quotaGB}">
+            <input id="eQuota" type="number" value="${esc(quotaGB)}">
         </div>
         <div class="form-group">
             <label>IP 限制 (0为无限制)</label>
-            <input id="eIPLimit" type="number" value="${u.ip_limit || 0}">
+            <input id="eIPLimit" type="number" value="${esc(u.ip_limit || 0)}">
         </div>
         <div class="form-group">
             <label>过期日期</label>
-            <input id="eExpiry" type="date" value="${expiryDate}">
+            <input id="eExpiry" type="date" value="${esc(expiryDate)}">
         </div>
         
         <div style="border-top:1px solid var(--border); margin-top:20px; padding-top:16px">
@@ -1263,18 +1281,18 @@ async function shareUser(id) {
         <div class="form-group">
             <label>通用代理链接 (直连专用)</label>
             <div style="display:flex;gap:8px">
-                <input readonly id="shLink" value="${data.link}" style="flex:1">
-                <button class="btn" onclick="copyText('${data.link}')">复制</button>
+                <input readonly id="shLink" value="${esc(data.link)}" style="flex:1">
+                <button class="btn" onclick="copyText('${escJs(data.link)}')">复制</button>
             </div>
         </div>
         <div class="form-group">
             <label>Clash 订阅地址 (分流必备)</label>
             <div style="display:flex;gap:8px">
-                <input readonly id="shSub" value="${data.sub_link}" style="flex:1">
-                <button class="btn" onclick="copyText('${data.sub_link}')">复制</button>
+                <input readonly id="shSub" value="${esc(data.sub_link)}" style="flex:1">
+                <button class="btn" onclick="copyText('${escJs(data.sub_link)}')">复制</button>
             </div>
         </div>
-        <button class="btn btn-primary" style="width:100%; height:44px; justify-content:center; margin-top:8px" onclick="window.location.href='clash://install-config?url=' + encodeURIComponent('${data.sub_link}')">🚀 一键拉起 Clash 导入订阅</button>
+        <button class="btn btn-primary" style="width:100%; height:44px; justify-content:center; margin-top:8px" onclick="window.location.href='clash://install-config?url=' + encodeURIComponent('${escJs(data.sub_link)}')">🚀 一键拉起 Clash 导入订阅</button>
     `, null, true);
 }
 

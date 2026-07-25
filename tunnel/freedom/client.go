@@ -108,7 +108,6 @@ func (c *Client) DialPacket(tunnel.Tunnel) (tunnel.PacketConn, error) {
 		if err != nil {
 			return nil, common.NewError("freedom failed to dial udp to socks").Base(err)
 		}
-		// TODO fix hardcoded localhost
 		packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
 		if err != nil {
 			return nil, common.NewError("freedom failed to listen udp").Base(err)

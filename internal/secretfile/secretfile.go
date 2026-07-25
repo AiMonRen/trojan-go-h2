@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"syscall"
 )
 
@@ -38,6 +39,71 @@ func Read(path string) ([]byte, error) {
 		return nil, fmt.Errorf("%s is larger than the %d byte limit for secret files", path, maxSecretSize)
 	}
 	return data, nil
+}
+
+// DefaultPerm is the mode used for a sensitive file whose current mode cannot
+// be determined (for example when it does not exist yet).
+const DefaultPerm = os.FileMode(0o600)
+
+// WriteAtomic replaces path with content without ever widening its permissions
+// and without leaving a truncated file behind if the process dies mid-write.
+//
+// S-03: the CLI used to rewrite config.yaml with a hardcoded 0644, which was a
+// one-way permission downgrade on a file holding proxy passwords — the
+// installer had created it as 0600. WriteAtomic instead stats the existing
+// file, reuses its mode (falling back to DefaultPerm), writes a temp file in
+// the same directory, fsyncs it, and renames it into place. The rename is
+// atomic on the same filesystem, so concurrent readers see either the old or
+// the new content and never a partial write. The parent directory is synced
+// afterwards so the replacement survives a crash.
+func WriteAtomic(path string, content []byte) error {
+	perm := DefaultPerm
+	if info, err := os.Stat(path); err == nil {
+		perm = info.Mode().Perm()
+		// Never inherit a mode that exposes the file to other users. If the
+		// file was already too permissive, tighten it rather than preserving
+		// the mistake.
+		if perm&0o077 != 0 {
+			perm = DefaultPerm
+		}
+	}
+
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".trojan-cfg-*")
+	if err != nil {
+		return fmt.Errorf("create temp file in %s: %w", dir, err)
+	}
+	tmpPath := tmp.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tmp.Close()
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if err := tmp.Chmod(perm); err != nil {
+		return fmt.Errorf("chmod %s: %w", tmpPath, err)
+	}
+	if _, err := tmp.Write(content); err != nil {
+		return fmt.Errorf("write %s: %w", tmpPath, err)
+	}
+	if err := tmp.Sync(); err != nil {
+		return fmt.Errorf("sync %s: %w", tmpPath, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", tmpPath, err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("rename %s to %s: %w", tmpPath, path, err)
+	}
+	committed = true
+
+	if dirFd, err := os.Open(dir); err == nil {
+		_ = dirFd.Sync()
+		_ = dirFd.Close()
+	}
+	return nil
 }
 
 // open performs the O_NOFOLLOW open plus the fstat-based validation. It is

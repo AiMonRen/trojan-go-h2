@@ -1,6 +1,7 @@
 package webserver
 
 import (
+	"crypto/subtle"
 	"net"
 	"net/http"
 	"strings"
@@ -46,14 +47,18 @@ func (s *AdminServer) registerAdminRoutes(r *gin.Engine, mountPath string) {
 		mountPath = "/"
 	}
 
+	// S-05: the panel HTML and its API get the full browser hardening set.
+	// The mask page and NoRoute handler deliberately stay bare so their
+	// response headers keep matching a plain nginx install.
+	panelHeaders := securityHeaders(true)
 	serveIndex := func(c *gin.Context) {
 		data, _ := webui.ReadIndex()
 		c.Data(http.StatusOK, "text/html; charset=utf-8", data)
 	}
 	if mountPath == "/" {
-		r.GET("/", serveIndex)
+		r.GET("/", panelHeaders, serveIndex)
 	} else {
-		r.GET(mountPath, serveIndex)
+		r.GET(mountPath, panelHeaders, serveIndex)
 		trimmedPath := strings.TrimSuffix(mountPath, "/")
 		if trimmedPath != mountPath && trimmedPath != "" {
 			r.GET(trimmedPath, func(c *gin.Context) { c.Redirect(http.StatusFound, mountPath) })
@@ -61,7 +66,7 @@ func (s *AdminServer) registerAdminRoutes(r *gin.Engine, mountPath string) {
 		r.GET("/", s.serveMaskPage)
 	}
 
-	apiGroup := r.Group("/admin/api")
+	apiGroup := r.Group("/admin/api", panelHeaders)
 	apiGroup.POST("/login", s.enforceLoginRateLimit(), s.handleLogin)
 	auth := apiGroup.Group("/", s.enforceAdminRateLimit(), s.invalidateSubscriptionAfterMutation(), s.requireAdminSession())
 	auth.GET("/settings", s.handleGetSettings)
@@ -93,6 +98,7 @@ func (s *AdminServer) registerAdminRoutes(r *gin.Engine, mountPath string) {
 	auth.GET("/logs", s.handleGetLogs)
 	auth.POST("/service", s.handleServiceControl)
 	auth.POST("/restart", s.handleRestart)
+	auth.GET("/restart-status", s.handleRestartStatus)
 	auth.GET("/settings/hysteria", s.handleGetHysteriaConfig)
 	auth.POST("/settings/hysteria", s.handleSaveHysteriaConfig)
 
@@ -100,8 +106,62 @@ func (s *AdminServer) registerAdminRoutes(r *gin.Engine, mountPath string) {
 	if s.subPath != "" {
 		subRoute = s.subPath
 	}
-	r.GET(subRoute, s.handleSub)
+	// The subscription endpoint is consumed by proxy clients rather than
+	// browsers, so it only gets the sniffing/referrer/transport headers. A CSP
+	// would be meaningless here and framing rules do not apply.
+	r.GET(subRoute, securityHeaders(false), s.handleSub)
 	r.NoRoute(s.serveMaskPage)
+}
+
+// securityHeaders sets the browser-side hardening response headers that were
+// previously absent entirely (S-05).
+//
+// full=true is for the admin panel and its API: it adds Content-Security-Policy
+// and anti-framing headers. full=false is for endpoints consumed by proxy
+// clients, where only MIME sniffing, referrer leakage and transport downgrade
+// are relevant.
+//
+// The CSP still allows 'unsafe-inline' because index.html carries its script
+// and styles inline. Once those are split into separate assets the keyword can
+// be dropped and the policy tightened; the header being present already blocks
+// external script origins and inline event-handler injection is contained by
+// the escaping added for S-01.
+func securityHeaders(full bool) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		h := c.Writer.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Referrer-Policy", "no-referrer")
+		// HSTS is only meaningful on an HTTPS response. In split-service mode
+		// the admin listener is plain HTTP on loopback behind the TLS gateway,
+		// and SetTrustedProxies restricts X-Forwarded-* to loopback, so the
+		// forwarded scheme can be trusted here.
+		if c.Request.TLS != nil || strings.EqualFold(c.GetHeader("X-Forwarded-Proto"), "https") {
+			h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		}
+		if !full {
+			c.Next()
+			return
+		}
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Cross-Origin-Opener-Policy", "same-origin")
+		// fonts.googleapis.com / fonts.gstatic.com are allowlisted because
+		// index.html still @imports a Google Fonts stylesheet. Note that this
+		// request also reveals panel usage to a third party and simply stalls
+		// on networks where Google is unreachable; self-hosting the two font
+		// families would let both entries be dropped.
+		h.Set("Content-Security-Policy",
+			"default-src 'self'; "+
+				"script-src 'self' 'unsafe-inline'; "+
+				"style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "+
+				"img-src 'self' data:; "+
+				"font-src 'self' data: https://fonts.gstatic.com; "+
+				"connect-src 'self'; "+
+				"form-action 'self'; "+
+				"frame-ancestors 'none'; "+
+				"base-uri 'none'; "+
+				"object-src 'none'")
+		c.Next()
+	}
 }
 
 func (s *AdminServer) registerControlRoutes(r *gin.Engine, includeLegacy bool) {
@@ -140,10 +200,16 @@ func (s *AdminServer) requireInternalControl() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		if s.internalToken != "" && c.GetHeader("X-Internal-Token") != s.internalToken {
-			c.JSON(http.StatusForbidden, gin.H{"error": "invalid internal service token"})
-			c.Abort()
-			return
+		// S-04: compare in constant time. Go's string != short-circuits on the
+		// first differing byte, which is a (theoretical, given the loopback
+		// requirement above) timing oracle for a shared secret.
+		if s.internalToken != "" {
+			provided := c.GetHeader("X-Internal-Token")
+			if subtle.ConstantTimeCompare([]byte(provided), []byte(s.internalToken)) != 1 {
+				c.JSON(http.StatusForbidden, gin.H{"error": "invalid internal service token"})
+				c.Abort()
+				return
+			}
 		}
 		c.Next()
 	}

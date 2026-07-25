@@ -514,15 +514,24 @@ func (s *AdminServer) handleHysteriaAuth(c *gin.Context) {
 }
 
 // handleGetHysteriaConfig returns current Hysteria2 protocol settings.
+// F-1: distinguish ErrRecordNotFound (legitimate empty) from real DB failures.
+// A DB error on any key aborts the whole request instead of returning empty
+// strings that the panel would interpret as "not configured" and let the user
+// overwrite with empty values on the next save.
 func (s *AdminServer) handleGetHysteriaConfig(c *gin.Context) {
 	keys := []string{"hysteria_enabled", "hysteria_port", "hysteria_up_mbps", "hysteria_down_mbps", "hysteria_masquerade_url"}
 	result := gin.H{}
 	for _, k := range keys {
 		var cfg database.Config
-		if s.db.Where("`key` = ?", k).First(&cfg).Error == nil {
+		switch err := s.db.Where("`key` = ?", k).First(&cfg).Error; {
+		case err == nil:
 			result[k] = cfg.Value
-		} else {
+		case errors.Is(err, gorm.ErrRecordNotFound):
 			result[k] = ""
+		default:
+			log.Errorf("hysteria config: read %s from DB: %v", k, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "读取 Hysteria2 配置失败"})
+			return
 		}
 	}
 	c.JSON(http.StatusOK, result)

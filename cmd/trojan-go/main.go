@@ -22,6 +22,15 @@ import (
 	"github.com/voidluo/trojan-go/tunnel/trojan"
 )
 
+// serviceArgs extracts -config / -listen from a service argument list.
+//
+// KNOWN LIMITATION (#4): this is a hand-rolled scanner rather than a
+// flag.FlagSet. It silently ignores unknown flags, a trailing flag with no
+// value, and repeated flags (last one wins). That is acceptable today because
+// callers are the installer-generated systemd units, which always emit exactly
+// "-config <path> [-listen <addr>]". Migrating to flag.FlagSet would change the
+// signature to return an error and force every caller to handle parse failure,
+// so it is deferred to the v2 configuration format migration.
 func serviceArgs(args []string, defaultListen string) (configPath, listenAddress string) {
 	listenAddress = defaultListen
 	for i := 0; i < len(args)-1; i++ {

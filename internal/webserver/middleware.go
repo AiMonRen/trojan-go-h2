@@ -3,6 +3,7 @@ package webserver
 import (
 	cryptorand "crypto/rand"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -12,34 +13,44 @@ import (
 	"github.com/voidluo/trojan-go/internal/database"
 	"github.com/voidluo/trojan-go/log"
 	"golang.org/x/crypto/bcrypt"
+	"gorm.io/gorm"
 )
 
-// loadAdminCreds 加载管理员凭据，优先使用内存缓存以减少 SQLite 查询
-func (s *AdminServer) loadAdminCreds() (user, pass string) {
+// loadAdminCreds 加载管理员凭据，优先使用内存缓存以减少 SQLite 查询。
+// 返回值 ok=false 表示 DB 发生非 NotFound 错误，调用方应拒绝登录以避免认证降级。
+func (s *AdminServer) loadAdminCreds() (user, pass string, ok bool) {
 	s.credMu.RLock()
 	if s.cacheValid {
 		user, pass = s.cachedAdminUser, s.cachedAdminPass
 		s.credMu.RUnlock()
-		return
+		return user, pass, true
 	}
 	s.credMu.RUnlock()
 
 	s.credMu.Lock()
 	defer s.credMu.Unlock()
 	if s.cacheValid {
-		return s.cachedAdminUser, s.cachedAdminPass
+		return s.cachedAdminUser, s.cachedAdminPass, true
 	}
 	user, pass = s.configUser, s.configPass
 	var cfgU, cfgP database.Config
-	if s.db.Where("`key` = ?", "admin_username").First(&cfgU).Error == nil {
+	errU := s.db.Where("`key` = ?", "admin_username").First(&cfgU).Error
+	if errU == nil {
 		user = cfgU.Value
+	} else if !errors.Is(errU, gorm.ErrRecordNotFound) {
+		log.Errorf("Web panel: load admin_username from DB: %v", errU)
+		return user, pass, false
 	}
-	if s.db.Where("`key` = ?", "admin_password").First(&cfgP).Error == nil {
+	errP := s.db.Where("`key` = ?", "admin_password").First(&cfgP).Error
+	if errP == nil {
 		pass = cfgP.Value
+	} else if !errors.Is(errP, gorm.ErrRecordNotFound) {
+		log.Errorf("Web panel: load admin_password from DB: %v", errP)
+		return user, pass, false
 	}
 	s.cachedAdminUser, s.cachedAdminPass = user, pass
 	s.cacheValid = true
-	return
+	return user, pass, true
 }
 
 // invalidateAdminCache 使管理员凭据缓存失效（密码变更时调用）
@@ -195,7 +206,12 @@ func (s *AdminServer) handleLogin(c *gin.Context) {
 		return
 	}
 
-	effUser, effPass := s.loadAdminCreds()
+	effUser, effPass, credsOK := s.loadAdminCreds()
+	if !credsOK {
+		log.Errorf("Web panel: login blocked due to credential database unavailability")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "认证服务暂时不可用，请稍后重试"})
+		return
+	}
 
 	authSuccess := false
 	if req.Username == effUser {

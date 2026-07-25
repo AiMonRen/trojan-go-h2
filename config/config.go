@@ -8,12 +8,16 @@ import (
 	"math/rand"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
-var creators = make(map[string]Creator)
+var (
+	creators   = make(map[string]Creator)
+	creatorsMu sync.RWMutex
+)
 
 // Creator creates a config struct for a module.
 type Creator func() any
@@ -24,7 +28,10 @@ type normalizer interface {
 }
 
 // RegisterConfigCreator registers a config struct for parsing.
+// It is safe for concurrent use but intended to be called during init().
 func RegisterConfigCreator(name string, creator Creator) {
+	creatorsMu.Lock()
+	defer creatorsMu.Unlock()
 	creators[name+"_CONFIG"] = creator
 }
 
@@ -44,8 +51,16 @@ func compatConfigData(data []byte, isJSON bool) []byte {
 func parseJSON(data []byte) (map[string]any, error) {
 	data = compatConfigData(data, true)
 	result := make(map[string]any)
+	creatorsMu.RLock()
+	names := make([]string, 0, len(creators))
+	cfgs := make([]Creator, 0, len(creators))
 	for name, creator := range creators {
-		cfg := creator()
+		names = append(names, name)
+		cfgs = append(cfgs, creator)
+	}
+	creatorsMu.RUnlock()
+	for i, name := range names {
+		cfg := cfgs[i]()
 		if err := json.Unmarshal(data, cfg); err != nil {
 			return nil, err
 		}
@@ -58,8 +73,16 @@ func parseJSON(data []byte) (map[string]any, error) {
 func parseYAML(data []byte) (map[string]any, error) {
 	data = compatConfigData(data, false)
 	result := make(map[string]any)
+	creatorsMu.RLock()
+	names := make([]string, 0, len(creators))
+	cfgs := make([]Creator, 0, len(creators))
 	for name, creator := range creators {
-		cfg := creator()
+		names = append(names, name)
+		cfgs = append(cfgs, creator)
+	}
+	creatorsMu.RUnlock()
+	for i, name := range names {
+		cfg := cfgs[i]()
 		if err := yaml.Unmarshal(data, cfg); err != nil {
 			return nil, err
 		}

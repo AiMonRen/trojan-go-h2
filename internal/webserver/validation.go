@@ -157,8 +157,21 @@ func validateNodeName(name string) error {
 	if strings.TrimSpace(name) == "" {
 		return errors.New("节点名称不能只包含空白字符")
 	}
+	// S-01: defense in depth against stored XSS. The web UI escapes every
+	// interpolation point via esc()/escJs(), but the node name also flows into
+	// the site title and into generated subscription documents, so HTML
+	// metacharacters are rejected at the boundary as well. Anything that could
+	// break out of an element or attribute context is refused.
+	if i := strings.IndexAny(name, htmlMetaChars); i >= 0 {
+		return fmt.Errorf("节点名称不能包含字符 %q", string(name[i]))
+	}
 	return nil
 }
+
+// htmlMetaChars lists the characters that can terminate an HTML element or
+// attribute context. Rejected in display names as a second line of defense
+// behind the front-end escaping.
+const htmlMetaChars = `<>"'&`
 
 // validateUsername checks a proxy account name. The name is used in
 // subscription filenames and share links, so it is restricted to printable

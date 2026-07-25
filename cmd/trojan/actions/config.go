@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/voidluo/trojan-go/internal/secretfile"
 )
 
 // ShowConfig 展示当前配置文件内容
@@ -79,7 +81,12 @@ func ToggleWebSocket() {
 		return
 	}
 
-	if err := os.WriteFile(targetPath, []byte(newContent), 0644); err != nil {
+	// S-03: config.yaml holds proxy passwords and API keys. Writing it with a
+	// hardcoded 0644 was a one-way permission downgrade from the 0600 the
+	// installer sets, making it world-readable on the host. WriteAtomic
+	// preserves the existing mode (defaulting to 0600) and swaps the file in
+	// with a rename so a crash cannot leave a truncated config behind.
+	if err := secretfile.WriteAtomic(targetPath, []byte(newContent)); err != nil {
 		fmt.Printf("\033[31m写入配置文件失败: %v\033[0m\n", err)
 		return
 	}

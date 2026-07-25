@@ -11,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/voidluo/trojan-go/internal/database"
+	"github.com/voidluo/trojan-go/internal/secretfile"
 	"github.com/voidluo/trojan-go/log"
 	"gopkg.in/yaml.v3"
 	"gorm.io/gorm"
@@ -125,57 +126,16 @@ func (s *AdminServer) handleUpdateWebSocket(c *gin.Context) {
 		return
 	}
 
-	// Write to a unique temp file in the target directory and atomic rename.
-	// This prevents concurrent writers from corrupting each other and avoids
-	// exposing sensitive configuration through weak permissions.
-	info, statErr := os.Stat(targetPath)
-	perm := os.FileMode(0o600)
-	if statErr == nil {
-		perm = info.Mode().Perm()
-	}
-	dir := filepath.Dir(targetPath)
-	tmp, err := os.CreateTemp(dir, ".trojan-ws-*")
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建临时配置文件失败"})
+	// Preserve the existing mode, write a temp file in the target directory and
+	// atomically rename it into place. This prevents concurrent writers from
+	// corrupting each other and avoids exposing sensitive configuration through
+	// weak permissions. The directory is fsynced so the replacement survives a
+	// crash right after the HTTP response, keeping memory and disk in sync.
+	// S-03: shared with the CLI path so both writers behave identically.
+	if err := secretfile.WriteAtomic(targetPath, []byte(newContent)); err != nil {
+		log.Errorf("ws config: write %s: %v", targetPath, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "写入配置文件失败"})
 		return
-	}
-	tmpPath := tmp.Name()
-	committed := false
-	defer func() {
-		_ = tmp.Close()
-		if !committed {
-			_ = os.Remove(tmpPath)
-		}
-	}()
-	if err := tmp.Chmod(perm); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "设置临时文件权限失败"})
-		return
-	}
-	if _, err := tmp.WriteString(newContent); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "写入临时配置文件失败"})
-		return
-	}
-	if err := tmp.Sync(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "同步临时配置文件失败"})
-		return
-	}
-	if err := tmp.Close(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "关闭临时配置文件失败"})
-		return
-	}
-	if err := os.Rename(tmpPath, targetPath); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "重命名配置文件失败"})
-		return
-	}
-	committed = true
-
-	// Sync the directory to ensure the rename is durable before updating
-	// the in-memory state. This guarantees memory and disk stay in sync
-	// even if the process is killed immediately after the HTTP response.
-	dirFd, _ := os.Open(dir)
-	if dirFd != nil {
-		_ = dirFd.Sync()
-		_ = dirFd.Close()
 	}
 	s.wsEnabled = finalEnabled
 
@@ -241,22 +201,33 @@ func (s *AdminServer) handleUpdateSettings(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	// Validate every key before touching the database so a rejected field can
-	// never leave earlier keys already persisted.
-	for key := range req {
+	// Validate and collect in one pass, collecting valid entries for the transaction.
+	pairs := make([]database.Config, 0, len(req))
+	for key, value := range req {
 		if !publicSettingKeys[key] {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "设置包含受保护或不支持的字段: " + key})
 			return
 		}
+		// S-01: site_title is rendered in the admin UI and is also writable
+		// through the node-rename path, which already runs validateNodeName.
+		// Applying the same rule here keeps both writers consistent instead of
+		// leaving one unchecked back door.
+		if key == "site_title" && value != "" {
+			if err := validateNodeName(value); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "站点标题无效: " + err.Error()})
+				return
+			}
+		}
+		pairs = append(pairs, database.Config{Key: key, Value: value})
 	}
 	// F-2: the per-key Save loop used to commit each row on its own, so a
 	// failure halfway through left a partially applied settings set (e.g. a new
 	// clash_rules without the matching rule_providers). One transaction makes
 	// the update all-or-nothing.
 	if err := s.db.Transaction(func(tx *gorm.DB) error {
-		for key, value := range req {
-			if err := tx.Save(&database.Config{Key: key, Value: value}).Error; err != nil {
-				return fmt.Errorf("save setting %q: %w", key, err)
+		for i := range pairs {
+			if err := tx.Save(&pairs[i]).Error; err != nil {
+				return fmt.Errorf("save setting %q: %w", pairs[i].Key, err)
 			}
 		}
 		return nil

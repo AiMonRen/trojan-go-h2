@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"sync"
 
 	"github.com/voidluo/trojan-go/common"
 )
@@ -74,14 +75,22 @@ type Tunnel interface {
 	NewServer(context.Context, Server) (Server, error)
 }
 
-var tunnels = make(map[string]Tunnel)
+var (
+	tunnels  = make(map[string]Tunnel)
+	tunnelMu sync.RWMutex
+)
 
-// RegisterTunnel register a tunnel by tunnel name
+// RegisterTunnel register a tunnel by tunnel name.
+// It is safe for concurrent use but intended to be called during init().
 func RegisterTunnel(name string, tunnel Tunnel) {
+	tunnelMu.Lock()
+	defer tunnelMu.Unlock()
 	tunnels[name] = tunnel
 }
 
 func GetTunnel(name string) (Tunnel, error) {
+	tunnelMu.RLock()
+	defer tunnelMu.RUnlock()
 	if t, ok := tunnels[name]; ok {
 		return t, nil
 	}

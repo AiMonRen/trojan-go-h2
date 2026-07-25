@@ -2,6 +2,7 @@ package webserver
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -345,12 +346,24 @@ func sanitizeFilename(name string) string {
 func generateClashConfigMultiNode(db *gorm.DB, u database.User, nodes []database.Node, defaultDomain string, defaultPort int, defaultWS bool, defaultWSPath string) string {
 	var cfgRules, cfgProviders database.Config
 	rulesStr := ""
-	if db.Where("`key` = ?", "clash_rules").First(&cfgRules).Error == nil {
+	// F-1: distinguish ErrRecordNotFound (legitimate empty) from real DB failures.
+	// M-09 fallback mechanism ensures built-in defaults are used when DB is unavailable.
+	switch err := db.Where("`key` = ?", "clash_rules").First(&cfgRules).Error; {
+	case err == nil:
 		rulesStr = cfgRules.Value
+	case errors.Is(err, gorm.ErrRecordNotFound):
+		// no custom rules configured, use built-in defaults
+	default:
+		log.Errorf("subscription: read clash_rules from DB: %v", err)
 	}
 	providersStr := ""
-	if db.Where("`key` = ?", "clash_rule_providers").First(&cfgProviders).Error == nil {
+	switch err := db.Where("`key` = ?", "clash_rule_providers").First(&cfgProviders).Error; {
+	case err == nil:
 		providersStr = cfgProviders.Value
+	case errors.Is(err, gorm.ErrRecordNotFound):
+		// no custom providers configured, use built-in defaults
+	default:
+		log.Errorf("subscription: read clash_rule_providers from DB: %v", err)
 	}
 
 	config := renderClashConfigMultiNode(db, u, nodes, defaultDomain, defaultPort, defaultWS, defaultWSPath, rulesStr, providersStr)
@@ -395,28 +408,37 @@ func renderClashConfigMultiNode(db *gorm.DB, u database.User, nodes []database.N
 		sb.WriteString("\n\n")
 	}
 
-	// ---- 读取全局配置 ----
-	getConfigValue := func(d *gorm.DB, key string) (string, error) {
-		var c database.Config
-		if err := d.Where("`key` = ?", key).First(&c).Error; err != nil {
-			return "", err
-		}
-		return c.Value, nil
+	// ---- 读取全局配置（批量查询，减少 DB 往返） ----
+	// F-1: on DB error, default to h2Enabled=false (safer) but log for observability.
+	var hysteriaEnabledCfg database.Config
+	h2Err := db.Where("`key` = ? AND value = ?", "hysteria_enabled", "true").First(&hysteriaEnabledCfg).Error
+	h2Enabled := h2Err == nil
+	if h2Err != nil && !errors.Is(h2Err, gorm.ErrRecordNotFound) {
+		log.Errorf("subscription: read hysteria_enabled from DB: %v", h2Err)
 	}
 
-	h2Enabled := db.Where("`key` = ? AND value = ?", "hysteria_enabled", "true").First(&database.Config{}).Error == nil
+	// Batch-fetch the remaining subscription-scoped configs in one roundtrip.
+	batchKeys := []string{"hysteria_port", "hysteria_up_mbps", "hysteria_down_mbps", "node_location", "clash_test_url", "sub_use_ws"}
+	var batchCfgs []database.Config
+	if err := db.Where("`key` IN ?", batchKeys).Find(&batchCfgs).Error; err != nil {
+		log.Errorf("subscription: batch-read configs: %v", err)
+	}
+	batchMap := make(map[string]string, len(batchCfgs))
+	for _, c := range batchCfgs {
+		batchMap[c.Key] = c.Value
+	}
 
 	h2PortStr := "443"
-	if cfg, err := getConfigValue(db, "hysteria_port"); err == nil && cfg != "" {
-		h2PortStr = cfg
+	if v, ok := batchMap["hysteria_port"]; ok && v != "" {
+		h2PortStr = v
 	}
 	h2UpStr := "100"
-	if cfg, err := getConfigValue(db, "hysteria_up_mbps"); err == nil && cfg != "" {
-		h2UpStr = cfg
+	if v, ok := batchMap["hysteria_up_mbps"]; ok && v != "" {
+		h2UpStr = v
 	}
 	h2DownStr := "300"
-	if cfg, err := getConfigValue(db, "hysteria_down_mbps"); err == nil && cfg != "" {
-		h2DownStr = cfg
+	if v, ok := batchMap["hysteria_down_mbps"]; ok && v != "" {
+		h2DownStr = v
 	}
 
 	// 当前订阅只发布 Trojan 与 Hysteria2。VLESS/Reality 和 TUIC 的底层预留
@@ -424,8 +446,8 @@ func renderClashConfigMultiNode(db *gorm.DB, u database.User, nodes []database.N
 
 	// 节点地区标签（如 "美国"）
 	nodeLoc := "节点"
-	if cfg, err := getConfigValue(db, "node_location"); err == nil && cfg != "" {
-		nodeLoc = cfg
+	if v, ok := batchMap["node_location"]; ok && v != "" {
+		nodeLoc = v
 	}
 
 	// sniFor 决定 SNI 字段：节点自定义 SNI 优先，否则用 Address（不合法 IP 需设 SNI）
@@ -438,13 +460,13 @@ func renderClashConfigMultiNode(db *gorm.DB, u database.User, nodes []database.N
 
 	// 测速 URL（默认用 Cloudflare 端点，比 gstatic 在国内快）
 	testURL := "http://cp.cloudflare.com/generate_204"
-	if cfg, err := getConfigValue(db, "clash_test_url"); err == nil && cfg != "" && cfg != "0" {
-		testURL = cfg
+	if v, ok := batchMap["clash_test_url"]; ok && v != "" && v != "0" {
+		testURL = v
 	}
 
 	// 是否在 Clash 订阅中输出 WebSocket 配置（非 CDN 场景关掉省 1 RTT）
 	useWS := defaultWS
-	if subWS, err := getConfigValue(db, "sub_use_ws"); err == nil && subWS == "false" {
+	if v, ok := batchMap["sub_use_ws"]; ok && v == "false" {
 		useWS = false
 	}
 

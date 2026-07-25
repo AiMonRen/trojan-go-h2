@@ -9,7 +9,9 @@ import (
 	"os"
 	"os/exec"
 	"reflect"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -36,6 +38,16 @@ func (s *AdminServer) handleBackup(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"version": 1, "users": toPublicUsers(users)})
 }
 
+// handleRestore imports users from a backup payload.
+//
+// KNOWN LIMITATION (#6): the request body is capped by the global
+// limitRequestBody middleware at maxAdminRequestBody (1 MiB), which corresponds
+// to roughly 2000 users. Larger backups are rejected with 413 before this
+// handler runs. Raising the cap for this one endpoint would need a dedicated
+// review because (a) the cap is a deliberate DoS control on every admin route,
+// and (b) the F-3 transaction below would then hold a proportionally larger
+// SQLite write transaction. A streaming / chunked restore is the right fix and
+// is deferred to the backup feature rework.
 func (s *AdminServer) handleRestore(c *gin.Context) {
 	data, err := c.GetRawData()
 	if err != nil {
@@ -59,8 +71,12 @@ func (s *AdminServer) handleRestore(c *gin.Context) {
 	// restore now runs in one transaction: either every new user lands or none
 	// does. Authenticator sync is deferred until after a successful commit so
 	// we never advertise users that were rolled back.
+	//
+	// Variables are declared outside the closure to survive the transaction
+	// scope; the closure body resets them on entry so it is safe even if GORM
+	// (or an adapter) retries the transaction function.
 	var restoredHashes []string
-	count := 0
+	var count int
 	if err := s.db.Transaction(func(tx *gorm.DB) error {
 		restoredHashes = restoredHashes[:0]
 		count = 0
@@ -211,12 +227,33 @@ func hasSystemctl() bool {
 	return err == nil
 }
 
+// logLineBounds constrain the -n argument passed to journalctl.
+const (
+	defaultLogLines = 300
+	maxLogLines     = 5000
+)
+
+// normalizeLogLines clamps the caller-supplied line count.
+//
+// S-06: the raw query value used to be forwarded to journalctl unchecked. This
+// was never command injection (exec.Command does not use a shell, so the value
+// is a single argv element), but a non-numeric value made journalctl fail with
+// a usage error that was echoed back to the client, and a huge value triggered
+// an expensive journal read.
+func normalizeLogLines(lines string) string {
+	n, err := strconv.Atoi(strings.TrimSpace(lines))
+	if err != nil || n < 1 || n > maxLogLines {
+		n = defaultLogLines
+	}
+	return strconv.Itoa(n)
+}
+
 // getUnitLogs fetches logs for a single service unit via journalctl.
 func getUnitLogs(unit, lines, level string) ([]byte, error) {
 	if _, err := exec.LookPath("journalctl"); err != nil {
 		return nil, fmt.Errorf("日志服务不可用（journalctl 未找到），请直接查看进程输出")
 	}
-	args := []string{"-u", unit, "-n", lines, "--no-pager", "-o", "cat"}
+	args := []string{"-u", unit, "-n", normalizeLogLines(lines), "--no-pager", "-o", "cat"}
 	if level != "" && level != "all" {
 		p := ""
 		switch level {
@@ -318,7 +355,10 @@ func (s *AdminServer) handleGetLogs(c *gin.Context) {
 		}
 		out, err := getUnitLogs(unit, lines, level)
 		if err != nil {
-			c.String(http.StatusInternalServerError, "获取日志失败: "+err.Error()+"\n"+string(out))
+			// S-06: keep the underlying journalctl error and its output in the
+			// server log instead of echoing them to the client.
+			log.Errorf("logs: read unit %s: %v (%s)", unit, err, strings.TrimSpace(string(out)))
+			c.String(http.StatusInternalServerError, "获取日志失败，请查看服务端日志")
 			return
 		}
 		c.String(http.StatusOK, string(out))
@@ -331,7 +371,10 @@ func (s *AdminServer) handleGetLogs(c *gin.Context) {
 		fmt.Fprintf(&buf, "=== %s (%s) ===\n", u, serviceUnitDescription(u))
 		out, err := getUnitLogs(u, lines, level)
 		if err != nil {
-			fmt.Fprintf(&buf, "错误: %v\n%s\n\n", err, string(out))
+			// S-06: the aggregate view must not leak command output either; the
+			// operator still sees which unit failed.
+			log.Errorf("logs: read unit %s: %v (%s)", u, err, strings.TrimSpace(string(out)))
+			fmt.Fprintf(&buf, "错误: 读取该单元日志失败，详情见服务端日志\n\n")
 			continue
 		}
 		buf.Write(out)
@@ -427,20 +470,54 @@ func (s *AdminServer) handleServiceControl(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("已执行 %s %s", req.Action, unit)})
 }
 
+// lastRestartStatus provides a lightweight audit trail for async restarts.
+var lastRestartStatus struct {
+	mu     sync.Mutex
+	id     string
+	result string // "success" or error message
+	at     time.Time
+}
+
 func (s *AdminServer) handleRestart(c *gin.Context) {
 	// Restarting admin-service kills the process serving this request, so the
 	// work stays asynchronous and the response is an acknowledgement. M-05: the
 	// aggregated failure is now logged with the full unit list so operators can
 	// see partial failures in the journal.
 	units := s.serviceUnits()
+	restartID := fmt.Sprintf("restart-%d", time.Now().UnixMilli())
+	lastRestartStatus.mu.Lock()
+	lastRestartStatus.id = restartID
+	lastRestartStatus.result = "in-progress"
+	lastRestartStatus.at = time.Now()
+	lastRestartStatus.mu.Unlock()
 	c.JSON(http.StatusOK, gin.H{
-		"message": "正在重启所有服务单元...",
-		"units":   units,
+		"message":     "正在重启所有服务单元...",
+		"units":       units,
+		"restart_id":  restartID,
+		"poll_status": "/admin/api/restart-status",
 	})
 	go func() {
 		time.Sleep(200 * time.Millisecond)
-		if err := s.restartAllUnits(); err != nil {
-			log.Errorf("restart all units: %v", err)
+		err := s.restartAllUnits()
+		lastRestartStatus.mu.Lock()
+		defer lastRestartStatus.mu.Unlock()
+		if err != nil {
+			log.Errorf("restart all units [%s]: %v", restartID, err)
+			lastRestartStatus.result = err.Error()
+		} else {
+			log.Infof("restart all units [%s]: success", restartID)
+			lastRestartStatus.result = "success"
 		}
+		lastRestartStatus.at = time.Now()
 	}()
+}
+
+func (s *AdminServer) handleRestartStatus(c *gin.Context) {
+	lastRestartStatus.mu.Lock()
+	defer lastRestartStatus.mu.Unlock()
+	c.JSON(http.StatusOK, gin.H{
+		"restart_id": lastRestartStatus.id,
+		"result":     lastRestartStatus.result,
+		"at":         lastRestartStatus.at.Format(time.RFC3339),
+	})
 }

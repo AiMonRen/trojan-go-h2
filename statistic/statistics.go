@@ -51,7 +51,12 @@ type Creator func(ctx context.Context) (Authenticator, error)
 var (
 	createdAuthLock sync.Mutex
 	authCreators    = make(map[string]Creator)
-	createdAuth     = make(map[context.Context]Authenticator)
+	// createdAuth caches authenticators keyed by their parent context.
+	// Contexts used as keys MUST be long-lived (process or component lifetime)
+	// because map entries are only removed by CloseAuthenticator, not by GC.
+	// Using a short-lived context as a key will leak both the entry and the
+	// authenticator.
+	createdAuth = make(map[context.Context]Authenticator)
 )
 
 func RegisterAuthenticatorCreator(name string, creator Creator) {

@@ -109,3 +109,73 @@ func TestReadRejectsOversizedFile(t *testing.T) {
 		t.Fatal("Read must refuse a file larger than the secret size limit")
 	}
 }
+
+// TestWriteAtomicPreservesMode covers S-03: rewriting a sensitive config must
+// never widen its permissions.
+func TestWriteAtomicPreservesMode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	if err := WriteAtomic(path, []byte("new")); err != nil {
+		t.Fatalf("WriteAtomic: %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if string(data) != "new" {
+		t.Fatalf("content = %q, want %q", data, "new")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("mode = %o, want 600", got)
+	}
+	// No temp files may be left behind on the happy path.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("directory holds %d entries, want only the config file", len(entries))
+	}
+}
+
+// TestWriteAtomicTightensLooseMode: an already world-readable config must not
+// have that mistake preserved, and a brand new file defaults to 0600.
+func TestWriteAtomicTightensLooseMode(t *testing.T) {
+	dir := t.TempDir()
+
+	loose := filepath.Join(dir, "loose.yaml")
+	if err := os.WriteFile(loose, []byte("old"), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := WriteAtomic(loose, []byte("new")); err != nil {
+		t.Fatalf("WriteAtomic: %v", err)
+	}
+	info, err := os.Stat(loose)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if got := info.Mode().Perm(); got != DefaultPerm {
+		t.Fatalf("mode = %o, want %o", got, DefaultPerm)
+	}
+
+	fresh := filepath.Join(dir, "fresh.yaml")
+	if err := WriteAtomic(fresh, []byte("new")); err != nil {
+		t.Fatalf("WriteAtomic on new path: %v", err)
+	}
+	info, err = os.Stat(fresh)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if got := info.Mode().Perm(); got != DefaultPerm {
+		t.Fatalf("new file mode = %o, want %o", got, DefaultPerm)
+	}
+}

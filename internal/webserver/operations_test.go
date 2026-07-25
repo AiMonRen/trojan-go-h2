@@ -218,6 +218,13 @@ func TestHandleRestartReturnsAcceptedMessage(t *testing.T) {
 
 // stubControlUnit replaces the systemctl invocation with a deterministic
 // function for the duration of a test.
+//
+// Design note: this overrides a package-level function variable, which couples
+// tests to the internal representation of controlUnit. When the control
+// abstraction grows beyond the current two units (trojan-go + hysteria), an
+// interface-based approach (e.g., UnitController interface with
+// Start/Stop/Restart methods) would allow tests to pass mocks without touching
+// package-level variables.
 func stubControlUnit(t *testing.T, fn func(unit, action string) ([]byte, error)) {
 	t.Helper()
 	original := controlUnit

@@ -110,6 +110,25 @@ func TestValidateNodeName(t *testing.T) {
 	}
 }
 
+// TestValidateNodeNameRejectsHTMLMetaChars covers S-01: the node name reaches
+// the admin UI, so HTML metacharacters must be refused at the API boundary in
+// addition to the front-end escaping.
+func TestValidateNodeNameRejectsHTMLMetaChars(t *testing.T) {
+	for _, name := range []string{
+		`<img src=x onerror=alert(1)>`,
+		`<script>alert(1)</script>`,
+		`" onfocus=alert(1) autofocus x="`,
+		`hk' or '1`,
+		`a&b`,
+		`node<`,
+		`node>`,
+	} {
+		if err := validateNodeName(name); err == nil {
+			t.Errorf("validateNodeName(%q) = nil, want error", name)
+		}
+	}
+}
+
 func TestValidateUsername(t *testing.T) {
 	for _, name := range []string{"alice", "用户1", "a.b-c_d", strings.Repeat("u", maxUsernameLen)} {
 		if err := validateUsername(name); err != nil {

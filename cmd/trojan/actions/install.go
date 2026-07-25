@@ -72,6 +72,7 @@ func promptAdminPassword(promptCN, promptEN string) string {
 
 // InitDeployMaster 初始化部署（主节点）一键化流程
 func InitDeployMaster() {
+	// === Phase 0: privilege check and path selection ===
 	// Gateway 独占公网 TCP 443；Trojan data-plane 固定使用 loopback 14443。
 	r := mathrand.New(mathrand.NewSource(time.Now().UnixNano()))
 	const letters = "abcdefghijklmnopqrstuvwxyz0123456789"
@@ -251,6 +252,7 @@ func InitDeployMaster() {
 		}
 	}
 
+	// === Phase 1: SSL certificate provisioning ===
 	// 开始执行操作
 	fmt.Println("\n\033[36m=== 开始执行初始化部署 ===\033[0m")
 
@@ -272,6 +274,7 @@ func InitDeployMaster() {
 	fmt.Println("\033[32m✓ 证书已保存至:", tlsDir, "\033[0m")
 
 	// ─── Docker MySQL 部署 (如果适用) ────────────────────────────
+	// === Phase 2: optional MySQL setup ===
 	if deployDockerMySQL {
 		// 检测 Docker，如果不存在则打印分发行安装指引而非远程执行脚本
 		if err := exec.Command("docker", "--version").Run(); err != nil {
@@ -309,6 +312,7 @@ func InitDeployMaster() {
 		time.Sleep(5 * time.Second)
 	}
 
+	// === Phase 3: config generation, binary install and service bring-up ===
 	// ─── 步骤 2: 生成配置文件 ────────────────────────────
 	fmt.Println("\n[2/5] 正在生成配置文件...")
 

@@ -1,6 +1,7 @@
 package webserver
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -10,6 +11,7 @@ import (
 	"github.com/voidluo/trojan-go/common"
 	"github.com/voidluo/trojan-go/internal/database"
 	"github.com/voidluo/trojan-go/log"
+	"gorm.io/gorm"
 )
 
 // publicUser is the non-sensitive representation returned by management APIs.
@@ -95,8 +97,19 @@ func (s *AdminServer) handleAddUser(c *gin.Context) {
 	plaintextPassword := user.Password
 	user.Hash = common.SHA224String(plaintextPassword)
 	var existing database.User
-	if err := s.db.Where("hash = ?", user.Hash).First(&existing).Error; err == nil {
+	// S-09 (L-01): the `err == nil` form treated a query failure as "no
+	// conflict" and continued to Create, so a database outage surfaced as an
+	// opaque 500 from the unique index instead of a clear error. Align with the
+	// three-branch pattern used everywhere else in the project.
+	switch err := s.db.Where("hash = ?", user.Hash).First(&existing).Error; {
+	case err == nil:
 		c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("此密码已被用户 [%s] 使用", existing.Username)})
+		return
+	case errors.Is(err, gorm.ErrRecordNotFound):
+		// no conflict, continue
+	default:
+		log.Errorf("create user: password uniqueness precheck: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建用户失败"})
 		return
 	}
 	// Persist first to obtain a stable user ID for AES-GCM associated data, then
@@ -180,8 +193,17 @@ func (s *AdminServer) handleUpdateUser(c *gin.Context) {
 	if req.Password != "" {
 		newHash := common.SHA224String(req.Password)
 		var existing database.User
-		if err := s.db.Where("hash = ? AND id != ?", newHash, id).First(&existing).Error; err == nil {
+		// S-09 (L-01): same fix as the create path — a failed lookup must not
+		// be mistaken for "this password is free".
+		switch err := s.db.Where("hash = ? AND id != ?", newHash, id).First(&existing).Error; {
+		case err == nil:
 			c.JSON(http.StatusConflict, gin.H{"error": "此密码已被其他用户使用"})
+			return
+		case errors.Is(err, gorm.ErrRecordNotFound):
+			// no conflict, continue
+		default:
+			log.Errorf("update user %s: password uniqueness precheck: %v", id, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "更新用户失败"})
 			return
 		}
 		updates["hash"] = newHash

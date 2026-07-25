@@ -340,7 +340,59 @@ func registeredMigrations() []Migration {
 		{Version: 3, Name: "fix_legacy_lancidr_indentation", Revision: "2026-07-23", Up: fixLegacyLANCIDRIndentation},
 		{Version: 4, Name: "remove_unused_rule_providers", Revision: "2026-07-23", Up: removeUnusedRuleProviders},
 		{Version: 5, Name: "encrypt_recoverable_credentials", Revision: "2026-07-23", Up: encryptRecoverableCredentials},
+		{Version: 6, Name: "purge_sync_placeholder_passwords", Revision: "2026-07-25", Up: purgeSyncPlaceholderPasswords},
 	}
+}
+
+// legacySyncPlaceholderPassword is the literal that worker nodes used to write
+// into the local user cache before S-08 was fixed.
+const legacySyncPlaceholderPassword = "placeholder-pwd"
+
+// purgeSyncPlaceholderPasswords clears the placeholder credential that worker
+// nodes previously cached for synced users.
+//
+// S-08: the worker only ever receives the authentication hash from the master,
+// so its cached rows never held a usable password. Writing the fixed literal
+// "placeholder-pwd" meant migration 5 then encrypted that literal into
+// password_ciphertext, so UserPassword() would happily return it and any code
+// path generating a client config could emit a config that cannot authenticate.
+// Both the plaintext column and the ciphertext derived from it are cleared so
+// UserPassword() returns an empty string, which every caller already treats as
+// "credential unavailable".
+func purgeSyncPlaceholderPasswords(tx *gorm.DB) error {
+	if !tx.Migrator().HasTable(&User{}) {
+		return nil
+	}
+	var users []User
+	if err := tx.Where("password = ?", legacySyncPlaceholderPassword).Find(&users).Error; err != nil {
+		return err
+	}
+	// Rows already migrated by version 5 have an empty plaintext column, so the
+	// ciphertext has to be decrypted to recognise them.
+	var encrypted []User
+	if err := tx.Where("password = '' AND password_ciphertext <> '' AND password_ciphertext IS NOT NULL").Find(&encrypted).Error; err != nil {
+		return err
+	}
+	for i := range encrypted {
+		plaintext, err := UserPassword(encrypted[i])
+		if err != nil {
+			// An undecryptable row is not this migration's problem; leave it for
+			// the credential-key tooling to report.
+			continue
+		}
+		if plaintext == legacySyncPlaceholderPassword {
+			users = append(users, encrypted[i])
+		}
+	}
+	for i := range users {
+		if err := tx.Model(&User{}).Where("id = ?", users[i].ID).Updates(map[string]any{
+			"password":            "",
+			"password_ciphertext": "",
+		}).Error; err != nil {
+			return fmt.Errorf("clear placeholder credential for user %d: %w", users[i].ID, err)
+		}
+	}
+	return nil
 }
 
 func readConfigValue(tx *gorm.DB, key string) (Config, bool, error) {

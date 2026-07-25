@@ -251,7 +251,7 @@ func NewServer(ctx context.Context, underlay tunnel.Server) (*Server, error) {
 	}
 	ctx, cancel := context.WithCancel(ctx)
 
-	// TODO replace this dirty code
+	// Select authenticator backend based on MySQL configuration flag.
 	var auth statistic.Authenticator
 	var err error
 	if cfg.MySQL.Enabled {
