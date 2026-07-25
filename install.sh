@@ -1317,9 +1317,10 @@ log_level: 1
 local_addr: ${dp_host}
 local_port: ${dp_port}
 remote_addr: 127.0.0.1
-remote_port: 80
+remote_port: 0
 
 # gateway 已完成 TLS 卸载，data-plane 收到的是明文 + PROXY 协议头
+# remote_port=0 禁用固定重定向，由 freedom 隧道按目标地址直连
 transport_plugin:
   enabled: true
   type: plaintext
