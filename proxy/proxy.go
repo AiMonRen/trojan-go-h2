@@ -257,7 +257,10 @@ func NewProxyFromConfigData(data []byte, isJSON bool) (*Proxy, error) {
 	// 初始化从节点同步管理器
 	if nodeCfgAny := config.FromContext(ctx, nodesync.Name); nodeCfgAny != nil {
 		if nodeCfg, ok := nodeCfgAny.(*nodesync.Config); ok && nodeCfg.Node.Enabled {
-			nodesync.InitManager(nodeCfg.Node.MasterURL, nodeCfg.Node.Secret, nodeCfg.Node.SyncInterval)
+			if nodeCfg.Node.TrafficOutbox == "" {
+				return nil, common.NewError("worker node synchronization requires node.traffic_outbox")
+			}
+			nodesync.InitManager(nodeCfg.Node.MasterURL, nodeCfg.Node.Secret, nodeCfg.Node.SyncInterval, nodeCfg.Node.TrafficOutbox)
 			if mgr := nodesync.GetManager(); mgr != nil {
 				mgr.Start(ctx)
 			}

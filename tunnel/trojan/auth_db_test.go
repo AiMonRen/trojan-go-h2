@@ -20,7 +20,7 @@ func TestDataPlaneAuthenticatorLoadsExistingDatabaseUsers(t *testing.T) {
 	}
 	expired := time.Now().Add(-time.Hour)
 	users := []database.User{
-		{Username: "active", Hash: "active-hash", Quota: -1, Status: 0},
+		{Username: "active", Hash: "active-hash", Quota: -1, IPLimit: 3, Status: 0},
 		{Username: "disabled", Hash: "disabled-hash", Quota: -1, Status: 1},
 		{Username: "expired", Hash: "expired-hash", Quota: -1, Status: 0, ExpiryTime: &expired},
 		{Username: "quota", Hash: "quota-hash", Quota: 100, Used: 100, Status: 0},
@@ -36,8 +36,10 @@ func TestDataPlaneAuthenticatorLoadsExistingDatabaseUsers(t *testing.T) {
 	if err := webserver.SyncAuthenticatorFromDatabase(db, auth); err != nil {
 		t.Fatalf("SyncAuthenticatorFromDatabase: %v", err)
 	}
-	if ok, _ := auth.AuthUser("active-hash"); !ok {
+	if ok, runtimeUser := auth.AuthUser("active-hash"); !ok {
 		t.Fatal("active existing user must be loaded")
+	} else if got := runtimeUser.GetIPLimit(); got != 3 {
+		t.Fatalf("active existing user IP limit = %d, want 3", got)
 	}
 	for _, hash := range []string{"disabled-hash", "expired-hash", "quota-hash"} {
 		if ok, _ := auth.AuthUser(hash); ok {
@@ -65,10 +67,26 @@ func TestRefreshDataPlaneAuthenticatorAppliesDatabaseChanges(t *testing.T) {
 	go refreshDataPlaneAuthenticator(ctx, db, auth, 10*time.Millisecond)
 
 	waitAuthState(t, auth, "refresh-hash", true)
+	if err := db.Model(&database.User{}).Where("id = ?", user.ID).Update("ip_limit", 5).Error; err != nil {
+		t.Fatalf("update IP limit: %v", err)
+	}
+	waitIPLimit(t, auth, "refresh-hash", 5)
 	if err := db.Model(&database.User{}).Where("id = ?", user.ID).Update("status", 1).Error; err != nil {
 		t.Fatalf("disable user: %v", err)
 	}
 	waitAuthState(t, auth, "refresh-hash", false)
+}
+
+func waitIPLimit(t *testing.T, auth statistic.Authenticator, hash string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if ok, user := auth.AuthUser(hash); ok && user.GetIPLimit() == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("IP limit for %q did not become %d", hash, want)
 }
 
 func waitAuthState(t *testing.T, auth statistic.Authenticator, hash string, want bool) {

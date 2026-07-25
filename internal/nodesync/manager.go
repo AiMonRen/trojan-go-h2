@@ -6,6 +6,7 @@ import (
 	cryptorand "crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand/v2"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/voidluo/trojan-go/internal/database"
+	"github.com/voidluo/trojan-go/internal/trafficoutbox"
 	"github.com/voidluo/trojan-go/log"
 	"github.com/voidluo/trojan-go/statistic"
 	"gorm.io/gorm"
@@ -37,6 +39,8 @@ type NodeSyncManager struct {
 	pendingTraffic  map[string]trafficStats // 已从认证器取走、尚未被主节点确认的固定批次
 	queuedTraffic   map[string]trafficStats // 等待组成下一批的新增流量，不与失败批次混合
 	pendingSyncID   string                  // 固定批次的幂等键，失败重试必须保持不变
+	outbox          *trafficoutbox.File
+	outboxLoadError error
 	syncClient      *http.Client
 	heartbeatClient *http.Client
 	failureCount    int
@@ -44,11 +48,38 @@ type NodeSyncManager struct {
 	done            chan struct{}
 }
 
+// KNOWN LIMITATION (L-08): the node-sync manager is a process-global singleton.
+//
+// Current behaviour, stated explicitly so callers do not have to infer it:
+//   - InitManager only takes effect the first time it is called in a process.
+//     Every later call is silently ignored by managerOnce, so a second call with
+//     a different master_url/secret/interval does NOT reconfigure the manager.
+//   - GetManager returns nil until InitManager has run, and returns the same
+//     instance for the rest of the process lifetime.
+//   - Because the instance and its outbox file survive for the whole process,
+//     tests cannot get an isolated manager through this API. Tests that need
+//     isolation must construct a NodeSyncManager value directly inside the
+//     package instead of going through InitManager.
+//
+// Removing the singleton entirely requires lifecycle/dependency-injection
+// changes across the data plane and the worker control service, which is out of
+// scope here. The intended migration path is to add an exported
+// NewManager(...) (*NodeSyncManager, error) constructor, let production keep
+// calling InitManager purely as a compatibility wrapper around it, and have new
+// call sites and tests hold their own instance. That change is local and
+// reversible; it is simply not done yet.
+//
+// Note also that L-08 covered a second item — bounded, forced shutdown of
+// in-flight Gateway/ServiceRouter connections — which is tracked and fixed in
+// internal/webserver (Gateway.Close/ServiceRouter.Close drain with a deadline
+// and then force-close). This comment only documents the singleton part.
 var (
 	globalManager *NodeSyncManager
 	managerOnce   sync.Once
 )
 
+// GetManager returns the process-global manager, or nil when InitManager has not
+// been called yet. See the KNOWN LIMITATION note above.
 func GetManager() *NodeSyncManager {
 	return globalManager
 }
@@ -91,6 +122,24 @@ func newSyncID() (string, error) {
 		return "", fmt.Errorf("read cryptographic random source: %w", err)
 	}
 	return hex.EncodeToString(buf), nil
+}
+
+func validateUserHashes(hashes []string) error {
+	seen := make(map[string]struct{}, len(hashes))
+	for _, hash := range hashes {
+		if len(hash) != 56 {
+			return fmt.Errorf("invalid user hash length %d", len(hash))
+		}
+		decoded, err := hex.DecodeString(hash)
+		if err != nil || len(decoded) != 28 {
+			return errors.New("invalid SHA-224 user hash")
+		}
+		if _, exists := seen[hash]; exists {
+			return errors.New("duplicate user hash in sync response")
+		}
+		seen[hash] = struct{}{}
+	}
+	return nil
 }
 
 func boundedSyncBackoff(interval time.Duration, failures int) time.Duration {
@@ -148,21 +197,89 @@ func (m *NodeSyncManager) getHeartbeatClient() *http.Client {
 	return m.heartbeatClient
 }
 
-func InitManager(masterURL, secret string, intervalSec int) {
+// InitManager creates the process-global manager. It is idempotent by design:
+// only the first call in a process has any effect, and later calls are ignored
+// rather than reconfiguring or replacing the running manager. See the KNOWN
+// LIMITATION (L-08) note next to globalManager for the reasoning and the planned
+// migration to an injectable constructor.
+func InitManager(masterURL, secret string, intervalSec int, outboxPath ...string) {
+	alreadyInitialized := true
 	managerOnce.Do(func() {
+		alreadyInitialized = false
 		interval := normalizedSyncInterval(intervalSec)
 		if intervalSec <= 0 {
 			log.Warnf("node sync manager: invalid sync interval %ds; using default %s", intervalSec, interval)
 		}
-		globalManager = &NodeSyncManager{
-			masterURL:      masterURL,
-			secret:         secret,
-			syncInterval:   interval,
-			pendingTraffic: make(map[string]trafficStats),
-			queuedTraffic:  make(map[string]trafficStats),
-			done:           make(chan struct{}),
+		var path string
+		if len(outboxPath) > 0 {
+			path = outboxPath[0]
 		}
-		log.Infof("node sync manager initialized: master_url=%s, interval=%s", masterURL, interval)
+		outbox, outboxErr := trafficoutbox.NewFile(path)
+		globalManager = &NodeSyncManager{
+			masterURL:       masterURL,
+			secret:          secret,
+			syncInterval:    interval,
+			pendingTraffic:  make(map[string]trafficStats),
+			queuedTraffic:   make(map[string]trafficStats),
+			outbox:          outbox,
+			outboxLoadError: outboxErr,
+			done:            make(chan struct{}),
+		}
+		if outboxErr == nil {
+			outboxErr = globalManager.loadOutbox()
+			globalManager.outboxLoadError = outboxErr
+		}
+		if outboxErr != nil {
+			log.Errorf("node sync manager: traffic outbox unavailable: %v", outboxErr)
+		}
+		log.Infof("node sync manager initialized: master_url=%s, interval=%s, outbox=%s", masterURL, interval, path)
+	})
+	// Make the singleton's swallowed re-init observable instead of silent: a
+	// second call with different settings is a configuration bug the operator
+	// needs to see.
+	if alreadyInitialized {
+		log.Warnf("node sync manager: already initialized; ignoring re-init request for master_url=%s (process-global singleton, L-08)", masterURL)
+	}
+}
+
+func (m *NodeSyncManager) loadOutbox() error {
+	if m.outbox == nil {
+		return nil
+	}
+	state, err := m.outbox.Load()
+	if err != nil {
+		return err
+	}
+	m.pendingSyncID = state.PendingSyncID
+	m.pendingTraffic = fromOutboxTraffic(state.Pending)
+	m.queuedTraffic = fromOutboxTraffic(state.Queued)
+	return nil
+}
+
+func toOutboxTraffic(source map[string]trafficStats) map[string]trafficoutbox.Traffic {
+	result := make(map[string]trafficoutbox.Traffic, len(source))
+	for hash, value := range source {
+		result[hash] = trafficoutbox.Traffic{Up: value.Up, Down: value.Down}
+	}
+	return result
+}
+
+func fromOutboxTraffic(source map[string]trafficoutbox.Traffic) map[string]trafficStats {
+	result := make(map[string]trafficStats, len(source))
+	for hash, value := range source {
+		result[hash] = trafficStats{Up: value.Up, Down: value.Down}
+	}
+	return result
+}
+
+func (m *NodeSyncManager) persistOutboxLocked() error {
+	if m.outbox == nil {
+		return nil
+	}
+	return m.outbox.Save(trafficoutbox.State{
+		PendingSyncID: m.pendingSyncID,
+		Pending:       toOutboxTraffic(m.pendingTraffic),
+		Queued:        toOutboxTraffic(m.queuedTraffic),
 	})
 }
 
@@ -231,6 +348,12 @@ func (m *NodeSyncManager) performSync() {
 	}
 
 	m.mu.Lock()
+	if m.outboxLoadError != nil {
+		err := m.outboxLoadError
+		m.mu.Unlock()
+		m.recordSyncFailure(fmt.Sprintf("traffic outbox unavailable: %v", err))
+		return
+	}
 	if len(m.auths) == 0 {
 		m.mu.Unlock()
 		return
@@ -242,19 +365,33 @@ func (m *NodeSyncManager) performSync() {
 		m.queuedTraffic = make(map[string]trafficStats)
 	}
 
-	// 1. 收集新增流量到队列。已发送但尚未确认的批次保持原样，避免请求超时后
-	//    主节点已记账而从节点重试时把后续流量一并重复上报。
+	// 1. 收集新增流量到队列。TakeTraffic 只会在 outbox 检查点成功后清零，
+	//    因此进程在 Reset/写盘边界崩溃时不会形成未持久化的丢失窗口。
 	for _, auth := range m.auths {
 		for _, st := range auth.ListUsers() {
-			sent, recv := st.ResetTraffic()
-			if sent == 0 && recv == 0 {
-				continue
-			}
 			hash := st.Hash()
-			queued := m.queuedTraffic[hash]
-			queued.Up += recv   // 客户端上传 = 节点接收
-			queued.Down += sent // 客户端下载 = 节点发送
-			m.queuedTraffic[hash] = queued
+			_, _, err := st.TakeTraffic(func(sent, recv uint64) error {
+				queued, existed := m.queuedTraffic[hash]
+				if queued.Up > ^uint64(0)-recv || queued.Down > ^uint64(0)-sent {
+					return fmt.Errorf("traffic aggregation overflow for user %s", hash)
+				}
+				updated := trafficStats{Up: queued.Up + recv, Down: queued.Down + sent}
+				m.queuedTraffic[hash] = updated
+				if err := m.persistOutboxLocked(); err != nil {
+					if existed {
+						m.queuedTraffic[hash] = queued
+					} else {
+						delete(m.queuedTraffic, hash)
+					}
+					return fmt.Errorf("checkpoint traffic for user %s: %w", hash, err)
+				}
+				return nil
+			})
+			if err != nil {
+				m.mu.Unlock()
+				m.recordSyncFailure(err.Error())
+				return
+			}
 		}
 	}
 
@@ -267,20 +404,31 @@ func (m *NodeSyncManager) performSync() {
 			m.recordSyncFailure(fmt.Sprintf("failed to generate idempotency key: %v", err))
 			return
 		}
-		m.pendingTraffic = m.queuedTraffic
+		oldQueued := m.queuedTraffic
+		m.pendingTraffic = oldQueued
 		m.queuedTraffic = make(map[string]trafficStats)
 		m.pendingSyncID = syncID
+		if err := m.persistOutboxLocked(); err != nil {
+			m.pendingTraffic = make(map[string]trafficStats)
+			m.queuedTraffic = oldQueued
+			m.pendingSyncID = ""
+			m.mu.Unlock()
+			m.recordSyncFailure(fmt.Sprintf("failed to freeze traffic outbox batch: %v", err))
+			return
+		}
 	}
 
-	// 没有流量时仍同步用户哈希，但请求使用独立随机键，避免与流量批次语义混用。
-	if m.pendingSyncID == "" {
+	// 没有流量时仍同步用户哈希，但请求使用独立随机键。空流量请求不写 outbox，
+	// 因为它不产生计费副作用。
+	requestSyncID := m.pendingSyncID
+	if requestSyncID == "" {
 		syncID, err := newSyncID()
 		if err != nil {
 			m.mu.Unlock()
 			m.recordSyncFailure(fmt.Sprintf("failed to generate idempotency key: %v", err))
 			return
 		}
-		m.pendingSyncID = syncID
+		requestSyncID = syncID
 	}
 
 	// 复制固定批次；请求期间继续产生的流量会留在 queuedTraffic，等待下一次确认后发送。
@@ -288,7 +436,7 @@ func (m *NodeSyncManager) performSync() {
 	for hash, traffic := range m.pendingTraffic {
 		trafficMap[hash] = traffic
 	}
-	syncID := m.pendingSyncID
+	syncID := requestSyncID
 	m.mu.Unlock()
 
 	// 2. 发送请求给主节点
@@ -335,32 +483,33 @@ func (m *NodeSyncManager) performSync() {
 		m.recordSyncFailure(fmt.Sprintf("failed to decode response: %v", err))
 		return
 	}
-	m.recordSyncSuccess()
-
-	// 主节点已明确返回成功：只移除刚刚发送的快照，保留请求期间新加入的流量。
-	m.mu.Lock()
-	for hash, sent := range trafficMap {
-		pending := m.pendingTraffic[hash]
-		if pending.Up < sent.Up || pending.Down < sent.Down {
-			log.Warnf("node sync performSync: pending traffic changed unexpectedly for user %s; retaining for retry", hash)
-			continue
-		}
-		pending.Up -= sent.Up
-		pending.Down -= sent.Down
-		if pending.Up == 0 && pending.Down == 0 {
-			delete(m.pendingTraffic, hash)
-		} else {
-			m.pendingTraffic[hash] = pending
-		}
+	if err := validateUserHashes(respBody.Users); err != nil {
+		m.recordSyncFailure(fmt.Sprintf("master returned invalid user hashes: %v", err))
+		return
 	}
-	if len(m.pendingTraffic) == 0 {
+
+	// 主节点已明确返回成功：先持久化删除已确认批次，再更新内存状态。
+	// 若删除失败，保留原批次与同步 ID；后续重试由 Master 回执去重。
+	m.mu.Lock()
+	if len(trafficMap) > 0 {
+		oldPending := m.pendingTraffic
+		oldSyncID := m.pendingSyncID
+		m.pendingTraffic = make(map[string]trafficStats)
 		m.pendingSyncID = ""
+		if err := m.persistOutboxLocked(); err != nil {
+			m.pendingTraffic = oldPending
+			m.pendingSyncID = oldSyncID
+			m.mu.Unlock()
+			m.recordSyncFailure(fmt.Sprintf("failed to acknowledge traffic outbox batch: %v", err))
+			return
+		}
 	}
 	m.mu.Unlock()
 
 	// 3. 将最新的哈希列表同步回本地代理
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	auths := append([]statistic.Authenticator(nil), m.auths...)
+	m.mu.Unlock()
 
 	// 建立主节点有效用户哈希的 map
 	masterHashes := make(map[string]bool)
@@ -368,7 +517,7 @@ func (m *NodeSyncManager) performSync() {
 		masterHashes[h] = true
 	}
 
-	for _, auth := range m.auths {
+	for _, auth := range auths {
 		// 获取该 authenticator 目前已有的用户哈希
 		localHashes := make(map[string]bool)
 		for _, u := range auth.ListUsers() {
@@ -376,10 +525,13 @@ func (m *NodeSyncManager) performSync() {
 		}
 
 		// 3.1 删除已失效的用户
+		// L-01: these failures leave the local data plane diverged from the
+		// master (a revoked user can still connect, or a new user cannot), so
+		// they are logged at warning level rather than debug.
 		for h := range localHashes {
 			if !masterHashes[h] {
 				if err := auth.DelUser(h); err != nil {
-					log.Debugf("node sync performSync: failed to delete user hash %s: %v", h, err)
+					log.Warnf("node sync performSync: failed to delete user hash %s, it may still be able to connect until the next sync: %v", h, err)
 				}
 			}
 		}
@@ -388,36 +540,54 @@ func (m *NodeSyncManager) performSync() {
 		for h := range masterHashes {
 			if !localHashes[h] {
 				if err := auth.AddUser(h); err != nil {
-					log.Debugf("node sync performSync: failed to add user hash %s: %v", h, err)
+					log.Warnf("node sync performSync: failed to add user hash %s, it cannot connect until the next sync: %v", h, err)
 				}
 			}
 		}
 	}
 
 	// 4. 将最新的哈希列表同步写入从节点本地 SQLite 数据库作为缓存，以保障从节点断电/重启后的离线代理可用性
-	if m.db != nil {
-		m.db.Transaction(func(tx *gorm.DB) error {
+	m.mu.Lock()
+	db := m.db
+	m.mu.Unlock()
+	if db != nil {
+		if err := db.Transaction(func(tx *gorm.DB) error {
+			var result *gorm.DB
 			if len(respBody.Users) > 0 {
-				tx.Where("hash NOT IN ?", respBody.Users).Delete(&database.User{})
+				result = tx.Where("hash NOT IN ?", respBody.Users).Delete(&database.User{})
 			} else {
-				tx.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&database.User{})
+				result = tx.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&database.User{})
+			}
+			if result.Error != nil {
+				return result.Error
 			}
 
 			for _, h := range respBody.Users {
 				var localU database.User
-				if tx.Where("hash = ?", h).First(&localU).Error != nil {
-					newUser := database.User{
-						Username: "sync-user-" + h[:6],
-						Password: "placeholder-pwd",
-						Hash:     h,
-						Status:   0,
-					}
-					tx.Create(&newUser)
+				err := tx.Where("hash = ?", h).First(&localU).Error
+				if err == nil {
+					continue
+				}
+				if !errors.Is(err, gorm.ErrRecordNotFound) {
+					return err
+				}
+				newUser := database.User{
+					Username: "sync-user-" + h[:6],
+					Password: "placeholder-pwd",
+					Hash:     h,
+					Status:   0,
+				}
+				if err := tx.Create(&newUser).Error; err != nil {
+					return err
 				}
 			}
 			return nil
-		})
+		}); err != nil {
+			m.recordSyncFailure(fmt.Sprintf("failed to update local user cache: %v", err))
+			return
+		}
 	}
+	m.recordSyncSuccess()
 }
 
 // heartbeatLoop sends lightweight heartbeats to the master every 30 seconds.

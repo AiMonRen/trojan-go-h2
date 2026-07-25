@@ -14,6 +14,9 @@ type TrafficMeter interface {
 	io.Closer
 	Hash() string
 	AddTraffic(sent, recv int)
+	AddTraffic64(sent, recv uint64)
+	SubtractTraffic(sent, recv uint64)
+	TakeTraffic(checkpoint func(sent, recv uint64) error) (sent, recv uint64, err error)
 	GetTraffic() (sent, recv uint64)
 	SetTraffic(sent, recv uint64)
 	ResetTraffic() (sent, recv uint64)

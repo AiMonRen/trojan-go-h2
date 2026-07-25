@@ -2,6 +2,7 @@ package actions
 
 import (
 	cryptorand "crypto/rand"
+	"errors"
 	"fmt"
 	"math/big"
 	mathrand "math/rand"
@@ -104,11 +105,12 @@ func InitDeployMaster() {
 
 	configPath := filepath.Join(deployPath, "config.yaml")
 	if _, err := os.Stat(configPath); err == nil {
-		fmt.Println("\033[33m检测到配置文件已存在，继续操作将覆盖它。\033[0m")
-		ans := getStdin("是否继续？(y/n): ", "Continue? (y/n): ")
-		if ans != "y" && ans != "Y" {
-			return
-		}
+		fmt.Println("\033[31m检测到现有部署。为避免二进制、配置和服务进入新旧混合状态，初始化部署拒绝直接覆盖。\033[0m")
+		fmt.Println("请准备带 SHA-256 校验的升级清单，并使用：trojan upgrade --manifest /path/to/upgrade.json")
+		return
+	} else if !errors.Is(err, os.ErrNotExist) {
+		fmt.Printf("\033[31m检查现有部署失败: %v\033[0m\n", err)
+		return
 	}
 
 	title := "=== 初始化部署（主节点） ==="
@@ -271,20 +273,22 @@ func InitDeployMaster() {
 
 	// ─── Docker MySQL 部署 (如果适用) ────────────────────────────
 	if deployDockerMySQL {
-		// 检测并自动安装 Docker
+		// 检测 Docker，如果不存在则打印分发行安装指引而非远程执行脚本
 		if err := exec.Command("docker", "--version").Run(); err != nil {
-			fmt.Println("\033[33m未检测到 Docker，正在为您自动安装 Docker...\033[0m")
-			installCmd := exec.Command("sh", "-c", "curl -fsSL https://get.docker.com | sh")
-			installCmd.Stdout = os.Stdout
-			installCmd.Stderr = os.Stderr
-			if err := installCmd.Run(); err != nil {
-				fmt.Printf("\033[31m❌ 自动安装 Docker 失败: %v，请手动安装后重试！\033[0m\n", err)
-				return
-			}
-			// 启动并使能 Docker
-			_ = runCmd("systemctl", "start", "docker")
-			_ = runCmd("systemctl", "enable", "docker")
-			fmt.Println("\033[32m✓ Docker 安装并启动成功！\033[0m")
+			fmt.Println("\033[33m未检测到 Docker。请通过发行版官方仓库安装 Docker 后重试：\033[0m")
+			fmt.Println("")
+			fmt.Println("  Ubuntu / Debian:")
+			fmt.Println("    sudo apt-get update && sudo apt-get install -y docker.io")
+			fmt.Println("    sudo systemctl enable --now docker")
+			fmt.Println("")
+			fmt.Println("  CentOS / RHEL / Fedora:")
+			fmt.Println("    sudo dnf install -y docker-ce  # 或 docker")
+			fmt.Println("    sudo systemctl enable --now docker")
+			fmt.Println("")
+			fmt.Println("  或参考官方文档: https://docs.docker.com/engine/install/")
+			fmt.Println("")
+			fmt.Println("\033[31m❌ Docker 不可用，已跳过 MySQL 容器部署。\033[0m")
+			return
 		}
 
 		fmt.Printf("\n正在部署 Docker MySQL 容器 (端口 %d, 库名 %s)...\n", mysqlPort, mysqlDB)
@@ -463,11 +467,12 @@ func InitDeployWorker() {
 
 	configPath := filepath.Join(deployPath, "config.yaml")
 	if _, err := os.Stat(configPath); err == nil {
-		fmt.Println("\033[33m检测到从节点配置文件已存在，继续操作将覆盖它。\033[0m")
-		ans := getStdin("是否继续？(y/n): ", "Continue? (y/n): ")
-		if ans != "y" && ans != "Y" {
-			return
-		}
+		fmt.Println("\033[31m检测到现有 Worker 部署。初始化部署拒绝直接覆盖，以免留下新旧混合状态。\033[0m")
+		fmt.Println("请准备带 SHA-256 校验的升级清单，并使用：trojan upgrade --manifest /path/to/upgrade.json")
+		return
+	} else if !errors.Is(err, os.ErrNotExist) {
+		fmt.Printf("\033[31m检查现有 Worker 部署失败: %v\033[0m\n", err)
+		return
 	}
 
 	title := "=== 初始化部署（从节点） ==="

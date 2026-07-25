@@ -1,7 +1,7 @@
 name: Test
 on:
   push:
-    branches: [master]
+    branches: [master, singbox+vl+hy2+tj, buildtest]
     paths:
       - "**/*.go"
       - "go.mod"
@@ -9,7 +9,7 @@ on:
       - ".github/workflows/test.yml"
   pull_request:
     types: [opened, synchronize, reopened]
-    branches: [master]
+    branches: [master, singbox+vl+hy2+tj, buildtest]
     paths:
       - "**/*.go"
       - "go.mod"

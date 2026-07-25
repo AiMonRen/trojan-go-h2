@@ -4,7 +4,6 @@ import (
 	"net"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/voidluo/trojan-go/internal/database"
@@ -121,18 +120,28 @@ func (s *AdminServer) registerControlRoutes(r *gin.Engine, includeLegacy bool) {
 }
 
 func (s *AdminServer) registerInternalControlRoutes(r *gin.Engine) {
-	internal := r.Group("/internal/control/v1", s.requireLoopbackControl())
+	internal := r.Group("/internal/control/v1", s.requireInternalControl())
 	internal.POST("/nodes/sync", s.handleNodeSync)
 	internal.POST("/nodes/heartbeat", s.handleNodeHeartbeat)
 	internal.POST("/hysteria/auth", s.handleHysteriaAuth)
 	internal.POST("/data-plane/traffic", s.handleDataPlaneTraffic)
 }
 
-func (s *AdminServer) requireLoopbackControl() gin.HandlerFunc {
+// requireInternalControl verifies that the request originates from a
+// loopback address AND carries the correct shared internal API token.
+// The token is always provisioned during server startup; the empty-token
+// fast path exists only for test fixtures that directly construct an
+// AdminServer struct without going through newAdminServer.
+func (s *AdminServer) requireInternalControl() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		host, _, err := net.SplitHostPort(c.Request.RemoteAddr)
 		if err != nil || (host != "127.0.0.1" && host != "::1") {
 			c.JSON(http.StatusForbidden, gin.H{"error": "internal control endpoint requires loopback origin"})
+			c.Abort()
+			return
+		}
+		if s.internalToken != "" && c.GetHeader("X-Internal-Token") != s.internalToken {
+			c.JSON(http.StatusForbidden, gin.H{"error": "invalid internal service token"})
 			c.Abort()
 			return
 		}
@@ -154,7 +163,9 @@ func (s *AdminServer) requireAdminOrNode() gin.HandlerFunc {
 
 		ts := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
 		if ts == "" {
-			ts = c.Query("token")
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "身份凭证无效"})
+			c.Abort()
+			return
 		}
 
 		token, err := s.verifyJWT(ts)
@@ -167,13 +178,12 @@ func (s *AdminServer) requireAdminOrNode() gin.HandlerFunc {
 			return
 		}
 
-		if lastNano := s.lastActiveNano.Load(); lastNano != 0 && time.Since(time.Unix(0, lastNano)) > 30*time.Minute {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "会话已过期，请重新登录"})
-			c.Abort()
+		// Per-session idle timeout. The jti claim is mandatory; see
+		// enforceSessionIdleTimeout for why tokens without it are rejected.
+		if !s.enforceSessionIdleTimeout(c, token) {
 			return
 		}
 
-		s.lastActiveNano.Store(time.Now().UnixNano())
 		c.Next()
 	}
 }

@@ -6,6 +6,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"time"
+
+	"github.com/voidluo/trojan-go/internal/webserver"
 )
 
 type deploymentRole string
@@ -41,11 +43,60 @@ func deploymentServiceDescriptions(role deploymentRole) deploymentServices {
 	}
 }
 
+// serviceSandboxDirectives returns systemd security hardening directives
+// suitable for services that do not need to modify system state.
+//
+// KNOWN LIMITATION (M-12): every generated unit still runs as root. There is no
+// `User=`/`Group=` and no `DynamicUser=`, so these directives reduce the blast
+// radius of a compromised service but do NOT give it a non-root identity. What
+// is actually enforced today:
+//   - NoNewPrivileges, ProtectSystem=strict, ProtectHome, PrivateTmp
+//   - RestrictAddressFamilies limited to AF_INET/AF_INET6/AF_UNIX
+//   - an empty CapabilityBoundingSet for backend services, and only
+//     CAP_NET_BIND_SERVICE for the public Gateway (and Hysteria2)
+//   - ReadWritePaths narrowed to the deployment directory and the internal token
+//     directory, everything else under ProtectSystem=strict stays read-only
+//
+// This is a mitigation, not a fix. A root-level code-execution bug in any of
+// these services is still root on the host. Dropping privileges is squarely
+// within this installer's scope — it already writes the units, creates the
+// directories and sets their permissions — so the remaining work is deployment
+// code, not an external ops task:
+//  1. preferred: `DynamicUser=yes` together with `StateDirectory=`/`LogsDirectory=`
+//     so systemd owns the identity and the writable state;
+//  2. if the shared certificate/database permissions make DynamicUser awkward:
+//     an idempotent `useradd --system trojan-go` in the installer, explicit
+//     `User=trojan-go`/`Group=trojan-go` in each unit, chown of deployPath and
+//     /var/lib/trojan-go, and CAP_NET_BIND_SERVICE kept only on the Gateway.
+//
+// Until one of those lands, treat these services as root services when
+// assessing risk.
+func serviceSandboxDirectives(bindLowPort bool, readWritePaths ...string) string {
+	dirs := "NoNewPrivileges=true\nProtectSystem=strict\nProtectHome=true\nPrivateTmp=true\nRestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX\n"
+	if bindLowPort {
+		dirs += "AmbientCapabilities=CAP_NET_BIND_SERVICE\nCapabilityBoundingSet=CAP_NET_BIND_SERVICE\n"
+	} else {
+		dirs += "CapabilityBoundingSet=\n"
+	}
+	for _, path := range readWritePaths {
+		dirs += fmt.Sprintf("ReadWritePaths=%s\n", path)
+	}
+	return dirs
+}
+
 // deploymentUnitContents creates all unit files without writing to the host.
 // Rendering units in one place keeps Master and Worker dependency ordering
-// explicit and prevents the public Gateway from starting before private backends.
+// explicit and prevents the public Gateway from starting before private
+// backends. See serviceSandboxDirectives for the M-12 privilege limitation that
+// applies to every unit rendered here.
 func deploymentUnitContents(role deploymentRole, deployPath string, hysteriaEnabled bool) map[string]string {
 	descriptions := deploymentServiceDescriptions(role)
+	// All services need read access to the shared internal API token file.
+	// admin-service also creates it on first start; other services only read it.
+	tokenDir := filepath.Dir("/var/lib/trojan-go/internal-token")
+	sandbox := serviceSandboxDirectives(false, deployPath, tokenDir)
+	gatewaySandbox := serviceSandboxDirectives(true, deployPath, tokenDir)
+
 	units := map[string]string{
 		"trojan-data-plane.service": fmt.Sprintf(`[Unit]
 Description=%s
@@ -57,10 +108,10 @@ LimitNOFILE=65536
 ExecStart=/usr/bin/trojan-go -config %s
 Restart=on-failure
 RestartSec=10s
-
+%s
 [Install]
 WantedBy=multi-user.target
-`, descriptions.DataPlane, filepath.Join(deployPath, "config.yaml")),
+`, descriptions.DataPlane, filepath.Join(deployPath, "config.yaml"), sandbox),
 	}
 
 	if role == deploymentWorker {
@@ -74,10 +125,10 @@ LimitNOFILE=65536
 ExecStart=/usr/bin/trojan-go control-service -worker -config %s -listen 127.0.0.1:%d
 Restart=on-failure
 RestartSec=10s
-
+%s
 [Install]
 WantedBy=multi-user.target
-`, descriptions.Control, filepath.Join(deployPath, "web_config.yaml"), defaultControlServicePort)
+`, descriptions.Control, filepath.Join(deployPath, "web_config.yaml"), defaultControlServicePort, sandbox)
 		units["gateway-service.service"] = fmt.Sprintf(`[Unit]
 Description=%s
 After=network.target control-service.service trojan-data-plane.service
@@ -89,10 +140,10 @@ LimitNOFILE=65536
 ExecStart=/usr/bin/trojan-go gateway-service -config %s
 Restart=on-failure
 RestartSec=10s
-
+%s
 [Install]
 WantedBy=multi-user.target
-`, descriptions.Gateway, filepath.Join(deployPath, "gateway.yaml"))
+`, descriptions.Gateway, filepath.Join(deployPath, "gateway.yaml"), gatewaySandbox)
 	} else {
 		units["admin-service.service"] = fmt.Sprintf(`[Unit]
 Description=%s
@@ -104,10 +155,10 @@ LimitNOFILE=65536
 ExecStart=/usr/bin/trojan-go admin-service -config %s -listen 127.0.0.1:%d
 Restart=on-failure
 RestartSec=10s
-
+%s
 [Install]
 WantedBy=multi-user.target
-`, descriptions.Admin, filepath.Join(deployPath, "web_config.yaml"), defaultAdminServicePort)
+`, descriptions.Admin, filepath.Join(deployPath, "web_config.yaml"), defaultAdminServicePort, sandbox)
 		units["control-service.service"] = fmt.Sprintf(`[Unit]
 Description=%s
 After=network.target admin-service.service
@@ -119,10 +170,10 @@ LimitNOFILE=65536
 ExecStart=/usr/bin/trojan-go control-service -listen 127.0.0.1:%d -admin 127.0.0.1:%d
 Restart=on-failure
 RestartSec=10s
-
+%s
 [Install]
 WantedBy=multi-user.target
-`, descriptions.Control, defaultControlServicePort, defaultAdminServicePort)
+`, descriptions.Control, defaultControlServicePort, defaultAdminServicePort, sandbox)
 		units["gateway-service.service"] = fmt.Sprintf(`[Unit]
 Description=%s
 After=network.target admin-service.service control-service.service trojan-data-plane.service
@@ -134,13 +185,14 @@ LimitNOFILE=65536
 ExecStart=/usr/bin/trojan-go gateway-service -config %s
 Restart=on-failure
 RestartSec=10s
-
+%s
 [Install]
 WantedBy=multi-user.target
-`, descriptions.Gateway, filepath.Join(deployPath, "gateway.yaml"))
+`, descriptions.Gateway, filepath.Join(deployPath, "gateway.yaml"), gatewaySandbox)
 	}
 
 	if hysteriaEnabled {
+		hysteriaSandbox := serviceSandboxDirectives(true, deployPath)
 		units["hysteria.service"] = fmt.Sprintf(`[Unit]
 Description=%s
 After=network.target control-service.service
@@ -151,10 +203,10 @@ Type=simple
 ExecStart=/usr/local/bin/hysteria server -c %s
 Restart=on-failure
 RestartSec=10s
-
+%s
 [Install]
 WantedBy=multi-user.target
-`, descriptions.Hysteria, filepath.Join(deployPath, "hysteria.yaml"))
+`, descriptions.Hysteria, filepath.Join(deployPath, "hysteria.yaml"), hysteriaSandbox)
 	}
 	return units
 }
@@ -243,6 +295,14 @@ func installDeploymentBinaries(deployPath, tlsDir, certificatePath, privateKeyPa
 }
 
 func configureAndStartDeployment(role deploymentRole, deployPath string, hysteriaEnabled bool, renewalConfig certificateRenewalConfig) error {
+	// Pre-create the shared internal service token before any service unit is
+	// started. All same-host services (admin/control/data-plane) authenticate
+	// loopback calls with this token; since every service now fails closed when
+	// the token is missing, the installer must establish it up front. The parent
+	// directory is created 0700 and the file 0600 by LoadOrCreateInternalToken.
+	if _, err := webserver.LoadOrCreateInternalToken(webserver.DefaultInternalTokenPath); err != nil {
+		return fmt.Errorf("provision internal service token: %w", err)
+	}
 	if err := writeDeploymentUnits("/etc/systemd/system", role, deployPath, hysteriaEnabled); err != nil {
 		return err
 	}
@@ -262,8 +322,8 @@ func configureAndStartDeployment(role deploymentRole, deployPath string, hysteri
 		if err := runCmd("systemctl", "enable", service); err != nil {
 			return fmt.Errorf("enable %s: %w", service, err)
 		}
-		if err := runCmd("systemctl", "start", service); err != nil {
-			return fmt.Errorf("start %s: %w", service, err)
+		if err := runCmd("systemctl", "restart", service); err != nil {
+			return fmt.Errorf("restart %s: %w", service, err)
 		}
 	}
 

@@ -14,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -36,6 +35,9 @@ const (
 	adminRequestLimit   = 240
 	adminRequestWindow  = time.Minute
 	maxRateLimitEntries = 10000
+	// sessionIdleTimeout bounds how long a management session may stay idle
+	// before it must re-authenticate, independent of the JWT exp claim.
+	sessionIdleTimeout = 30 * time.Minute
 )
 
 type rateLimitEntry struct {
@@ -58,10 +60,19 @@ type AdminServer struct {
 	connChan chan net.Conn
 	done     chan struct{}
 
-	lastActiveNano atomic.Int64 // 后端会话活动时间（Unix 纳秒），用于超时注销，原子操作防 Data Race
+	// jwtSecretMu protects concurrent reads during JWT verification and
+	// writes during administrator password changes.
+	jwtSecretMu sync.RWMutex
+	jwtSecret   []byte
 
-	// jwtSecret 启动时自动生成的 32 字节高熵随机密钥，专用于 JWT HS256 签名与验证
-	jwtSecret []byte
+	// sessionTimes maps JWT ID (jti claim) to the last access timestamp
+	// for per-session idle timeout enforcement.
+	sessionTimes sync.Map // jti(string) → time.Time
+
+	// internalToken authenticates loopback service-to-service calls (e.g.
+	// control-service → admin-service, data-plane traffic reporting).
+	// Generated once and shared via a well-known file.
+	internalToken string
 
 	// 初始配置（当数据库未设置时作为回退）
 	configUser string
@@ -103,6 +114,45 @@ type AdminServer struct {
 
 // SetAuth 绑定代理核心认证器，并将数据库中已有的用户同步到认证器中。
 // 这是连接 Web 面板（SQLite）与代理核心（内存认证）的关键桥梁。
+// getJWTSecret returns a thread-safe snapshot of the JWT signing key.
+func (s *AdminServer) getJWTSecret() []byte {
+	s.jwtSecretMu.RLock()
+	defer s.jwtSecretMu.RUnlock()
+	return s.jwtSecret
+}
+
+// setJWTSecret atomically replaces the JWT signing key and expires all
+// active sessions.
+func (s *AdminServer) setJWTSecret(secret []byte) {
+	s.jwtSecretMu.Lock()
+	s.jwtSecret = secret
+	s.jwtSecretMu.Unlock()
+	s.sessionTimes.Range(func(key, _ any) bool {
+		s.sessionTimes.Delete(key)
+		return true
+	})
+}
+
+// updateSessionActivity records that the session identified by jti has
+// been active at the current time.
+func (s *AdminServer) updateSessionActivity(jti string) {
+	s.sessionTimes.Store(jti, time.Now())
+}
+
+// isSessionExpired returns true when a session has been idle for more
+// than the configured duration.
+func (s *AdminServer) isSessionExpired(jti string, maxIdle time.Duration) bool {
+	value, ok := s.sessionTimes.Load(jti)
+	if !ok {
+		return false // no previous activity, not yet expired
+	}
+	lastSeen, ok := value.(time.Time)
+	if !ok {
+		return true
+	}
+	return time.Since(lastSeen) > maxIdle
+}
+
 func (s *AdminServer) SetAuth(auth statistic.Authenticator) {
 	s.auths = append(s.auths, auth)
 	if err := SyncAuthenticatorFromDatabase(s.db, auth); err != nil {
@@ -174,10 +224,21 @@ func newAdminServer(db *gorm.DB, username, password, mountPath string, port int,
 	if err != nil {
 		log.Fatal("admin panel: load JWT signing secret:", err)
 	}
-	srv.jwtSecret = jwtSecret
+	srv.setJWTSecret(jwtSecret)
 
-	// 初始化会话激活时间，登录后重新计时
-	srv.lastActiveNano.Store(time.Now().UnixNano())
+	// Load or create the internal service-to-service API token. Services on
+	// the same machine (control-service, data-plane) read the same token from
+	// the filesystem and present it with every internal call.
+	//
+	// The installer provisions /var/lib/trojan-go and the token before any
+	// service starts. We fail closed: if the token cannot be loaded or created
+	// we refuse to start rather than fall back to an ephemeral token, which
+	// would silently break authentication for peer services reading the file.
+	internalToken, err := LoadOrCreateInternalToken(DefaultInternalTokenPath)
+	if err != nil {
+		log.Fatal("admin panel: internal service token required but unavailable:", err)
+	}
+	srv.internalToken = internalToken
 
 	if isNode {
 		if mgr := nodesync.GetManager(); mgr != nil {
@@ -186,12 +247,12 @@ func newAdminServer(db *gorm.DB, username, password, mountPath string, port int,
 	}
 
 	gin.SetMode(gin.ReleaseMode)
-	r := gin.New()
+	r := newTrustedGinEngine()
 	srv.registerRoutes(r, mountPath)
 	srv.handler = r
 
 	if startWorkers {
-		srv.workers.Add(2)
+		srv.workers.Add(3)
 		go func() {
 			defer srv.workers.Done()
 			srv.resetTrafficWorker()
@@ -200,9 +261,13 @@ func newAdminServer(db *gorm.DB, username, password, mountPath string, port int,
 			defer srv.workers.Done()
 			srv.trafficSyncWorker()
 		}()
+		go func() {
+			defer srv.workers.Done()
+			srv.receiptCleanupWorker()
+		}()
 
 		// Consume decrypted connections routed from the TLS layer.
-		srv.httpServer = &http.Server{Handler: r}
+		srv.httpServer = newHTTPServer(r)
 		go func() {
 			if err := srv.httpServer.Serve(srv); err != nil && err != http.ErrServerClosed && srv.doneOpen() {
 				log.Error("admin panel: TLS-shared HTTP server failed:", err)
@@ -219,7 +284,7 @@ func newAdminServer(db *gorm.DB, username, password, mountPath string, port int,
 			log.Error("admin panel: standalone port listener failed:", err)
 		} else {
 			srv.standaloneListener = listener
-			srv.standaloneServer = &http.Server{Handler: r}
+			srv.standaloneServer = newHTTPServer(r)
 			go func() {
 				log.Infof("admin panel: listening on http://%s", listener.Addr())
 				if err := srv.standaloneServer.Serve(listener); err != nil && err != http.ErrServerClosed && srv.doneOpen() {

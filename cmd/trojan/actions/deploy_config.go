@@ -17,21 +17,23 @@ const (
 // deploymentDataPlaneConfig is the installer-owned representation of the
 // loopback-only Trojan data-plane config.yaml.
 type deploymentDataPlaneConfig struct {
-	RunType          string                    `yaml:"run_type"`
-	LocalAddr        string                    `yaml:"local_addr"`
-	LocalPort        int                       `yaml:"local_port"`
-	RemoteAddr       string                    `yaml:"remote_addr"`
-	RemotePort       int                       `yaml:"remote_port"`
-	DisableHTTPCheck bool                      `yaml:"disable_http_check"`
-	AuthDB           string                    `yaml:"auth_db"`
-	AuthRefresh      int                       `yaml:"auth_refresh"`
-	TrafficReport    string                    `yaml:"traffic_report,omitempty"`
-	TrafficInterval  int                       `yaml:"traffic_interval,omitempty"`
-	ProxyProtocol    bool                      `yaml:"proxy_protocol"`
-	TransportPlugin  deploymentTransportPlugin `yaml:"transport_plugin"`
-	Mux              deploymentMuxConfig       `yaml:"mux"`
-	Node             *deploymentNodeConfig     `yaml:"node,omitempty"`
-	Log              deploymentLogConfig       `yaml:"log"`
+	RunType           string                    `yaml:"run_type"`
+	LocalAddr         string                    `yaml:"local_addr"`
+	LocalPort         int                       `yaml:"local_port"`
+	RemoteAddr        string                    `yaml:"remote_addr"`
+	RemotePort        int                       `yaml:"remote_port"`
+	DisableHTTPCheck  bool                      `yaml:"disable_http_check"`
+	AuthDB            string                    `yaml:"auth_db"`
+	AuthRefresh       int                       `yaml:"auth_refresh"`
+	TrafficReport     string                    `yaml:"traffic_report,omitempty"`
+	TrafficInterval   int                       `yaml:"traffic_interval,omitempty"`
+	TrafficOutbox     string                    `yaml:"traffic_outbox,omitempty"`
+	InternalTokenPath string                    `yaml:"internal_token_path,omitempty"`
+	ProxyProtocol     bool                      `yaml:"proxy_protocol"`
+	TransportPlugin   deploymentTransportPlugin `yaml:"transport_plugin"`
+	Mux               deploymentMuxConfig       `yaml:"mux"`
+	Node              *deploymentNodeConfig     `yaml:"node,omitempty"`
+	Log               deploymentLogConfig       `yaml:"log"`
 }
 
 type deploymentTransportPlugin struct {
@@ -54,10 +56,11 @@ type deploymentAdminConfig struct {
 }
 
 type deploymentNodeConfig struct {
-	Enabled      bool   `yaml:"enabled"`
-	MasterURL    string `yaml:"master_url"`
-	Secret       string `yaml:"secret"`
-	SyncInterval int    `yaml:"sync_interval"`
+	Enabled       bool   `yaml:"enabled"`
+	MasterURL     string `yaml:"master_url"`
+	Secret        string `yaml:"secret"`
+	SyncInterval  int    `yaml:"sync_interval"`
+	TrafficOutbox string `yaml:"traffic_outbox,omitempty"`
 }
 
 type deploymentLogConfig struct {
@@ -201,6 +204,11 @@ func buildWorkerProxyConfig(input deploymentCoreConfigInput) ([]byte, error) {
 		return nil, fmt.Errorf("worker data-plane configuration requires node synchronization settings")
 	}
 	input = normalizeDeploymentPorts(input)
+	node := *input.Node
+	input.Node = &node
+	if input.Node.TrafficOutbox == "" {
+		input.Node.TrafficOutbox = filepath.Join(input.DeployPath, "state", "worker-traffic-outbox.json")
+	}
 	input.TrafficReporting = false
 	return marshalDeploymentYAML(newDeploymentDataPlaneConfig(input))
 }
@@ -228,6 +236,8 @@ func newDeploymentDataPlaneConfig(input deploymentCoreConfigInput) deploymentDat
 	if input.TrafficReporting {
 		cfg.TrafficReport = fmt.Sprintf("http://127.0.0.1:%d/internal/control/v1/data-plane/traffic", input.AdminPort)
 		cfg.TrafficInterval = 30
+		cfg.TrafficOutbox = filepath.Join(input.DeployPath, "state", "data-plane-traffic-outbox.json")
+		cfg.InternalTokenPath = "/var/lib/trojan-go/internal-token"
 	}
 	return cfg
 }

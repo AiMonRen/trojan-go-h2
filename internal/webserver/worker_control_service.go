@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"net/http"
 	"path/filepath"
 
 	"github.com/gin-gonic/gin"
@@ -17,6 +16,12 @@ import (
 // persistent store is the Worker cache database already present on that node;
 // it never opens or writes the Master database.
 func RunWorkerControlService(configPath, listenAddress string) error {
+	if err := requireLoopbackAddress(listenAddress, "worker control-service"); err != nil {
+		return err
+	}
+	if err := ValidateWorkerControlServiceConfig(configPath); err != nil {
+		return err
+	}
 	if abs, err := filepath.Abs(configPath); err == nil {
 		WebConfigPath = abs
 	} else {
@@ -35,13 +40,13 @@ func RunWorkerControlService(configPath, listenAddress string) error {
 	}
 	srv := newAdminServer(db, cfg.Admin.Username, cfg.Admin.Password, cfg.Admin.Path, 0, false, "", false, true, "", cfg.Admin.SubPath, "", false)
 	gin.SetMode(gin.ReleaseMode)
-	r := gin.New()
+	r := newTrustedGinEngine()
 	srv.registerRoutesForMode(r, cfg.Admin.Path, RouteModeControl)
 	listener, err := net.Listen("tcp", listenAddress)
 	if err != nil {
 		return fmt.Errorf("监听 Worker control-service 失败: %w", err)
 	}
-	httpServer := &http.Server{Handler: r}
+	httpServer := newHTTPServer(r)
 	log.Infof("worker control-service started on http://%s using existing cache database %s", listener.Addr(), cfg.Admin.DBPath)
 	go func() {
 		<-common.ShutdownContext().Done()

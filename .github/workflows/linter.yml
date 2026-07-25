@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - master
+      - singbox+vl+hy2+tj
+      - buildtest
     paths:
       - "**/*.go"
       - ".github/workflows/linter.yml"
@@ -12,6 +14,8 @@ on:
     types: [opened, synchronize, reopened]
     branches:
       - master
+      - singbox+vl+hy2+tj
+      - buildtest
     paths:
       - "**/*.go"
       - ".github/workflows/linter.yml"
@@ -22,11 +26,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout codebase
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v2
+        uses: golangci/golangci-lint-action@v6
         with:
-          version: latest
+          version: v1.64
           args: --config=.github/linters/.golangci.yml
           only-new-issues: true

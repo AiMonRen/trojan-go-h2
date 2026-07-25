@@ -27,6 +27,10 @@ func TestMain(m *testing.M) {
 	if err := database.EnsureCredentialKey(); err != nil {
 		panic(err)
 	}
+	// Redirect the internal-token path to a writable temp location so tests
+	// that construct an AdminServer can provision the token without touching
+	// /var/lib/trojan-go. Production keeps the default path and fails closed.
+	DefaultInternalTokenPath = filepath.Join(dir, "internal-token")
 	code := m.Run()
 	_ = os.RemoveAll(dir)
 	os.Exit(code)

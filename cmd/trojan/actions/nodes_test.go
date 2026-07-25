@@ -2,6 +2,7 @@ package actions
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -15,9 +16,71 @@ func setupTestDB(t *testing.T) func() {
 	t.Helper()
 	originalDBPath := dbPath
 	t.Setenv("TROJAN_CREDENTIAL_KEY_FILE", filepath.Join(t.TempDir(), "credentials.key"))
+	if err := database.EnsureCredentialKey(); err != nil {
+		t.Fatalf("ensure credential key: %v", err)
+	}
+	t.Setenv("TROJAN_DB", "test-managed")
 	dbPath = filepath.Join(t.TempDir(), "nodes.db")
 	return func() {
 		dbPath = originalDBPath
+	}
+}
+
+func withStdin(t *testing.T, input string, action func()) {
+	t.Helper()
+	oldStdin := os.Stdin
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create stdin pipe: %v", err)
+	}
+	os.Stdin = r
+	if _, err := w.Write([]byte(input)); err != nil {
+		t.Fatalf("write stdin: %v", err)
+	}
+	_ = w.Close()
+	action()
+	os.Stdin = oldStdin
+	_ = r.Close()
+}
+
+func TestNodeAddRejectsInvalidTrafficRate(t *testing.T) {
+	teardownTestDB := setupTestDB(t)
+	defer teardownTestDB()
+
+	db, err := database.InitDb(dbPath)
+	if err != nil {
+		t.Fatalf("init database: %v", err)
+	}
+	withStdin(t, "invalid-rate\ninvalid.example.com\n443\n-1\n", NodeAdd)
+
+	var count int64
+	if err := db.Model(&database.Node{}).Count(&count).Error; err != nil {
+		t.Fatalf("count nodes: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("invalid traffic rate created %d nodes", count)
+	}
+}
+
+func TestNodeModifyRejectsInvalidTrafficRate(t *testing.T) {
+	teardownTestDB := setupTestDB(t)
+	defer teardownTestDB()
+
+	db, err := database.InitDb(dbPath)
+	if err != nil {
+		t.Fatalf("init database: %v", err)
+	}
+	node := database.Node{Name: "worker", Address: "worker.example.com", Port: 443, TrafficRate: 1}
+	if err := db.Create(&node).Error; err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+	withStdin(t, fmt.Sprintf("%d\n\n\n\n0\n", node.ID), NodeModify)
+
+	if err := db.First(&node, node.ID).Error; err != nil {
+		t.Fatalf("reload node: %v", err)
+	}
+	if node.TrafficRate != 1 {
+		t.Fatalf("invalid traffic rate was persisted: %v", node.TrafficRate)
 	}
 }
 

@@ -41,20 +41,30 @@ func (s *AdminServer) handleDataPlaneTraffic(c *gin.Context) {
 		if result.RowsAffected == 0 {
 			return nil
 		}
+
+		increments := make(map[string]trafficIncrement, len(request.Traffic))
 		for hash, traffic := range request.Traffic {
 			if hash == "" {
 				continue
 			}
-			if err := tx.Model(&database.User{}).Where("hash = ?", hash).Updates(map[string]any{
-				"upload":   gorm.Expr("upload + ?", int64(traffic.Up)),
-				"download": gorm.Expr("download + ?", int64(traffic.Down)),
-				"used":     gorm.Expr("used + ?", int64(traffic.Up+traffic.Down)),
-			}).Error; err != nil {
+			increment, err := newTrafficIncrement(traffic.Up, traffic.Down, 1)
+			if err != nil {
+				return err
+			}
+			increments[hash] = increment
+		}
+		for hash, increment := range increments {
+			if err := persistTrafficIncrement(tx, hash, increment); err != nil {
 				return err
 			}
 		}
 		return nil
 	}); err != nil {
+		if isTrafficValueError(err) {
+			log.Warnf("rejected invalid data-plane traffic batch: %v", err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid data-plane traffic values"})
+			return
+		}
 		log.Errorf("persist data-plane traffic batch: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "data-plane traffic persistence failed"})
 		return

@@ -9,10 +9,11 @@ type Config struct {
 }
 
 type NodeConfig struct {
-	Enabled      bool   `json:"enabled" yaml:"enabled"`
-	MasterURL    string `json:"master_url" yaml:"master_url"`
-	Secret       string `json:"secret" yaml:"secret"`
-	SyncInterval int    `json:"sync_interval" yaml:"sync_interval"`
+	Enabled       bool   `json:"enabled" yaml:"enabled"`
+	MasterURL     string `json:"master_url" yaml:"master_url"`
+	Secret        string `json:"secret" yaml:"secret"`
+	SyncInterval  int    `json:"sync_interval" yaml:"sync_interval"`
+	TrafficOutbox string `json:"traffic_outbox" yaml:"traffic_outbox"`
 }
 
 func init() {

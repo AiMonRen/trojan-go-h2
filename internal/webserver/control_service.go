@@ -19,14 +19,27 @@ import (
 // does not open SQLite. All stateful work is forwarded to admin-service through
 // its loopback-only internal API, making admin-service the sole master writer.
 func RunControlService(listenAddress, adminAddress string) error {
+	if err := requireLoopbackAddress(listenAddress, "control-service"); err != nil {
+		return err
+	}
+	if err := requireLoopbackAddress(adminAddress, "control-service admin backend"); err != nil {
+		return err
+	}
 	adminURL, err := url.Parse("http://" + adminAddress)
 	if err != nil || adminURL.Host == "" {
 		return fmt.Errorf("无效 admin-service 内部地址 %q", adminAddress)
 	}
+	// Fail closed: the internal token must exist before control-service starts.
+	// Without it every forwarded call would be rejected by admin-service, so we
+	// refuse to start rather than run in a permanently broken state.
+	token, err := ReadInternalToken(DefaultInternalTokenPath)
+	if err != nil {
+		return fmt.Errorf("control-service 需要内部服务令牌但无法读取: %w", err)
+	}
 	gin.SetMode(gin.ReleaseMode)
-	r := gin.New()
+	r := newTrustedGinEngine()
 	r.Use(gin.Recovery())
-	proxy := newInternalControlProxy(adminURL)
+	proxy := newInternalControlProxy(adminURL, token)
 	control := r.Group("/control/v1")
 	control.POST("/nodes/sync", proxy)
 	control.POST("/nodes/heartbeat", proxy)
@@ -36,7 +49,7 @@ func RunControlService(listenAddress, adminAddress string) error {
 	if err != nil {
 		return fmt.Errorf("监听 control-service 失败: %w", err)
 	}
-	httpServer := &http.Server{Handler: r}
+	httpServer := newHTTPServer(r)
 	log.Infof("control-service started on http://%s forwarding stateful operations to %s", listener.Addr(), adminURL)
 	go func() {
 		<-common.ShutdownContext().Done()
@@ -45,7 +58,7 @@ func RunControlService(listenAddress, adminAddress string) error {
 	return httpServer.Serve(listener)
 }
 
-func newInternalControlProxy(adminURL *url.URL) gin.HandlerFunc {
+func newInternalControlProxy(adminURL *url.URL, token string) gin.HandlerFunc {
 	client := &http.Client{Timeout: controlRequestTimeout}
 	return func(c *gin.Context) {
 		path := strings.TrimPrefix(c.Request.URL.Path, "/control/v1")
@@ -58,7 +71,12 @@ func newInternalControlProxy(adminURL *url.URL) gin.HandlerFunc {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "创建内部控制请求失败"})
 			return
 		}
+		req.Header.Set("X-Internal-Token", token)
 		for key, values := range c.Request.Header {
+			switch http.CanonicalHeaderKey(key) {
+			case "Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-Real-Ip":
+				continue
+			}
 			for _, value := range values {
 				req.Header.Add(key, value)
 			}

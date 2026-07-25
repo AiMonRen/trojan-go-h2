@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/voidluo/trojan-go/internal/secretfile"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 )
@@ -40,12 +41,15 @@ func CredentialKeyPath() string {
 // workflow, never implicitly during normal database initialization.
 func EnsureCredentialKey() error {
 	path := CredentialKeyPath()
-	data, err := os.ReadFile(path)
+	// L-06: an existing key is validated through the same hardened read as
+	// loadCredentialKey, so provisioning cannot bless a symlinked or
+	// foreign-owned key file that the loader would later reject.
+	data, err := secretfile.Read(path)
 	if err == nil {
 		if len(data) != 32 {
 			return fmt.Errorf("credential key %s must contain exactly 32 bytes", path)
 		}
-		return checkCredentialKeyPermissions(path)
+		return nil
 	}
 	if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("read credential key %s: %w", path, err)
@@ -73,37 +77,20 @@ func EnsureCredentialKey() error {
 
 func loadCredentialKey() ([]byte, error) {
 	path := CredentialKeyPath()
-	key, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		if err := EnsureCredentialKey(); err != nil {
-			return nil, fmt.Errorf("provision credential key at %s: %w", path, err)
-		}
-		key, err = os.ReadFile(path)
-	}
+	// L-06: secretfile.Read opens the path once with O_NOFOLLOW and validates
+	// type, mode and owner on the open descriptor, closing the Lstat→ReadFile
+	// TOCTOU window that the previous implementation had.
+	key, err := secretfile.Read(path)
 	if err != nil {
-		return nil, fmt.Errorf("read credential key %s: %w", path, err)
-	}
-	if err := checkCredentialKeyPermissions(path); err != nil {
-		return nil, err
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("credential key file %s is missing; run the installer to provision one, then restore the database-key pair together", path)
+		}
+		return nil, fmt.Errorf("load credential key: %w", err)
 	}
 	if len(key) != 32 {
 		return nil, fmt.Errorf("credential key %s must contain exactly 32 bytes", path)
 	}
 	return key, nil
-}
-
-func checkCredentialKeyPermissions(path string) error {
-	info, err := os.Stat(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return fmt.Errorf("inspect credential key %s: %w", path, err)
-	}
-	if info.Mode().Perm()&0077 != 0 {
-		return fmt.Errorf("credential key %s must be readable only by its owner (mode 0600)", path)
-	}
-	return nil
 }
 
 // EncryptCredential uses AES-256-GCM with a unique nonce and binds the value to

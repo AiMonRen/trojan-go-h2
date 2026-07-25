@@ -306,7 +306,11 @@ func NewServer(ctx context.Context, underlay tunnel.Server) (*Server, error) {
 	}
 
 	if cfg.TrafficReport != "" {
-		reporter, reporterErr := newDataPlaneTrafficReporter(auth, cfg.TrafficReport)
+		if cfg.TrafficOutbox == "" {
+			cancel()
+			return nil, common.NewError("trojan data-plane traffic reporting requires traffic_outbox")
+		}
+		reporter, reporterErr := newDataPlaneTrafficReporter(auth, cfg.TrafficReport, cfg.InternalTokenPath, cfg.TrafficOutbox)
 		if reporterErr != nil {
 			cancel()
 			return nil, common.NewError("trojan data-plane invalid traffic reporting configuration").Base(reporterErr)

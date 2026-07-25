@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
@@ -180,5 +181,42 @@ func TestRegisteredMigrationsNormalizeLegacyRules(t *testing.T) {
 		if !strings.Contains(config.Value, want) {
 			t.Fatalf("migrated rules missing %q:\n%s", want, config.Value)
 		}
+	}
+}
+
+func TestVerifyLockOwnership(t *testing.T) {
+	db := openMigrationTestDB(t)
+	if err := db.AutoMigrate(&MigrationLock{}); err != nil {
+		t.Fatalf("automigrate lock table: %v", err)
+	}
+
+	// Held lease with a valid token and future expiry passes.
+	valid := MigrationLock{Name: migrationLockName, Token: "owner-token", ExpiresAt: time.Now().UTC().Add(migrationLockTTL)}
+	if err := db.Create(&valid).Error; err != nil {
+		t.Fatalf("seed valid lock: %v", err)
+	}
+	if err := verifyLockOwnership(db, "owner-token"); err != nil {
+		t.Fatalf("valid lease should pass: %v", err)
+	}
+
+	// A different token means the lease was taken over.
+	if err := verifyLockOwnership(db, "other-token"); err == nil || !strings.Contains(err.Error(), "taken over") {
+		t.Fatalf("token mismatch should fail with takeover error, got: %v", err)
+	}
+
+	// An expired lease (even with the right token) must fail.
+	if err := db.Model(&MigrationLock{}).Where("name = ?", migrationLockName).Update("expires_at", time.Now().UTC().Add(-time.Minute)).Error; err != nil {
+		t.Fatalf("expire lock: %v", err)
+	}
+	if err := verifyLockOwnership(db, "owner-token"); err == nil || !strings.Contains(err.Error(), "expired") {
+		t.Fatalf("expired lease should fail, got: %v", err)
+	}
+
+	// A missing lease row fails closed.
+	if err := db.Delete(&MigrationLock{}, "name = ?", migrationLockName).Error; err != nil {
+		t.Fatalf("delete lock: %v", err)
+	}
+	if err := verifyLockOwnership(db, "owner-token"); err == nil || !strings.Contains(err.Error(), "lease row missing") {
+		t.Fatalf("missing lease should fail, got: %v", err)
 	}
 }

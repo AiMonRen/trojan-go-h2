@@ -48,6 +48,9 @@ func TestBuildMasterProxyConfigRoundTrip(t *testing.T) {
 	if got.TrafficReport != wantReport || got.TrafficInterval != 30 {
 		t.Fatalf("unexpected master traffic reporting: %+v", got)
 	}
+	if got.TrafficOutbox != "/etc/trojan-go/state/data-plane-traffic-outbox.json" {
+		t.Fatalf("unexpected master traffic outbox: %+v", got)
+	}
 	if got.Node != nil {
 		t.Fatalf("master data-plane must not include node sync: %+v", got.Node)
 	}
@@ -72,6 +75,9 @@ func TestBuildWorkerProxyConfigRoundTrip(t *testing.T) {
 	}
 	if got.Node == nil || got.Node.MasterURL != "https://master.example.com/control/v1/nodes/sync" || got.Node.Secret != "node-secret" {
 		t.Fatalf("unexpected node synchronization config: %+v", got.Node)
+	}
+	if got.Node.TrafficOutbox != "/etc/trojan-go/state/worker-traffic-outbox.json" {
+		t.Fatalf("unexpected worker traffic outbox: %+v", got.Node)
 	}
 	if got.TrafficReport != "" || got.TrafficInterval != 0 {
 		t.Fatalf("worker must report through node sync only: %+v", got)

@@ -1,13 +1,25 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
+	"fmt"
+	"net"
+	"net/url"
 	"os"
+	"path/filepath"
+	"strings"
 
 	_ "github.com/voidluo/trojan-go/component"
+	"github.com/voidluo/trojan-go/config"
+	"github.com/voidluo/trojan-go/internal/nodesync"
 	"github.com/voidluo/trojan-go/internal/webserver"
 	"github.com/voidluo/trojan-go/log"
 	"github.com/voidluo/trojan-go/option"
+	"github.com/voidluo/trojan-go/proxy"
+	"github.com/voidluo/trojan-go/tunnel/transport"
+	"github.com/voidluo/trojan-go/tunnel/trojan"
 )
 
 func serviceArgs(args []string, defaultListen string) (configPath, listenAddress string) {
@@ -23,7 +35,124 @@ func serviceArgs(args []string, defaultListen string) (configPath, listenAddress
 	return configPath, listenAddress
 }
 
+func validateAddress(host string, port int, name string) error {
+	if host == "" || port < 0 || port > 65535 {
+		return fmt.Errorf("invalid %s address %q:%d", name, host, port)
+	}
+	if net.ParseIP(host) == nil && strings.ContainsAny(host, " /\\") {
+		return fmt.Errorf("invalid %s host %q", name, host)
+	}
+	return nil
+}
+
+func validateDataPlaneConfig(configPath string) error {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return fmt.Errorf("read data-plane config: %w", err)
+	}
+	ctx, err := config.WithYAMLConfig(context.Background(), data)
+	if err != nil {
+		return fmt.Errorf("parse data-plane config: %w", err)
+	}
+	proxyCfg, err := config.Require[proxy.Config](ctx, proxy.Name)
+	if err != nil {
+		return err
+	}
+	if strings.ToUpper(proxyCfg.RunType) != "SERVER" {
+		return fmt.Errorf("data-plane run_type must be server, got %q", proxyCfg.RunType)
+	}
+	transportCfg, err := config.Require[transport.Config](ctx, transport.Name)
+	if err != nil {
+		return err
+	}
+	if err := validateAddress(transportCfg.LocalHost, transportCfg.LocalPort, "local"); err != nil {
+		return err
+	}
+	if !net.ParseIP(transportCfg.LocalHost).IsLoopback() {
+		return fmt.Errorf("data-plane local_addr must be a loopback IP, got %q", transportCfg.LocalHost)
+	}
+	if transportCfg.LocalPort == 0 {
+		return errors.New("data-plane local_port must be non-zero")
+	}
+	if !transportCfg.TransportPlugin.Enabled || transportCfg.TransportPlugin.Type != "plaintext" {
+		return errors.New("service data-plane requires transport_plugin.enabled=true and type=plaintext")
+	}
+	if !transportCfg.ProxyProtocol {
+		return errors.New("service data-plane requires proxy_protocol=true")
+	}
+	trojanCfg, err := config.Require[trojan.Config](ctx, trojan.Name)
+	if err != nil {
+		return err
+	}
+	if trojanCfg.AuthDB == "" {
+		return errors.New("data-plane auth_db is required")
+	}
+	if trojanCfg.TrafficReport != "" {
+		reportURL, err := url.Parse(trojanCfg.TrafficReport)
+		if err != nil || reportURL.Scheme != "http" || reportURL.Host == "" {
+			return fmt.Errorf("invalid data-plane traffic_report %q", trojanCfg.TrafficReport)
+		}
+		host := reportURL.Hostname()
+		ip := net.ParseIP(host)
+		if ip == nil || !ip.IsLoopback() {
+			return fmt.Errorf("data-plane traffic_report must use a loopback IP, got %q", trojanCfg.TrafficReport)
+		}
+		if trojanCfg.TrafficOutbox == "" {
+			return errors.New("trojan data-plane traffic reporting requires traffic_outbox")
+		}
+	}
+	nodeCfg, err := config.Require[nodesync.Config](ctx, nodesync.Name)
+	if err == nil && nodeCfg.Node.Enabled {
+		if nodeCfg.Node.MasterURL == "" || nodeCfg.Node.Secret == "" || nodeCfg.Node.TrafficOutbox == "" {
+			return errors.New("worker node synchronization requires master_url, secret and traffic_outbox")
+		}
+	}
+	return nil
+}
+
+func validateServiceConfig(args []string) error {
+	if len(args) < 4 || args[0] != "--service" || args[2] != "--config" || (len(args)-4)%3 != 0 {
+		return errors.New("usage: trojan-go config-check --service <gateway|admin|worker-control|data-plane> --config <path> [--path-override <target> <staged-path>]...")
+	}
+	service, configPath := args[1], args[3]
+	if configPath == "" {
+		return errors.New("config path is required")
+	}
+	pathOverrides := make(map[string]string)
+	for i := 4; i < len(args); i += 3 {
+		if args[i] != "--path-override" {
+			return fmt.Errorf("unsupported config-check option %q", args[i])
+		}
+		if args[i+1] == "" || args[i+2] == "" {
+			return errors.New("path override requires non-empty target and staged path")
+		}
+		pathOverrides[filepath.Clean(args[i+1])] = args[i+2]
+	}
+	if service != "gateway" && len(pathOverrides) > 0 {
+		return fmt.Errorf("path overrides are not supported for service %q", service)
+	}
+	switch service {
+	case "gateway":
+		return webserver.ValidateGatewayConfigWithPathOverrides(configPath, pathOverrides)
+	case "admin":
+		return webserver.ValidateAdminServiceConfig(configPath)
+	case "worker-control":
+		return webserver.ValidateWorkerControlServiceConfig(configPath)
+	case "data-plane":
+		return validateDataPlaneConfig(configPath)
+	default:
+		return fmt.Errorf("unsupported service %q", service)
+	}
+}
+
 func main() {
+	if len(os.Args) >= 2 && os.Args[1] == "config-check" {
+		if err := validateServiceConfig(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "config validation failed:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	// Service commands use the existing deployment database as cold data. The
 	// legacy web command remains available only for the embedded compatibility runtime.
 	if len(os.Args) >= 2 {

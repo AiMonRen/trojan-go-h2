@@ -2,15 +2,14 @@ package webserver
 
 import (
 	"fmt"
-	"net"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/voidluo/trojan-go/common"
 	"github.com/voidluo/trojan-go/internal/database"
+	"github.com/voidluo/trojan-go/log"
 )
 
 // publicUser is the non-sensitive representation returned by management APIs.
@@ -71,8 +70,26 @@ func (s *AdminServer) handleAddUser(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的参数"})
 		return
 	}
-	if user.Username == "" || user.Password == "" {
+	if user.Password == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "用户名和密码不能为空"})
+		return
+	}
+	// L-02: usernames end up in subscription filenames and share links, so
+	// enforce length, UTF-8 validity and character restrictions on create.
+	if err := validateUsername(user.Username); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := validateQuota(user.Quota); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if user.Status < 0 || user.Status > 1 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "状态必须为 0（启用）或 1（禁用）"})
+		return
+	}
+	if user.IPLimit < 0 || user.IPLimit > 100 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "IP 限制必须在 0 到 100 之间"})
 		return
 	}
 	plaintextPassword := user.Password
@@ -90,14 +107,16 @@ func (s *AdminServer) handleAddUser(c *gin.Context) {
 		return
 	}
 	if err := database.SetUserPassword(s.db, &user, plaintextPassword); err != nil {
-		s.db.Delete(&user)
+		// L-01: report a failed compensating delete; otherwise a user row can
+		// survive without a usable password ciphertext.
+		if delErr := s.db.Delete(&user).Error; delErr != nil {
+			log.Errorf("create user: rollback of user %d failed after credential encryption error, an unusable user row may remain: %v", user.ID, delErr)
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "用户凭据加密失败"})
 		return
 	}
-	if len(s.auths) > 0 && user.Status == 0 {
-		for _, a := range s.auths {
-			a.AddUser(user.Hash)
-		}
+	if user.Status == 0 {
+		s.syncAuthAddUser("create user", user.Hash)
 	}
 	c.JSON(http.StatusOK, toPublicUser(user))
 }
@@ -130,15 +149,32 @@ func (s *AdminServer) handleUpdateUser(c *gin.Context) {
 	updates := map[string]interface{}{}
 	passwordChanged := false
 	if req.Username != "" {
+		// L-02: the update path used to accept any non-empty username.
+		if err := validateUsername(req.Username); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 		updates["username"] = req.Username
 	}
 	if req.Status != nil {
+		if *req.Status < 0 || *req.Status > 1 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "状态必须为 0（启用）或 1（禁用）"})
+			return
+		}
 		updates["status"] = *req.Status
 	}
 	if req.Quota != nil {
+		if err := validateQuota(*req.Quota); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 		updates["quota"] = *req.Quota
 	}
 	if req.IPLimit != nil {
+		if *req.IPLimit < 0 || *req.IPLimit > 100 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "IP 限制必须在 0 到 100 之间"})
+			return
+		}
 		updates["ip_limit"] = *req.IPLimit
 	}
 	if req.Password != "" {
@@ -153,6 +189,10 @@ func (s *AdminServer) handleUpdateUser(c *gin.Context) {
 		passwordChanged = true
 	}
 	if req.ExpiryDays != nil {
+		if *req.ExpiryDays < 0 || *req.ExpiryDays > 3650 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "有效天数必须在 0 到 3650 之间"})
+			return
+		}
 		if *req.ExpiryDays > 0 {
 			expiry := time.Now().AddDate(0, 0, *req.ExpiryDays)
 			updates["expiry_time"] = &expiry
@@ -180,27 +220,38 @@ func (s *AdminServer) handleUpdateUser(c *gin.Context) {
 			}
 		}
 	}
-	if err := s.db.Model(&user).Updates(updates).Error; err != nil {
+	// Wrap field updates and credential encryption in a single transaction.
+	// If credential encryption fails the field changes are rolled back,
+	// preventing a mismatch between the new hash and the password ciphertext.
+	tx := s.db.Begin()
+	if tx.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "开启数据库事务失败"})
+		return
+	}
+	if err := tx.Model(&user).Updates(updates).Error; err != nil {
+		tx.Rollback()
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "更新用户失败"})
 		return
 	}
 	if passwordChanged {
-		if err := database.SetUserPassword(s.db, &user, req.Password); err != nil {
+		if err := database.SetUserPassword(tx, &user, req.Password); err != nil {
+			tx.Rollback()
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "用户凭据加密失败"})
 			return
 		}
 	}
+	if err := tx.Commit().Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "提交用户更新事务失败"})
+		return
+	}
 
 	// 同步所有存在的核心
 	if len(s.auths) > 0 {
-		for _, a := range s.auths {
-			a.DelUser(oldHash)
-		}
-		s.db.First(&user, id) // 获取更新后的状态
-		if user.Status == 0 {
-			for _, a := range s.auths {
-				a.AddUser(user.Hash)
-			}
+		s.syncAuthDelUser("update user", oldHash)
+		if err := s.db.First(&user, id).Error; err != nil {
+			log.Warnf("refresh user %d after update: %v", id, err)
+		} else if user.Status == 0 {
+			s.syncAuthAddUser("update user", user.Hash)
 		}
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "更新成功"})
@@ -212,13 +263,14 @@ func (s *AdminServer) handleDeleteUser(c *gin.Context) {
 		return
 	}
 	var user database.User
-	if s.db.First(&user, c.Param("id")).Error == nil {
-		if len(s.auths) > 0 && user.Hash != "" {
-			for _, a := range s.auths {
-				a.DelUser(user.Hash)
-			}
-		}
-		s.db.Delete(&user)
+	if err := s.db.First(&user, c.Param("id")).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "用户不存在"})
+		return
+	}
+	s.syncAuthDelUser("delete user", user.Hash)
+	if err := s.db.Delete(&user).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "删除用户失败"})
+		return
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "已删除"})
 }
@@ -232,7 +284,21 @@ func (s *AdminServer) handleUpdateQuota(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	s.db.Model(&database.User{}).Where("id = ?", id).Update("quota", req.Quota)
+	// L-02: this standalone endpoint used to skip the -1 boundary that the
+	// user update path enforces, so it could store values like -5.
+	if err := validateQuota(req.Quota); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	result := s.db.Model(&database.User{}).Where("id = ?", id).Update("quota", req.Quota)
+	if result.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "设置限额失败"})
+		return
+	}
+	if result.RowsAffected == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "用户不存在"})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "限额设置成功"})
 }
 
@@ -241,9 +307,17 @@ func (s *AdminServer) handleClearTraffic(c *gin.Context) {
 		s.proxyToMaster(c)
 		return
 	}
-	s.db.Model(&database.User{}).Where("id = ?", c.Param("id")).Updates(map[string]interface{}{
+	result := s.db.Model(&database.User{}).Where("id = ?", c.Param("id")).Updates(map[string]interface{}{
 		"used": 0, "upload": 0, "download": 0,
 	})
+	if result.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "清空流量失败"})
+		return
+	}
+	if result.RowsAffected == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "用户不存在"})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "流量已清空"})
 }
 
@@ -256,13 +330,33 @@ func (s *AdminServer) handleSetExpire(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if req.Days < 0 || req.Days > 3650 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "有效天数必须在 0 到 3650 之间"})
+		return
+	}
 	expiry := time.Now().AddDate(0, 0, req.Days)
-	s.db.Model(&database.User{}).Where("id = ?", id).Update("expiry_time", &expiry)
+	result := s.db.Model(&database.User{}).Where("id = ?", id).Update("expiry_time", &expiry)
+	if result.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "设置过期时间失败"})
+		return
+	}
+	if result.RowsAffected == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "用户不存在"})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "过期时间设置成功", "expiry": expiry})
 }
 
 func (s *AdminServer) handleCancelExpire(c *gin.Context) {
-	s.db.Model(&database.User{}).Where("id = ?", c.Param("id")).Update("expiry_time", nil)
+	result := s.db.Model(&database.User{}).Where("id = ?", c.Param("id")).Update("expiry_time", nil)
+	if result.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "取消限期失败"})
+		return
+	}
+	if result.RowsAffected == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "用户不存在"})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "已取消限期"})
 }
 
@@ -278,10 +372,8 @@ func (s *AdminServer) handleShare(c *gin.Context) {
 	}
 	domain := s.serverDomain
 	if domain == "" {
-		domain = c.DefaultQuery("domain", c.Request.Host)
-		if strings.Contains(domain, ":") {
-			domain, _, _ = net.SplitHostPort(domain)
-		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "服务域名为空；请在面板设置中配置 canonical domain"})
+		return
 	}
 	password, err := database.UserPassword(user)
 	if err != nil || password == "" {

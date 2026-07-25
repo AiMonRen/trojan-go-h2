@@ -2,14 +2,50 @@ package memory
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"runtime"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/voidluo/trojan-go/common"
 	"github.com/voidluo/trojan-go/config"
 )
+
+func TestTakeTrafficCheckpointFailureKeepsCounters(t *testing.T) {
+	ctx := config.WithConfig(context.Background(), Name, &Config{})
+	auth, err := NewAuthenticator(ctx)
+	if err != nil {
+		t.Fatalf("NewAuthenticator: %v", err)
+	}
+	if err := auth.AddUser("take-traffic"); err != nil {
+		t.Fatalf("AddUser: %v", err)
+	}
+	_, user := auth.AuthUser("take-traffic")
+	user.AddTraffic64(100, 200)
+	checkpointErr := errors.New("checkpoint failed")
+	sent, recv, err := user.TakeTraffic(func(sent, recv uint64) error {
+		if sent != 100 || recv != 200 {
+			t.Fatalf("checkpoint values = %d/%d", sent, recv)
+		}
+		return checkpointErr
+	})
+	if !errors.Is(err, checkpointErr) || sent != 100 || recv != 200 {
+		t.Fatalf("TakeTraffic = %d/%d err=%v", sent, recv, err)
+	}
+	if sent, recv := user.GetTraffic(); sent != 100 || recv != 200 {
+		t.Fatalf("failed checkpoint changed counters: %d/%d", sent, recv)
+	}
+	if _, _, err := user.TakeTraffic(func(uint64, uint64) error { return nil }); err != nil {
+		t.Fatalf("successful checkpoint: %v", err)
+	}
+	if sent, recv := user.GetTraffic(); sent != 0 || recv != 0 {
+		t.Fatalf("successful checkpoint did not clear counters: %d/%d", sent, recv)
+	}
+}
 
 func TestMemoryAuth(t *testing.T) {
 	cfg := &Config{
@@ -119,6 +155,76 @@ func TestMemoryAuth(t *testing.T) {
 	}
 	user.Close()
 	auth.Close()
+}
+
+func TestConcurrentIPLimitNeverExceeded(t *testing.T) {
+	cfg := &Config{}
+	ctx := config.WithConfig(context.Background(), Name, cfg)
+	auth, err := NewAuthenticator(ctx)
+	if err != nil {
+		t.Fatalf("NewAuthenticator: %v", err)
+	}
+	defer auth.Close()
+	if err := auth.AddUser("limited-user"); err != nil {
+		t.Fatalf("AddUser: %v", err)
+	}
+	_, user := auth.AuthUser("limited-user")
+	user.SetIPLimit(8)
+
+	var accepted atomic.Int32
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < 128; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			if user.AddIP(fmt.Sprintf("192.0.2.%d", i)) {
+				accepted.Add(1)
+			}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	if got := int(accepted.Load()); got != 8 {
+		t.Fatalf("accepted %d unique IPs, want 8", got)
+	}
+	if got := user.GetIP(); got != 8 {
+		t.Fatalf("tracked %d unique IPs, want 8", got)
+	}
+}
+
+func TestConcurrentDuplicateIPCountedOnce(t *testing.T) {
+	cfg := &Config{}
+	ctx := config.WithConfig(context.Background(), Name, cfg)
+	auth, err := NewAuthenticator(ctx)
+	if err != nil {
+		t.Fatalf("NewAuthenticator: %v", err)
+	}
+	defer auth.Close()
+	if err := auth.AddUser("duplicate-user"); err != nil {
+		t.Fatalf("AddUser: %v", err)
+	}
+	_, user := auth.AuthUser("duplicate-user")
+	user.SetIPLimit(1)
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < 128; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if !user.AddIP("198.51.100.10") {
+				t.Error("duplicate IP should remain accepted")
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if got := user.GetIP(); got != 1 {
+		t.Fatalf("tracked %d IPs, want 1", got)
+	}
 }
 
 func BenchmarkMemoryUsage(b *testing.B) {

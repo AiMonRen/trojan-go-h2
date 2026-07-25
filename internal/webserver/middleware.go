@@ -1,6 +1,8 @@
 package webserver
 
 import (
+	cryptorand "crypto/rand"
+	"encoding/hex"
 	"net/http"
 	"strings"
 	"time"
@@ -111,13 +113,52 @@ func (s *AdminServer) enforceLoginRateLimit() gin.HandlerFunc {
 	}
 }
 
+// enforceSessionIdleTimeout validates the per-session idle timeout carried by
+// the jti claim and refreshes the session activity timestamp.
+//
+// The jti claim is MANDATORY: a token without it cannot be tracked in
+// sessionTimes, so accepting it would let any token minted before this
+// mechanism existed (or crafted with the claim stripped) bypass the idle
+// timeout for its whole 24h exp window. Such tokens are rejected outright.
+//
+// Returns true when the request may proceed. On failure the response has
+// already been written and the context aborted.
+func (s *AdminServer) enforceSessionIdleTimeout(c *gin.Context, token *jwt.Token) bool {
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		log.Warnf("Web panel: rejected session token with unexpected claims type from %s", c.ClientIP())
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "会话令牌无效，请重新登录"})
+		c.Abort()
+		return false
+	}
+	jti, _ := claims["jti"].(string)
+	if jti == "" {
+		log.Warnf("Web panel: rejected session token without jti claim from %s", c.ClientIP())
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "会话令牌缺少会话标识，请重新登录"})
+		c.Abort()
+		return false
+	}
+	if s.isSessionExpired(jti, sessionIdleTimeout) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "会话已过期，请重新登录"})
+		c.Abort()
+		return false
+	}
+	s.updateSessionActivity(jti)
+	return true
+}
+
 // requireAdminSession is used for credential and service-control operations that
 // must never be authorized only by a Worker communication secret.
+// It only accepts the Authorization: Bearer header (URL query parameter support
+// has been removed to prevent token leakage via logs, browser history and Referer).
+// Session idle timeout is enforced per-session via the mandatory jti claim.
 func (s *AdminServer) requireAdminSession() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		ts := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
 		if ts == "" {
-			ts = c.Query("token")
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "需要管理员会话"})
+			c.Abort()
+			return
 		}
 		token, err := s.verifyJWT(ts)
 		if err != nil || token == nil || !token.Valid {
@@ -125,12 +166,9 @@ func (s *AdminServer) requireAdminSession() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		if lastNano := s.lastActiveNano.Load(); lastNano != 0 && time.Since(time.Unix(0, lastNano)) > 30*time.Minute {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "会话已过期，请重新登录"})
-			c.Abort()
+		if !s.enforceSessionIdleTimeout(c, token) {
 			return
 		}
-		s.lastActiveNano.Store(time.Now().UnixNano())
 		c.Next()
 	}
 }
@@ -168,9 +206,16 @@ func (s *AdminServer) handleLogin(c *gin.Context) {
 		} else {
 			if req.Password == effPass {
 				authSuccess = true
+				// Opportunistic upgrade of a legacy plaintext password to
+				// bcrypt. L-01: a failed upgrade must be visible, otherwise
+				// the password silently stays in plaintext forever. Login
+				// itself still succeeds; the upgrade retries on next login.
 				hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
-				if err == nil {
-					s.db.Save(&database.Config{Key: "admin_password", Value: string(hash)})
+				if err != nil {
+					log.Errorf("Web panel: hash legacy admin password: %v", err)
+				} else if err := s.db.Save(&database.Config{Key: "admin_password", Value: string(hash)}).Error; err != nil {
+					log.Errorf("Web panel: persist upgraded admin password hash, it remains stored in plaintext: %v", err)
+				} else {
 					s.invalidateAdminCache()
 				}
 			}
@@ -179,18 +224,26 @@ func (s *AdminServer) handleLogin(c *gin.Context) {
 
 	if authSuccess {
 		s.clearLoginFailures(c.ClientIP())
-		s.lastActiveNano.Store(time.Now().UnixNano())
+		jtiBytes := make([]byte, 16)
+		if _, err := cryptorand.Read(jtiBytes); err != nil {
+			log.Errorf("Web panel: generate jti: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "会话初始化失败"})
+			return
+		}
+		jti := hex.EncodeToString(jtiBytes)
 		token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 			"user": req.Username,
+			"jti":  jti,
 			"exp":  time.Now().Add(time.Hour * 24).Unix(),
 		})
-		t, err := token.SignedString(s.jwtSecret)
+		t, err := token.SignedString(s.getJWTSecret())
 		if err != nil {
 			log.Errorf("Web panel failed to sign JWT for user %q: %v", req.Username, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "无法生成会话令牌"})
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"token": t})
+		s.updateSessionActivity(jti)
 	} else {
 		s.recordRateLimitEvent(s.loginFailures, c.ClientIP(), loginFailureWindow)
 		log.Warnf("Web panel login failed for username=%q from ip=%s", req.Username, c.ClientIP())

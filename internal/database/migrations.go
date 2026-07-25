@@ -1,6 +1,7 @@
 package database
 
 import (
+	"context"
 	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -17,6 +18,12 @@ const (
 	migrationStatusStarted = "started"
 	migrationStatusApplied = "applied"
 	migrationStatusFailed  = "failed"
+
+	// migrationLockTTL is how long a freshly acquired or renewed lease is valid.
+	migrationLockTTL = 5 * time.Minute
+	// migrationLockRenewInterval is how often the background loop renews the
+	// lease; it must be comfortably shorter than migrationLockTTL.
+	migrationLockRenewInterval = 2 * time.Minute
 )
 
 // SchemaMigration is the immutable record of a completed database change.
@@ -108,6 +115,21 @@ func runMigrations(db *gorm.DB, migrations []Migration) error {
 	}
 	defer releaseMigrationLock(db, lockToken)
 
+	// Start a background goroutine that periodically renews the lock.
+	// This prevents lock expiry during migrations that take longer than
+	// the fixed TTL (e.g. encrypting large credential tables).
+	//
+	// renewalCtx stops the renewal loop when we return. migCtx is bound to the
+	// migration transactions themselves: if renewal fails, the loop cancels
+	// migCtx so any in-flight migration aborts before committing under a lease
+	// it no longer holds.
+	renewalCtx, cancelRenewal := context.WithCancel(context.Background())
+	defer cancelRenewal()
+	migCtx, cancelMigration := context.WithCancel(context.Background())
+	defer cancelMigration()
+	renewalErrCh := make(chan error, 1)
+	go renewLockLoop(db, lockToken, renewalCtx, renewalErrCh, cancelMigration)
+
 	var previous uint64
 	for _, migration := range migrations {
 		if migration.Version == 0 || migration.Name == "" || migration.Revision == "" || migration.Up == nil {
@@ -131,8 +153,23 @@ func runMigrations(db *gorm.DB, migrations []Migration) error {
 			return fmt.Errorf("read migration %03d: %w", migration.Version, err)
 		}
 
-		if err := runMigration(db, migration, checksum); err != nil {
+		// Abort early if the lease was already lost before starting the next
+		// migration, so we never open a transaction we cannot safely commit.
+		select {
+		case renewalErr := <-renewalErrCh:
+			return fmt.Errorf("migration lock lost before migration %03d: %w", migration.Version, renewalErr)
+		default:
+		}
+
+		if err := runMigration(migCtx, db, lockToken, migration, checksum); err != nil {
 			return err
+		}
+
+		// Verify the lock is still held after each migration.
+		select {
+		case renewalErr := <-renewalErrCh:
+			return fmt.Errorf("migration lock lost after migration %03d: %w", migration.Version, renewalErr)
+		default:
 		}
 	}
 	return nil
@@ -146,7 +183,7 @@ func acquireMigrationLock(db *gorm.DB, now time.Time) (string, error) {
 		return "", fmt.Errorf("generate migration lock token: %w", err)
 	}
 	token := hex.EncodeToString(tokenBytes[:])
-	expiresAt := now.Add(30 * time.Second)
+	expiresAt := now.Add(5 * time.Minute)
 	lock := MigrationLock{Name: migrationLockName, Token: token, ExpiresAt: expiresAt}
 	result := db.Model(&MigrationLock{}).Where("name = ? AND expires_at < ?", migrationLockName, now).Updates(map[string]any{"token": token, "expires_at": expiresAt})
 	if result.Error != nil {
@@ -161,11 +198,75 @@ func acquireMigrationLock(db *gorm.DB, now time.Time) (string, error) {
 	return token, nil
 }
 
+// renewMigrationLock extends the expiration of an existing migration lock
+// by the given duration. It returns an error if the token no longer holds
+// the lock, indicating the migration must abort.
+func renewMigrationLock(db *gorm.DB, token string, extension time.Duration) error {
+	result := db.Model(&MigrationLock{}).Where("name = ? AND token = ?", migrationLockName, token).Update("expires_at", time.Now().Add(extension))
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return errors.New("migration lock was lost: another process may have taken over")
+	}
+	return nil
+}
+
 func releaseMigrationLock(db *gorm.DB, token string) {
 	_ = db.Delete(&MigrationLock{}, "name = ? AND token = ?", migrationLockName, token).Error
 }
 
-func runMigration(db *gorm.DB, migration Migration, checksum string) error {
+// verifyLockOwnership confirms, inside the migration transaction, that the
+// lease row still belongs to token and has not expired. Running it on tx means
+// the check and the schema write are committed atomically, so we can never
+// commit a migration under a lease that was lost or taken over.
+func verifyLockOwnership(tx *gorm.DB, token string) error {
+	var lock MigrationLock
+	err := tx.First(&lock, "name = ?", migrationLockName).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return errors.New("migration lock was lost before commit: lease row missing")
+	}
+	if err != nil {
+		return fmt.Errorf("verify migration lock ownership: %w", err)
+	}
+	if lock.Token != token {
+		return errors.New("migration lock was taken over before commit: token mismatch")
+	}
+	if !lock.ExpiresAt.After(time.Now().UTC()) {
+		return errors.New("migration lock expired before commit")
+	}
+	return nil
+}
+
+// renewLockLoop periodically extends the migration lock's expiration while
+// migrations are running. It stops when the parent context is cancelled and
+// sends any renewal error to errCh (exactly once) so the caller can abort
+// the migration sequence. On renewal failure it also calls cancelMigration so
+// that an in-flight migration transaction bound to that context is aborted
+// immediately instead of continuing to write schema under a lost lease.
+func renewLockLoop(db *gorm.DB, token string, ctx context.Context, errCh chan<- error, cancelMigration context.CancelFunc) {
+	ticker := time.NewTicker(migrationLockRenewInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := renewMigrationLock(db, token, migrationLockTTL); err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+				// Abort any in-flight migration bound to migCtx so it stops
+				// before committing under a lease we no longer hold.
+				cancelMigration()
+				return
+			}
+		}
+	}
+}
+
+func runMigration(ctx context.Context, db *gorm.DB, lockToken string, migration Migration, checksum string) error {
 	startedAt := time.Now().UTC()
 	audit := MigrationAudit{
 		Version: migration.Version, Name: migration.Name, Checksum: checksum,
@@ -175,7 +276,9 @@ func runMigration(db *gorm.DB, migration Migration, checksum string) error {
 		return fmt.Errorf("create audit for migration %03d: %w", migration.Version, err)
 	}
 
-	tx := db.Begin()
+	// Bind the transaction to ctx so a lost lease (which cancels ctx via the
+	// renewal loop) aborts the in-flight work instead of committing blindly.
+	tx := db.WithContext(ctx).Begin()
 	if tx.Error != nil {
 		return finishMigrationFailure(db, audit, startedAt, fmt.Errorf("begin transaction: %w", tx.Error))
 	}
@@ -191,6 +294,19 @@ func runMigration(db *gorm.DB, migration Migration, checksum string) error {
 	}).Error; err != nil {
 		_ = tx.Rollback().Error
 		return finishMigrationFailure(db, audit, startedAt, fmt.Errorf("record applied migration: %w", err))
+	}
+
+	// Final ownership check inside the transaction, immediately before commit.
+	// This closes the race where the lease expired and was taken over by another
+	// process between the last renewal and this commit: if we no longer own the
+	// lock we roll back rather than write schema under a stolen lease.
+	if err := ctx.Err(); err != nil {
+		_ = tx.Rollback().Error
+		return finishMigrationFailure(db, audit, startedAt, fmt.Errorf("migration context cancelled before commit: %w", err))
+	}
+	if err := verifyLockOwnership(tx, lockToken); err != nil {
+		_ = tx.Rollback().Error
+		return finishMigrationFailure(db, audit, startedAt, err)
 	}
 	if err := tx.Commit().Error; err != nil {
 		return finishMigrationFailure(db, audit, startedAt, fmt.Errorf("commit migration: %w", err))

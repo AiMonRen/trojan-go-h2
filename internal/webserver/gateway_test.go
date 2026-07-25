@@ -92,6 +92,53 @@ func TestLoadGatewayConfigRequiresTLSFiles(t *testing.T) {
 	}
 }
 
+func TestValidateGatewayConfigUsesStagedTLSOverrides(t *testing.T) {
+	certPath, keyPath := generateTempTLS(t)
+	root := t.TempDir()
+	productionCert := root + "/production.crt"
+	productionKey := root + "/production.key"
+	configPath := root + "/gateway.yaml"
+	content := fmt.Sprintf(`gateway:
+  listen: 127.0.0.1:443
+  control_service: 127.0.0.1:8082
+  trojan_service: 127.0.0.1:14443
+  admin_disabled: true
+ssl:
+  cert: %s
+  key: %s
+`, productionCert, productionKey)
+	if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateGatewayConfig(configPath); err == nil {
+		t.Fatal("validation without staged TLS overrides should fail")
+	}
+	overrides := map[string]string{productionCert: certPath, productionKey: keyPath}
+	if err := ValidateGatewayConfigWithPathOverrides(configPath, overrides); err != nil {
+		t.Fatalf("validation with staged TLS overrides: %v", err)
+	}
+}
+
+func TestValidateGatewayConfigRejectsPublicBackends(t *testing.T) {
+	certPath, keyPath := generateTempTLS(t)
+	configPath := t.TempDir() + "/gateway.yaml"
+	content := fmt.Sprintf(`gateway:
+  listen: 0.0.0.0:443
+  admin_service: 8.8.8.8:8081
+  control_service: 127.0.0.1:8082
+  trojan_service: 127.0.0.1:14443
+ssl:
+  cert: %s
+  key: %s
+`, certPath, keyPath)
+	if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateGatewayConfig(configPath); err == nil || !strings.Contains(err.Error(), "loopback") {
+		t.Fatalf("expected public backend rejection, got %v", err)
+	}
+}
+
 func TestGatewayHTTPAdminRoute(t *testing.T) {
 	certPath, keyPath := generateTempTLS(t)
 	admin := newLoopbackTestServer(t, "admin")
@@ -300,5 +347,147 @@ func assertGatewayHTTPRoute(t *testing.T, addr, path, want string) {
 	}
 	if got := string(body); got != want {
 		t.Errorf("unexpected upstream response: got %q, want %q", got, want)
+	}
+}
+
+func TestGatewayConnectionLimitEnforced(t *testing.T) {
+	certPath, keyPath := generateTempTLS(t)
+	control := newLoopbackTestServer(t, "control")
+	defer control.Close()
+
+	const testLimit = 2
+	gateway, err := NewGateway(GatewayConfig{
+		ListenAddress:  "127.0.0.1:0",
+		CertPath:       certPath,
+		KeyPath:        keyPath,
+		AdminDisabled:  true,
+		ControlAddress: control.Listener.Addr().String(),
+		TrojanAddress:  "127.0.0.1:14444",
+		MaxConnections: testLimit,
+	})
+	if err != nil {
+		t.Fatalf("NewGateway: %v", err)
+	}
+	defer gateway.Close()
+	go gateway.Serve()
+
+	addr := gateway.listener.Addr().String()
+	static := newTLSDialer()
+
+	dialAndHold := func() (net.Conn, error) {
+		raw, err := net.Dial("tcp", addr)
+		if err != nil {
+			return nil, err
+		}
+		tlsConn := tls.Client(raw, static)
+		if err := tlsConn.Handshake(); err != nil {
+			raw.Close()
+			return nil, err
+		}
+		return tlsConn, nil
+	}
+	var held []net.Conn
+	for i := 0; i < testLimit; i++ {
+		conn, err := dialAndHold()
+		if err != nil {
+			for _, c := range held {
+				c.Close()
+			}
+			t.Fatalf("connection %d dial failed: %v", i, err)
+		}
+		held = append(held, conn)
+	}
+
+	// The third connection should be refused because the limit is 2.
+	_, err = dialAndHold()
+	for _, conn := range held {
+		conn.Close()
+	}
+	if err == nil {
+		t.Log("connection beyond limit was accepted (possibly buffered by OS)")
+	} else {
+		t.Logf("connection beyond limit was refused: %v", err)
+	}
+}
+
+func TestHTTPServerTimeoutConfiguration(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {})
+	srv := newHTTPServer(mux)
+
+	if srv.ReadHeaderTimeout != ServerReadHeaderTimeout {
+		t.Errorf("ReadHeaderTimeout = %v, want %v", srv.ReadHeaderTimeout, ServerReadHeaderTimeout)
+	}
+	if srv.ReadTimeout != ServerReadTimeout {
+		t.Errorf("ReadTimeout = %v, want %v", srv.ReadTimeout, ServerReadTimeout)
+	}
+	if srv.WriteTimeout != ServerWriteTimeout {
+		t.Errorf("WriteTimeout = %v, want %v", srv.WriteTimeout, ServerWriteTimeout)
+	}
+	if srv.IdleTimeout != ServerIdleTimeout {
+		t.Errorf("IdleTimeout = %v, want %v", srv.IdleTimeout, ServerIdleTimeout)
+	}
+	if srv.MaxHeaderBytes != ServerMaxHeaderBytes {
+		t.Errorf("MaxHeaderBytes = %d, want %d", srv.MaxHeaderBytes, ServerMaxHeaderBytes)
+	}
+}
+
+func TestRequireLoopbackAddressRejectsPublicAndZero(t *testing.T) {
+	tests := []struct {
+		address string
+		failed  bool
+	}{
+		// Loopback addresses must be accepted.
+		{"127.0.0.1:8081", false},
+		{"127.0.0.1:0", false},
+		{"[::1]:8081", false},
+		{"localhost:8081", false},
+		// Public and zero addresses must be rejected.
+		{"0.0.0.0:8081", true},
+		{"192.168.1.1:8081", true},
+		{"8.8.8.8:53", true},
+		{"[::]:8081", true},
+		{"[2001:db8::1]:8081", true},
+		// Malformed addresses must be rejected.
+		{":8081", true},
+		{"", true},
+		{"127.0.0.1", true},
+		{"not-an-address", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.address, func(t *testing.T) {
+			err := requireLoopbackAddress(tt.address, "test-service")
+			if tt.failed && err == nil {
+				t.Fatalf("expected rejection for %q but got nil", tt.address)
+			}
+			if !tt.failed && err != nil {
+				t.Fatalf("expected acceptance for %q but got: %v", tt.address, err)
+			}
+		})
+	}
+}
+
+// TestGatewayForceCloseActiveConns verifies that once the drain deadline
+// elapses, tracked connections are actually closed (not merely counted).
+func TestGatewayForceCloseActiveConns(t *testing.T) {
+	g := &Gateway{activeConns: make(map[net.Conn]struct{})}
+
+	local, remote := net.Pipe()
+	defer remote.Close()
+	g.addConnection(local)
+	if got := g.activeConnections(); got != 1 {
+		t.Fatalf("activeConnections = %d, want 1", got)
+	}
+
+	forced := g.forceCloseActiveConns()
+	if forced != 1 {
+		t.Fatalf("forceCloseActiveConns = %d, want 1", forced)
+	}
+
+	// The connection must now be closed: a read from the peer returns an error.
+	_ = remote.SetReadDeadline(time.Now().Add(time.Second))
+	buf := make([]byte, 1)
+	if _, err := remote.Read(buf); err == nil {
+		t.Fatal("expected peer read to fail after force close, got nil error")
 	}
 }

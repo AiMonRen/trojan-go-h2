@@ -75,7 +75,14 @@ func NodeAdd() {
 	rateStr = strings.TrimSpace(rateStr)
 	rate := 1.0
 	if rateStr != "" {
-		fmt.Sscanf(rateStr, "%f", &rate)
+		if _, err := fmt.Sscanf(rateStr, "%f", &rate); err != nil {
+			fmt.Println("\033[31m流量结算倍率格式无效！\033[0m")
+			return
+		}
+	}
+	if err := database.ValidateTrafficRate(rate); err != nil {
+		fmt.Printf("\033[31m流量结算倍率必须大于 0 且不超过 %d！\033[0m\n", database.MaxTrafficRate)
+		return
 	}
 
 	fmt.Print("是否启用 WebSocket 伪装 (y/n, 默认 n): ")
@@ -184,9 +191,15 @@ func NodeModify() {
 	rateStr = strings.TrimSpace(rateStr)
 	if rateStr != "" {
 		var rate float64
-		if _, err := fmt.Sscanf(rateStr, "%f", &rate); err == nil {
-			node.TrafficRate = rate
+		if _, err := fmt.Sscanf(rateStr, "%f", &rate); err != nil {
+			fmt.Println("\033[31m流量结算倍率格式无效！\033[0m")
+			return
 		}
+		if err := database.ValidateTrafficRate(rate); err != nil {
+			fmt.Printf("\033[31m流量结算倍率必须大于 0 且不超过 %d！\033[0m\n", database.MaxTrafficRate)
+			return
+		}
+		node.TrafficRate = rate
 	}
 
 	fmt.Print("是否修改 WebSocket 伪装设置？(y/n, 默认 n): ")

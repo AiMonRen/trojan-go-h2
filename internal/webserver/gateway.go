@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -37,6 +38,7 @@ type GatewayConfig struct {
 	TrojanAddress  string
 	AdminPrefix    string
 	SubPath        string
+	MaxConnections int
 }
 
 // Gateway owns the public TLS listener and keeps all service backends private.
@@ -49,6 +51,12 @@ type Gateway struct {
 	done          chan struct{}
 	closeOnce     sync.Once
 	workers       sync.WaitGroup
+	semaphore     chan struct{}
+	// activeConns tracks every accepted connection so that, once the drain
+	// deadline expires, Close can forcibly close whatever is still open
+	// instead of merely logging the count and returning.
+	activeConns map[net.Conn]struct{}
+	connMu      sync.Mutex
 }
 
 // gatewayFileConfig is intentionally independent from admin-service database
@@ -87,7 +95,61 @@ func loadGatewayConfig(configPath string) (gatewayFileConfig, error) {
 	return cfg, nil
 }
 
+func ValidateGatewayConfig(configPath string) error {
+	return ValidateGatewayConfigWithPathOverrides(configPath, nil)
+}
+
+func ValidateGatewayConfigWithPathOverrides(configPath string, pathOverrides map[string]string) error {
+	gatewayFile, err := loadGatewayConfig(configPath)
+	if err != nil {
+		return err
+	}
+	if replacement := pathOverrides[filepath.Clean(gatewayFile.SSL.Cert)]; replacement != "" {
+		gatewayFile.SSL.Cert = replacement
+	}
+	if replacement := pathOverrides[filepath.Clean(gatewayFile.SSL.Key)]; replacement != "" {
+		gatewayFile.SSL.Key = replacement
+	}
+	listenAddress := gatewayFile.Gateway.Listen
+	if listenAddress == "" {
+		listenAddress = defaultGatewayListenAddress
+	}
+	if _, _, err := net.SplitHostPort(listenAddress); err != nil {
+		return fmt.Errorf("无效 Gateway 监听地址 %q: %w", listenAddress, err)
+	}
+	adminAddress := gatewayFile.Gateway.AdminService
+	if !gatewayFile.Gateway.AdminDisabled {
+		if adminAddress == "" {
+			adminAddress = "127.0.0.1:8081"
+		}
+		if _, err := loopbackHTTPURL(adminAddress, "admin-service"); err != nil {
+			return err
+		}
+	}
+	controlAddress := gatewayFile.Gateway.ControlService
+	if controlAddress == "" {
+		controlAddress = "127.0.0.1:8082"
+	}
+	if _, err := loopbackHTTPURL(controlAddress, "control-service"); err != nil {
+		return err
+	}
+	trojanAddress := gatewayFile.Gateway.TrojanService
+	if trojanAddress == "" {
+		trojanAddress = defaultTrojanDataPlane
+	}
+	if err := requireLoopbackAddress(trojanAddress, "trojan data-plane"); err != nil {
+		return err
+	}
+	if _, err := tls.LoadX509KeyPair(gatewayFile.SSL.Cert, gatewayFile.SSL.Key); err != nil {
+		return fmt.Errorf("加载 Gateway TLS 证书失败: %w", err)
+	}
+	return nil
+}
+
 func RunGatewayService(configPath, listenAddress string) error {
+	if err := ValidateGatewayConfig(configPath); err != nil {
+		return err
+	}
 	gatewayFile, err := loadGatewayConfig(configPath)
 	if err != nil {
 		return err
@@ -167,6 +229,10 @@ func NewGateway(cfg GatewayConfig) (*Gateway, error) {
 		_ = router.Close()
 		return nil, fmt.Errorf("监听 Gateway 失败: %w", err)
 	}
+	maxConn := cfg.MaxConnections
+	if maxConn <= 0 {
+		maxConn = MaxActiveConnections
+	}
 	return &Gateway{
 		listener:      listener,
 		tlsConfig:     &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"http/1.1"}, MinVersion: tls.VersionTLS12},
@@ -174,6 +240,8 @@ func NewGateway(cfg GatewayConfig) (*Gateway, error) {
 		trojanAddress: cfg.TrojanAddress,
 		dialer:        net.Dialer{Timeout: gatewayBackendDialTimeout, KeepAlive: 30 * time.Second},
 		done:          make(chan struct{}),
+		semaphore:     make(chan struct{}, maxConn),
+		activeConns:   make(map[net.Conn]struct{}),
 	}, nil
 }
 
@@ -200,9 +268,18 @@ func (g *Gateway) Serve() error {
 				return fmt.Errorf("Gateway 接收连接失败: %w", err)
 			}
 		}
+		select {
+		case g.semaphore <- struct{}{}:
+		default:
+			_ = conn.Close()
+			continue
+		}
 		g.workers.Add(1)
+		g.addConnection(conn)
 		go func() {
 			defer g.workers.Done()
+			defer g.removeConnection(conn)
+			defer func() { <-g.semaphore }()
 			g.handleConn(conn)
 		}()
 	}
@@ -286,12 +363,59 @@ func relayGatewayConnections(client, backend net.Conn) {
 	<-done
 }
 
+func (g *Gateway) addConnection(conn net.Conn) {
+	g.connMu.Lock()
+	g.activeConns[conn] = struct{}{}
+	g.connMu.Unlock()
+}
+
+func (g *Gateway) removeConnection(conn net.Conn) {
+	g.connMu.Lock()
+	delete(g.activeConns, conn)
+	g.connMu.Unlock()
+}
+
+func (g *Gateway) activeConnections() int64 {
+	g.connMu.Lock()
+	defer g.connMu.Unlock()
+	return int64(len(g.activeConns))
+}
+
+// forceCloseActiveConns closes every connection still registered. It is called
+// once the drain deadline elapses so that in-flight relays are torn down and
+// their goroutines can return, rather than being left to linger indefinitely.
+func (g *Gateway) forceCloseActiveConns() int {
+	g.connMu.Lock()
+	conns := make([]net.Conn, 0, len(g.activeConns))
+	for conn := range g.activeConns {
+		conns = append(conns, conn)
+	}
+	g.connMu.Unlock()
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
+	return len(conns)
+}
+
 func (g *Gateway) Close() error {
 	g.closeOnce.Do(func() {
 		close(g.done)
 		_ = g.listener.Close()
-		_ = g.serviceRouter.Close()
 	})
-	g.workers.Wait()
+	drainDone := make(chan struct{})
+	go func() {
+		g.workers.Wait()
+		close(drainDone)
+	}()
+	select {
+	case <-drainDone:
+	case <-time.After(GatewayDrainTimeout):
+		// Bounded drain: forcibly close whatever is still open so handler
+		// goroutines unblock, then wait for them to finish returning.
+		forced := g.forceCloseActiveConns()
+		log.Warnf("gateway-service: drain deadline exceeded with %d connections still active, forcing close", forced)
+		g.workers.Wait()
+	}
+	_ = g.serviceRouter.Close()
 	return nil
 }

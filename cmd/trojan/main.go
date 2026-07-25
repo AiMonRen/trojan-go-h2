@@ -16,6 +16,17 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) == 4 && os.Args[1] == "upgrade" && os.Args[2] == "--manifest" {
+		if os.Geteuid() != 0 {
+			fmt.Fprintln(os.Stderr, "atomic upgrade requires root privileges")
+			os.Exit(1)
+		}
+		if err := actions.UpgradeFromManifest(os.Args[3]); err != nil {
+			fmt.Fprintf(os.Stderr, "atomic upgrade failed: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	// 允许通过环境变量指定数据库路径
 	if dbPath := os.Getenv("TROJAN_DB"); dbPath != "" {
@@ -30,6 +41,7 @@ func main() {
 			{Label: menu.L{"停止服务", "Stop Service"}, Action: actions.TrojanStop},
 			{Label: menu.L{"重启服务", "Restart Service"}, Action: actions.TrojanRestart},
 			{Label: menu.L{"查看状态", "Check Status"}, Action: actions.TrojanStatus},
+			{Label: menu.L{"原子升级与自动回滚", "Atomic Upgrade & Rollback"}, Action: actions.AtomicUpgrade},
 			{Label: menu.L{"申请 SSL 证书", "Apply SSL Certificate"}, Action: actions.ApplyCert},
 			{Label: menu.L{"初始化一键部署（主节点）", "Initial Deployment (Master Node)"}, Action: actions.InitDeployMaster},
 			{Label: menu.L{"初始化一键部署（从节点）", "Initial Deployment (Worker Node)"}, Action: actions.InitDeployWorker},

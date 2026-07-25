@@ -3,7 +3,8 @@ package webserver
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"net"
+	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -53,39 +54,58 @@ func toPublicNodes(nodes []database.Node) []publicNode {
 
 func (s *AdminServer) handleListNodes(c *gin.Context) {
 	var nodes []database.Node
-	s.db.Find(&nodes)
+	if err := s.db.Find(&nodes).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "读取节点列表失败"})
+		return
+	}
 
 	// 如果当前不是从节点（即为主节点），则将主节点自身作为虚拟节点加入列表头部
 	if !s.isNode {
 		mainNodeName := "主节点"
 		var cfgTitle database.Config
-		if s.db.Where("`key` = ?", "site_title").First(&cfgTitle).Error == nil && cfgTitle.Value != "" {
-			mainNodeName = cfgTitle.Value
+		// L-01 (F-1): distinguish "no site_title row" (fall back to the default
+		// label) from a real database failure. Treating both as "use default"
+		// hides outages and lets the panel render stale/incorrect data.
+		switch err := s.db.Where("`key` = ?", "site_title").First(&cfgTitle).Error; {
+		case err == nil:
+			if cfgTitle.Value != "" {
+				mainNodeName = cfgTitle.Value
+			}
+		case errors.Is(err, gorm.ErrRecordNotFound):
+			// no custom title configured yet, keep the default
+		default:
+			log.Errorf("node list: read site_title: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "读取节点列表失败"})
+			return
 		}
 
-		host := c.Request.Host
-		domain, _, err := net.SplitHostPort(host)
-		if err != nil {
-			domain = host
-		}
-
+		// L-04: the synthetic main-node entry must only ever advertise a
+		// domain that the operator configured (gateway/embedded config, or the
+		// canonical serverDomain). The request Host header is attacker
+		// controlled, so it is never used as a fallback: a poisoned Host would
+		// otherwise be echoed back into the panel and copied into client
+		// configs. When no canonical domain is known we omit the entry (and log
+		// it) instead of publishing an untrusted address.
 		mainDomain, mainPort, mainWs, mainWsPath := s.getMainNodeInfo()
 		if mainDomain == "" {
-			mainDomain = domain
+			mainDomain = s.serverDomain
 		}
-
-		now := time.Now()
-		mainNode := database.Node{
-			ID:            999999, // 使用特殊的大ID标识系统内置主节点
-			Name:          mainNodeName,
-			Address:       mainDomain,
-			Port:          mainPort,
-			TrafficRate:   1.0,
-			WSEnabled:     mainWs,
-			WSPath:        mainWsPath,
-			LastHeartbeat: &now,
+		if mainDomain == "" {
+			log.Warn("node list: canonical domain not configured, omitting synthetic main node entry")
+		} else {
+			now := time.Now()
+			mainNode := database.Node{
+				ID:            999999, // 使用特殊的大ID标识系统内置主节点
+				Name:          mainNodeName,
+				Address:       mainDomain,
+				Port:          mainPort,
+				TrafficRate:   1.0,
+				WSEnabled:     mainWs,
+				WSPath:        mainWsPath,
+				LastHeartbeat: &now,
+			}
+			nodes = append([]database.Node{mainNode}, nodes...)
 		}
-		nodes = append([]database.Node{mainNode}, nodes...)
 	}
 
 	c.JSON(http.StatusOK, toPublicNodes(nodes))
@@ -93,21 +113,47 @@ func (s *AdminServer) handleListNodes(c *gin.Context) {
 
 func (s *AdminServer) handleAddNode(c *gin.Context) {
 	var req struct {
-		Name        string  `json:"name"`
-		Address     string  `json:"address"`
-		Port        int     `json:"port"`
-		TrafficRate float64 `json:"traffic_rate"`
-		WSEnabled   bool    `json:"ws_enabled"`
-		WSPath      string  `json:"ws_path"`
-		SNI         string  `json:"sni"`
-		Secret      string  `json:"secret"`
+		Name        string   `json:"name"`
+		Address     string   `json:"address"`
+		Port        int      `json:"port"`
+		TrafficRate *float64 `json:"traffic_rate"`
+		WSEnabled   bool     `json:"ws_enabled"`
+		WSPath      string   `json:"ws_path"`
+		SNI         string   `json:"sni"`
+		Secret      string   `json:"secret"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的参数"})
 		return
 	}
-	if req.Name == "" || req.Address == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "节点名称和地址不能为空"})
+	// L-02: name/address/ws-path/SNI now go through the shared validators so
+	// the create and update paths enforce identical rules.
+	if err := validateNodeName(req.Name); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := validateNodeAddress(req.Address); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.Port != 0 && (req.Port < 1 || req.Port > 65535) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "端口必须在 1-65535 范围内"})
+		return
+	}
+	if err := validateWSPath(req.WSPath); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := validateSNI(req.SNI); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	trafficRate := 1.0
+	if req.TrafficRate != nil {
+		trafficRate = *req.TrafficRate
+	}
+	if err := validateTrafficRate(trafficRate); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "流量倍率必须大于 0 且不超过 1000"})
 		return
 	}
 	secret := req.Secret
@@ -126,14 +172,11 @@ func (s *AdminServer) handleAddNode(c *gin.Context) {
 		return
 	}
 	node := database.Node{
-		Name: req.Name, Address: req.Address, Port: req.Port, TrafficRate: req.TrafficRate,
+		Name: req.Name, Address: req.Address, Port: req.Port, TrafficRate: trafficRate,
 		WSEnabled: req.WSEnabled, WSPath: req.WSPath, SNI: req.SNI, Secret: pendingSecret,
 	}
 	if node.Port == 0 {
 		node.Port = 443
-	}
-	if node.TrafficRate == 0 {
-		node.TrafficRate = 1
 	}
 	if node.WSPath == "" {
 		node.WSPath = "/trojan-go"
@@ -143,7 +186,11 @@ func (s *AdminServer) handleAddNode(c *gin.Context) {
 		return
 	}
 	if err := database.SetNodeSecret(s.db, &node, secret); err != nil {
-		s.db.Delete(&node)
+		// L-01: the compensating delete can itself fail and leave a node row
+		// without a usable secret, so report it instead of discarding it.
+		if delErr := s.db.Delete(&node).Error; delErr != nil {
+			log.Errorf("create node: rollback of node %d failed after secret encryption error, a node row without a valid secret may remain: %v", node.ID, delErr)
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "节点凭据加密失败"})
 		return
 	}
@@ -190,16 +237,34 @@ func (s *AdminServer) handleUpdateNode(c *gin.Context) {
 		return
 	}
 	updates := map[string]interface{}{}
+	// L-02: apply the same validators as the create path; previously an update
+	// could store a name or address that create would have rejected.
 	if req.Name != "" {
+		if err := validateNodeName(req.Name); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 		updates["name"] = req.Name
 	}
 	if req.Address != "" {
+		if err := validateNodeAddress(req.Address); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 		updates["address"] = req.Address
 	}
 	if req.Port != nil {
+		if *req.Port < 1 || *req.Port > 65535 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "端口必须在 1-65535 范围内"})
+			return
+		}
 		updates["port"] = *req.Port
 	}
 	if req.TrafficRate != nil {
+		if err := validateTrafficRate(*req.TrafficRate); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "流量倍率必须大于 0 且不超过 1000"})
+			return
+		}
 		updates["traffic_rate"] = *req.TrafficRate
 	}
 	if req.WSEnabled != nil {
@@ -209,6 +274,10 @@ func (s *AdminServer) handleUpdateNode(c *gin.Context) {
 		path := req.WSPath
 		if !strings.HasPrefix(path, "/") {
 			path = "/" + path
+		}
+		if err := validateWSPath(path); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
 		}
 		updates["ws_path"] = path
 	}
@@ -244,9 +313,18 @@ func (s *AdminServer) handleRotateNodeSecret(c *gin.Context) {
 }
 
 func (s *AdminServer) handleDeleteNode(c *gin.Context) {
+	if s.isNode {
+		s.proxyToMaster(c)
+		return
+	}
 	var node database.Node
-	if s.db.First(&node, c.Param("id")).Error == nil {
-		s.db.Delete(&node)
+	if err := s.db.First(&node, c.Param("id")).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "节点不存在"})
+		return
+	}
+	if err := s.db.Delete(&node).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "删除节点失败"})
+		return
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "已删除"})
 }
@@ -271,7 +349,11 @@ func (s *AdminServer) handleNodeSync(c *gin.Context) {
 	if clientIP != "" && clientIP != "::1" && clientIP != "127.0.0.1" {
 		node.DetectedIP = clientIP
 	}
-	s.db.Save(&node)
+	if err := s.db.Save(&node).Error; err != nil {
+		log.Errorf("heartbeat: save node %d: %v", node.ID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "心跳信息更新失败"})
+		return
+	}
 
 	var req struct {
 		Traffic map[string]struct {
@@ -287,8 +369,14 @@ func (s *AdminServer) handleNodeSync(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "缺少流量同步幂等键"})
 			return
 		}
+		if len(syncID) > 64 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "无效的流量同步幂等键"})
+			return
+		}
 		// Persist the key and traffic update in the same transaction so a lost HTTP
-		// response cannot double-charge users.
+		// response cannot double-charge users. Validate only newly accepted batches:
+		// an already-receipted retry must remain successful even if the node rate was
+		// changed after the original commit.
 		if err := s.db.Transaction(func(tx *gorm.DB) error {
 			receipt := database.NodeSyncReceipt{NodeID: node.ID, SyncID: syncID}
 			result := tx.Where("node_id = ? AND sync_id = ?", node.ID, syncID).FirstOrCreate(&receipt)
@@ -300,21 +388,26 @@ func (s *AdminServer) handleNodeSync(c *gin.Context) {
 				return nil
 			}
 
-			for hash, t := range req.Traffic {
-				total := int64(t.Up + t.Down)
-				if node.TrafficRate != 1.0 {
-					total = int64(float64(total) * node.TrafficRate)
+			increments := make(map[string]trafficIncrement, len(req.Traffic))
+			for hash, traffic := range req.Traffic {
+				increment, err := newTrafficIncrement(traffic.Up, traffic.Down, node.TrafficRate)
+				if err != nil {
+					return err
 				}
-				if err := tx.Model(&database.User{}).Where("hash = ?", hash).Updates(map[string]interface{}{
-					"upload":   gorm.Expr("upload + ?", int64(t.Up)),
-					"download": gorm.Expr("download + ?", int64(t.Down)),
-					"used":     gorm.Expr("used + ?", total),
-				}).Error; err != nil {
+				increments[hash] = increment
+			}
+			for hash, increment := range increments {
+				if err := persistTrafficIncrement(tx, hash, increment); err != nil {
 					return err
 				}
 			}
 			return nil
 		}); err != nil {
+			if isTrafficValueError(err) {
+				log.Warnf("node sync: rejected invalid traffic batch for node %d: %v", node.ID, err)
+				c.JSON(http.StatusBadRequest, gin.H{"error": "无效的流量数据"})
+				return
+			}
 			log.Error("node sync: failed to persist traffic batch:", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "流量同步失败"})
 			return
@@ -322,7 +415,11 @@ func (s *AdminServer) handleNodeSync(c *gin.Context) {
 	}
 
 	var users []database.User
-	s.db.Where("status = ?", 0).Find(&users)
+	if err := s.db.Where("status = ?", 0).Find(&users).Error; err != nil {
+		log.Errorf("node sync: list active users: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "读取有效用户失败"})
+		return
+	}
 	validHashes := []string{}
 	for _, u := range users {
 		if u.ExpiryTime != nil && !u.ExpiryTime.IsZero() && u.ExpiryTime.Before(now) {
@@ -356,7 +453,11 @@ func (s *AdminServer) handleNodeHeartbeat(c *gin.Context) {
 	if ip := c.ClientIP(); ip != "" && ip != "::1" && ip != "127.0.0.1" {
 		node.DetectedIP = ip
 	}
-	s.db.Save(&node)
+	if err := s.db.Save(&node).Error; err != nil {
+		log.Errorf("heartbeat: save node %d: %v", node.ID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "心跳信息更新失败"})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -441,11 +542,26 @@ func (s *AdminServer) handleSaveHysteriaConfig(c *gin.Context) {
 		"hysteria_down_mbps":      true,
 		"hysteria_masquerade_url": true,
 	}
-	for k, v := range req {
-		if !allowed[k] {
-			continue
+	// L-01: persist all accepted keys in one transaction and report failures.
+	// Previously a failed upsert returned "已保存" while nothing was written,
+	// and a partial failure could leave port/bandwidth settings inconsistent.
+	err := s.db.Transaction(func(tx *gorm.DB) error {
+		for k, v := range req {
+			if !allowed[k] {
+				continue
+			}
+			if err := tx.Where("`key` = ?", k).
+				Assign(database.Config{Value: v}).
+				FirstOrCreate(&database.Config{Key: k}).Error; err != nil {
+				return fmt.Errorf("save %s: %w", k, err)
+			}
 		}
-		s.db.Where("`key` = ?", k).Assign(database.Config{Value: v}).FirstOrCreate(&database.Config{Key: k})
+		return nil
+	})
+	if err != nil {
+		log.Errorf("hysteria settings: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Hysteria2 配置保存失败"})
+		return
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "Hysteria2 配置已保存"})
 }

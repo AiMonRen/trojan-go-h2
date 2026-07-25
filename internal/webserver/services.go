@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"net/http"
 	"os"
 	"path/filepath"
 
@@ -44,12 +43,43 @@ func loadStandaloneConfig(configPath string) (standaloneConfig, error) {
 	if cfg.Admin.DBPath == "" {
 		return cfg, fmt.Errorf("配置文件中缺少 admin.db")
 	}
+	if cfg.Admin.Username == "" || cfg.Admin.Password == "" {
+		return cfg, fmt.Errorf("配置文件中缺少 admin.username 或 admin.password")
+	}
+	if cfg.Admin.Path == "" {
+		return cfg, fmt.Errorf("配置文件中缺少 admin.path")
+	}
+	if cfg.Admin.SubPath == "" {
+		return cfg, fmt.Errorf("配置文件中缺少 admin.sub_path")
+	}
 	return cfg, nil
+}
+
+func ValidateAdminServiceConfig(configPath string) error {
+	_, err := loadStandaloneConfig(configPath)
+	return err
+}
+
+func ValidateWorkerControlServiceConfig(configPath string) error {
+	cfg, err := loadStandaloneConfig(configPath)
+	if err != nil {
+		return err
+	}
+	if !cfg.Node.Enabled {
+		return fmt.Errorf("worker control-service requires node.enabled=true")
+	}
+	return nil
 }
 
 // RunAdminService starts the sole master-database writer. It reads the existing
 // deployment database directly; no schema replacement or data export is used.
 func RunAdminService(configPath, listenAddress string) error {
+	if err := requireLoopbackAddress(listenAddress, "admin-service"); err != nil {
+		return err
+	}
+	if err := ValidateAdminServiceConfig(configPath); err != nil {
+		return err
+	}
 	if abs, err := filepath.Abs(configPath); err == nil {
 		WebConfigPath = abs
 	} else {
@@ -65,13 +95,13 @@ func RunAdminService(configPath, listenAddress string) error {
 	}
 	srv := newAdminServer(db, cfg.Admin.Username, cfg.Admin.Password, cfg.Admin.Path, 0, false, "", false, cfg.Node.Enabled, "", cfg.Admin.SubPath, "", true)
 	gin.SetMode(gin.ReleaseMode)
-	r := gin.New()
+	r := newTrustedGinEngine()
 	srv.registerRoutesForMode(r, cfg.Admin.Path, RouteModeAdmin)
 	listener, err := net.Listen("tcp", listenAddress)
 	if err != nil {
 		return fmt.Errorf("监听 admin-service 失败: %w", err)
 	}
-	httpServer := &http.Server{Handler: r}
+	httpServer := newHTTPServer(r)
 	log.Infof("admin-service started on http://%s using existing database %s", listener.Addr(), cfg.Admin.DBPath)
 	go func() {
 		<-common.ShutdownContext().Done()

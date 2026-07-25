@@ -23,6 +23,7 @@ func TestDataPlaneTrafficEndpointIsIdempotent(t *testing.T) {
 		t.Fatalf("create user: %v", err)
 	}
 	srv := newAdminServer(db, "admin", "test-password", "/admin/", 0, false, "", false, false, "", "/sub", "", false)
+	srv.internalToken = "" // bypass internal auth for unit tests
 	router := gin.New()
 	srv.registerRoutesForMode(router, "/admin/", RouteModeAdmin)
 
@@ -64,6 +65,7 @@ func TestDataPlaneTrafficEndpointRejectsNonLoopback(t *testing.T) {
 		t.Fatalf("InitDb: %v", err)
 	}
 	srv := newAdminServer(db, "admin", "test-password", "/admin/", 0, false, "", false, false, "", "/sub", "", false)
+	srv.internalToken = "" // bypass internal auth for unit tests
 	router := gin.New()
 	srv.registerRoutesForMode(router, "/admin/", RouteModeAdmin)
 	request := httptest.NewRequest(http.MethodPost, "/internal/control/v1/data-plane/traffic", bytes.NewBufferString(`{"sync_id":"batch","traffic":{"hash":{"up":1,"down":2}}}`))

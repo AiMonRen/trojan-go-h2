@@ -30,8 +30,9 @@ type User struct {
 	recvSpeed uint64
 
 	hash        string
-	ipTable     sync.Map
-	ipNum       int32
+	trafficLock sync.Mutex
+	ipLock      sync.Mutex
+	ipTable     map[string]struct{}
 	maxIPNum    int
 	limiterLock sync.RWMutex
 	sendLimiter *rate.Limiter
@@ -47,57 +48,98 @@ func (u *User) Close() error {
 }
 
 func (u *User) AddIP(ip string) bool {
+	u.ipLock.Lock()
+	defer u.ipLock.Unlock()
 	if u.maxIPNum <= 0 {
 		return true
 	}
-	_, found := u.ipTable.Load(ip)
-	if found {
+	if _, found := u.ipTable[ip]; found {
 		return true
 	}
-	if int(u.ipNum)+1 > u.maxIPNum {
+	if len(u.ipTable) >= u.maxIPNum {
 		return false
 	}
-	u.ipTable.Store(ip, true)
-	atomic.AddInt32(&u.ipNum, 1)
+	u.ipTable[ip] = struct{}{}
 	return true
 }
 
 func (u *User) DelIP(ip string) bool {
+	u.ipLock.Lock()
+	defer u.ipLock.Unlock()
 	if u.maxIPNum <= 0 {
 		return true
 	}
-	_, found := u.ipTable.Load(ip)
-	if !found {
+	if _, found := u.ipTable[ip]; !found {
 		return false
 	}
-	u.ipTable.Delete(ip)
-	atomic.AddInt32(&u.ipNum, -1)
+	delete(u.ipTable, ip)
 	return true
 }
 
 func (u *User) GetIP() int {
-	return int(u.ipNum)
+	u.ipLock.Lock()
+	defer u.ipLock.Unlock()
+	return len(u.ipTable)
 }
 
 func (u *User) SetIPLimit(n int) {
+	u.ipLock.Lock()
 	u.maxIPNum = n
+	if n <= 0 {
+		clear(u.ipTable)
+	}
+	u.ipLock.Unlock()
 }
 
 func (u *User) GetIPLimit() int {
+	u.ipLock.Lock()
+	defer u.ipLock.Unlock()
 	return u.maxIPNum
 }
 
 func (u *User) AddTraffic(sent, recv int) {
+	if sent < 0 || recv < 0 {
+		return
+	}
 	u.limiterLock.RLock()
 	defer u.limiterLock.RUnlock()
 
-	if u.sendLimiter != nil && sent >= 0 {
+	if u.sendLimiter != nil && sent > 0 {
 		u.sendLimiter.WaitN(u.ctx, sent)
-	} else if u.recvLimiter != nil && recv >= 0 {
+	}
+	if u.recvLimiter != nil && recv > 0 {
 		u.recvLimiter.WaitN(u.ctx, recv)
 	}
-	atomic.AddUint64(&u.sent, uint64(sent))
-	atomic.AddUint64(&u.recv, uint64(recv))
+	u.AddTraffic64(uint64(sent), uint64(recv))
+}
+
+func (u *User) AddTraffic64(sent, recv uint64) {
+	u.trafficLock.Lock()
+	atomic.AddUint64(&u.sent, sent)
+	atomic.AddUint64(&u.recv, recv)
+	u.trafficLock.Unlock()
+}
+
+// SubtractTraffic atomically decreases the traffic counters by the given
+// amounts, saturating at zero. It holds trafficLock to serialize against
+// concurrent AddTraffic64 calls. This is used by the embedded sync path to
+// close the crash window between ResetTraffic and the database commit:
+// traffic is persisted first, then counters are decremented only on success.
+func (u *User) SubtractTraffic(sent, recv uint64) {
+	u.trafficLock.Lock()
+	defer u.trafficLock.Unlock()
+	cur := atomic.LoadUint64(&u.sent)
+	if cur >= sent {
+		atomic.StoreUint64(&u.sent, cur-sent)
+	} else {
+		atomic.StoreUint64(&u.sent, 0)
+	}
+	cur = atomic.LoadUint64(&u.recv)
+	if cur >= recv {
+		atomic.StoreUint64(&u.recv, cur-recv)
+	} else {
+		atomic.StoreUint64(&u.recv, 0)
+	}
 }
 
 func (u *User) SetSpeedLimit(send, recv int) {
@@ -134,8 +176,10 @@ func (u *User) Hash() string {
 }
 
 func (u *User) SetTraffic(send, recv uint64) {
+	u.trafficLock.Lock()
 	atomic.StoreUint64(&u.sent, send)
 	atomic.StoreUint64(&u.recv, recv)
+	u.trafficLock.Unlock()
 }
 
 func (u *User) GetTraffic() (uint64, uint64) {
@@ -143,11 +187,31 @@ func (u *User) GetTraffic() (uint64, uint64) {
 }
 
 func (u *User) ResetTraffic() (uint64, uint64) {
-	sent := atomic.SwapUint64(&u.sent, 0)
-	recv := atomic.SwapUint64(&u.recv, 0)
+	sent, recv, _ := u.TakeTraffic(nil)
+	return sent, recv
+}
+
+// TakeTraffic runs checkpoint while traffic mutation is blocked, then clears
+// exactly the counters represented by that durable checkpoint. If checkpoint
+// fails, the counters remain untouched.
+func (u *User) TakeTraffic(checkpoint func(sent, recv uint64) error) (uint64, uint64, error) {
+	u.trafficLock.Lock()
+	defer u.trafficLock.Unlock()
+	sent := atomic.LoadUint64(&u.sent)
+	recv := atomic.LoadUint64(&u.recv)
+	if sent == 0 && recv == 0 {
+		return 0, 0, nil
+	}
+	if checkpoint != nil {
+		if err := checkpoint(sent, recv); err != nil {
+			return sent, recv, err
+		}
+	}
+	atomic.StoreUint64(&u.sent, 0)
+	atomic.StoreUint64(&u.recv, 0)
 	atomic.StoreUint64(&u.lastSent, 0)
 	atomic.StoreUint64(&u.lastRecv, 0)
-	return sent, recv
+	return sent, recv, nil
 }
 
 func (u *User) speedUpdater() {
@@ -197,9 +261,10 @@ func (a *Authenticator) AddUser(hash string) error {
 	}
 	ctx, cancel := context.WithCancel(a.ctx)
 	meter := &User{
-		hash:   hash,
-		ctx:    ctx,
-		cancel: cancel,
+		hash:    hash,
+		ipTable: make(map[string]struct{}),
+		ctx:     ctx,
+		cancel:  cancel,
 	}
 	go meter.speedUpdater()
 	a.users.Store(hash, meter)
