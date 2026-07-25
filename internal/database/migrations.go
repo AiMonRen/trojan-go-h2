@@ -397,7 +397,7 @@ func purgeSyncPlaceholderPasswords(tx *gorm.DB) error {
 
 func readConfigValue(tx *gorm.DB, key string) (Config, bool, error) {
 	var config Config
-	err := tx.Where("key = ?", key).First(&config).Error
+	err := tx.Where("`key` = ?", key).First(&config).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return Config{}, false, nil
 	}
@@ -408,7 +408,7 @@ func updateConfigValue(tx *gorm.DB, config Config, value string) error {
 	if value == config.Value {
 		return nil
 	}
-	return tx.Model(&Config{}).Where("key = ?", config.Key).Update("value", value).Error
+	return tx.Model(&Config{}).Where("`key` = ?", config.Key).Update("value", value).Error
 }
 
 func normalizeLegacyClashRuleGroups(tx *gorm.DB) error {

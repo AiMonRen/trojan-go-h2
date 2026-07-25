@@ -430,7 +430,7 @@ func InitDb(dbPath string) (*gorm.DB, error) {
 		{Key: "sub_use_ws", Value: "false"},
 	}
 	for _, seed := range seeds {
-		db.Where("key = ?", seed.Key).FirstOrCreate(&Config{Key: seed.Key, Value: seed.Value})
+		db.Where("`key` = ?", seed.Key).FirstOrCreate(&Config{Key: seed.Key, Value: seed.Value})
 	}
 
 	if err := RunMigrations(db); err != nil {

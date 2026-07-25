@@ -86,7 +86,7 @@ func TestRunMigrationsRollsBackFailureAndAuditsIt(t *testing.T) {
 		t.Fatalf("migration error = %v", err)
 	}
 	var config Config
-	if err := db.Where("key = ?", "must_not_persist").First(&config).Error; !errors.Is(err, gorm.ErrRecordNotFound) {
+	if err := db.Where("`key` = ?", "must_not_persist").First(&config).Error; !errors.Is(err, gorm.ErrRecordNotFound) {
 		t.Fatalf("failed migration data persisted: config=%+v err=%v", config, err)
 	}
 	var migrationCount int64
@@ -235,7 +235,7 @@ func TestRegisteredMigrationsNormalizeLegacyRules(t *testing.T) {
 		t.Fatalf("run registered migrations: %v", err)
 	}
 	var config Config
-	if err := db.Where("key = ?", "clash_rules").First(&config).Error; err != nil {
+	if err := db.Where("`key` = ?", "clash_rules").First(&config).Error; err != nil {
 		t.Fatalf("read migrated config: %v", err)
 	}
 	for _, want := range []string{"DOMAIN-SUFFIX,google.com,🌐 节点选择", "DOMAIN-SUFFIX,openai.com,🤖 AI 服务", "DOMAIN-SUFFIX,githubcopilot.com,💻 AI 编程", "MATCH,🐟 漏网之鱼"} {
