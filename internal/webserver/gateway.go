@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -30,6 +31,9 @@ const (
 // GatewayConfig defines the independently deployable TCP/443 edge gateway.
 // HTTP routes are handled by ServiceRouter. Non-HTTP traffic is delivered as
 // decrypted Trojan bytes to a loopback-only data-plane listener.
+// When RelayTable is non-empty, the gateway peeks at TLS ClientHello SNI
+// and forwards matching traffic directly to the configured exit address
+// without terminating TLS locally.
 type GatewayConfig struct {
 	ListenAddress  string
 	CertPath       string
@@ -41,6 +45,10 @@ type GatewayConfig struct {
 	AdminPrefix    string
 	SubPath        string
 	MaxConnections int
+	// RelayTable maps TLS SNI domain names to "[host]:port" exit addresses.
+	// SNI=key → TCP forward to value. Key uses suffix matching (e.g.
+	// "xjp.liteops.top" matches SNI "xjp.liteops.top").
+	RelayTable map[string]string
 }
 
 // Gateway owns the public TLS listener and keeps all service backends private.
@@ -59,6 +67,8 @@ type Gateway struct {
 	// instead of merely logging the count and returning.
 	activeConns map[net.Conn]struct{}
 	connMu      sync.Mutex
+	// relayTable is the SNI→exit mapping for TCP relay without TLS termination.
+	relayTable map[string]string
 }
 
 // gatewayFileConfig is intentionally independent from admin-service database
@@ -82,6 +92,8 @@ type gatewayFileConfig struct {
 		AdminDisabled  bool   `yaml:"admin_disabled"`
 		ControlService string `yaml:"control_service"`
 		TrojanService  string `yaml:"trojan_service"`
+		// Relay is a SNI→exit mapping for TCP relay without TLS termination.
+		Relay map[string]string `yaml:"relay"`
 	} `yaml:"gateway"`
 	Routes struct {
 		AdminPrefix string `yaml:"admin_prefix"`
@@ -193,6 +205,7 @@ func RunGatewayService(configPath, listenAddress string) error {
 		TrojanAddress:  trojanAddress,
 		AdminPrefix:    gatewayFile.Routes.AdminPrefix,
 		SubPath:        gatewayFile.Routes.SubPath,
+		RelayTable:     gatewayFile.Gateway.Relay,
 	})
 	if err != nil {
 		return err
@@ -302,6 +315,7 @@ func NewGateway(cfg GatewayConfig) (*Gateway, error) {
 		tlsConfig:     &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"http/1.1"}, MinVersion: tls.VersionTLS12},
 		serviceRouter: router,
 		trojanAddress: cfg.TrojanAddress,
+		relayTable:    cfg.RelayTable,
 		dialer:        net.Dialer{Timeout: gatewayBackendDialTimeout, KeepAlive: 30 * time.Second},
 		done:          make(chan struct{}),
 		semaphore:     make(chan struct{}, maxConn),
@@ -349,7 +363,166 @@ func (g *Gateway) Serve() error {
 	}
 }
 
+
+// tryRelayRoute peeks at the TLS ClientHello on rawConn. If the SNI matches a
+// key in g.relayTable, the raw TCP stream is forwarded to the configured exit
+// address without local TLS termination. Returns true if relayed.
+func (g *Gateway) tryRelayRoute(rawConn net.Conn) bool {
+	_ = rawConn.SetDeadline(time.Now().Add(gatewayHandshakeTimeout))
+
+	// Read TLS record header (5 bytes) to determine the full record length.
+	var header [5]byte
+	if _, err := io.ReadFull(rawConn, header[:]); err != nil {
+		_ = rawConn.Close()
+		return true
+	}
+	if header[0] != 0x16 { // not TLS Handshake
+		p := &prefixConn{Conn: rawConn, prefix: header[:]}
+		rawConn = p
+		return false
+	}
+	recordLen := int(header[3])<<8 | int(header[4])
+	if recordLen < 38 || recordLen > 16384 { // implausible ClientHello
+		_ = rawConn.Close()
+		return true
+	}
+
+	// Read the exact record body.
+	buf := make([]byte, recordLen)
+	if _, err := io.ReadFull(rawConn, buf); err != nil {
+		_ = rawConn.Close()
+		return true
+	}
+	_ = rawConn.SetDeadline(time.Time{})
+
+	sni := extractSNI(buf)
+	fullPayload := append(header[:], buf...)
+
+	if sni == "" {
+		p := &prefixConn{Conn: rawConn, prefix: fullPayload}
+		rawConn = p
+		return false
+	}
+	// SNI parsed, continue with relay routing.
+
+	// Suffix-match against relayTable keys.
+	var exitAddr string
+	for domain, addr := range g.relayTable {
+		if strings.HasSuffix(sni, domain) {
+			exitAddr = addr
+			break
+		}
+	}
+	if exitAddr == "" {
+		p := &prefixConn{Conn: rawConn, prefix: fullPayload}
+		rawConn = p
+		return false
+	}
+
+	log.Infof("gateway relay: SNI=%s -> %s", sni, exitAddr)
+	exitConn, err := net.DialTimeout("tcp", exitAddr, gatewayBackendDialTimeout)
+	if err != nil {
+		log.Warnf("gateway relay: dial exit %s: %v", exitAddr, err)
+		_ = rawConn.Close()
+		return true
+	}
+
+	// Forward the full TLS record payload (header + body) to the exit.
+	if _, err := exitConn.Write(fullPayload); err != nil {
+		_ = exitConn.Close()
+		_ = rawConn.Close()
+		return true
+	}
+	relayGatewayConnections(rawConn, exitConn)
+	return true
+}
+
+// extractSNI parses a TLS ClientHello byte stream and returns the SNI
+// hostname, or empty string if not found.
+func extractSNI(data []byte) string {
+	const recordHeaderLen = 5
+	if len(data) < recordHeaderLen || data[0] != 0x16 {
+		return ""
+	}
+	recordLen := int(data[3])<<8 | int(data[4])
+	if len(data) < recordHeaderLen+recordLen {
+		return ""
+	}
+	hs := data[recordHeaderLen : recordHeaderLen+recordLen]
+	if len(hs) < 1 || hs[0] != 0x01 { // not ClientHello
+		return ""
+	}
+	// Skip: handshake type(1) + length(3) + version(2) + random(32)
+	pos := 6 + 32
+	if pos >= len(hs) {
+		return ""
+	}
+	// Session ID
+	sessLen := int(hs[pos])
+	pos += 1 + sessLen
+	if pos+2 > len(hs) {
+		return ""
+	}
+	// Cipher suites
+	cipherLen := int(hs[pos])<<8 | int(hs[pos+1])
+	pos += 2 + cipherLen
+	if pos+1 > len(hs) {
+		return ""
+	}
+	// Compression methods
+	compLen := int(hs[pos])
+	pos += 1 + compLen
+	if pos+2 > len(hs) {
+		return ""
+	}
+	// Extensions
+	extLen := int(hs[pos])<<8 | int(hs[pos+1])
+	pos += 2
+	end := pos + extLen
+	if end > len(hs) {
+		end = len(hs)
+	}
+	for pos+4 <= end {
+		extType := int(hs[pos])<<8 | int(hs[pos+1])
+		extDataLen := int(hs[pos+2])<<8 | int(hs[pos+3])
+		pos += 4
+		if extType == 0 && pos+5 <= end { // SNI (type 0x0000)
+			nameLen := int(hs[pos+3])<<8 | int(hs[pos+4])
+			if pos+5+nameLen <= end {
+				return string(hs[pos+5 : pos+5+nameLen])
+			}
+			return ""
+		}
+		pos += extDataLen
+	}
+	return ""
+}
+
+// prefixConn is a net.Conn that prepends a byte slice to the first Read.
+type prefixConn struct {
+	net.Conn
+	prefix []byte
+}
+
+func (p *prefixConn) Read(b []byte) (int, error) {
+	if len(p.prefix) > 0 {
+		n := copy(b, p.prefix)
+		p.prefix = p.prefix[n:]
+		return n, nil
+	}
+	return p.Conn.Read(b)
+}
+
 func (g *Gateway) handleConn(rawConn net.Conn) {
+	// If relayTable is configured, peek at TLS ClientHello SNI before
+	// handshake. Matching traffic is forwarded directly to the exit node
+	// without local TLS termination.
+	if len(g.relayTable) > 0 {
+		if g.tryRelayRoute(rawConn) {
+			return
+		}
+	}
+
 	_ = rawConn.SetDeadline(time.Now().Add(gatewayHandshakeTimeout))
 	tlsConn := tls.Server(rawConn, g.tlsConfig)
 	if err := tlsConn.Handshake(); err != nil {

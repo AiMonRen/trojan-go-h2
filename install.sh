@@ -104,6 +104,10 @@ mysql_dbname="trojan_go"
 sync_interval=60
 admin_username="admin"
 admin_password="AutoGenerate"
+relay_entry_domain=""
+relay_exit_domain=""
+relay_exit_ip=""
+relay_node_name=""
 
 # ==============================================================================
 # 颜色定义
@@ -203,6 +207,10 @@ parse_args() {
                 DEPLOY_MODE="ssl"
                 shift
                 ;;
+            --relay)
+                DEPLOY_MODE="relay"
+                shift
+                ;;
             --force|-f)
                 SSL_FORCE=true
                 shift
@@ -230,7 +238,7 @@ parse_args() {
         exit 1
     fi
 
-    if [[ "$DEPLOY_MODE" != "secret" && "$DEPLOY_MODE" != "ssl" && -z "$DEPLOY_MODE" ]]; then
+    if [[ "$DEPLOY_MODE" != "secret" && "$DEPLOY_MODE" != "ssl" && "$DEPLOY_MODE" != "relay" && -z "$DEPLOY_MODE" ]]; then
         error "请指定部署模式 --master 或 --worker (错误码: 2)"
         show_usage
         exit 2
@@ -246,6 +254,7 @@ ${BOLD}用法:${NC}
   sudo bash install.sh --config=<配置文件路径> --worker [--local-binaries]
   sudo bash install.sh --config=<配置文件路径> --secret
   sudo bash install.sh --config=<配置文件路径> --ssl [--force]
+  sudo bash install.sh --config=<配置文件路径> --relay
 
 ${BOLD}参数:${NC}
   --config=<path>     配置文件路径（必填）
@@ -254,9 +263,16 @@ ${BOLD}参数:${NC}
   --secret            显示主节点 Secret
   --ssl               手动 SSL 证书续期模式
   --force             强制续期（忽略到期时间检查，与 --ssl 配合使用）
+  --relay             中继节点模式（Gateway 内置 SNI 路由 + 订阅虚拟节点）
   --local-binaries    使用本地预编译二进制（跳过编译）
   --local-binaries    使用当前目录已有的 trojan-go / trojan（跳过源码编译）
                       别名: --local
+
+${BOLD}中继模式说明:${NC}
+  --relay 利用 Gateway 内置的 TLS ClientHello SNI 窥探功能实现 TCP 中继。
+  无需 HAProxy，无需改端口。流量从 443 进入，Gateway 根据 SNI 路由:
+    - 入口域名 → 正常 TLS 终止 + Trojan 代理
+    - 出口域名 → TCP 直转到目标 Worker
   --help, -h          显示帮助
 
 ${BOLD}示例:${NC}
@@ -268,6 +284,9 @@ ${BOLD}示例:${NC}
 
   # 获取 Secret
   sudo bash install.sh --config=/mnt/trojan-go/config.conf --secret
+
+  # 配置中继节点（日本入口 → 新加坡出口）
+  sudo bash install.sh --config=/mnt/trojan-go/config.conf --relay
 
 ${BOLD}错误码:${NC}
   1 - 配置文件路径不存在
@@ -328,7 +347,10 @@ load_config() {
             sync_interval) sync_interval="$value" ;;
             admin_username) admin_username="$value" ;;
             admin_password) admin_password="$value" ;;
-        esac
+            relay_entry_domain) relay_entry_domain="$value" ;;
+            relay_exit_domain) relay_exit_domain="$value" ;;
+            relay_exit_ip) relay_exit_ip="$value" ;;
+            relay_node_name) relay_node_name="$value" ;; 
     done < "$CONFIG_FILE"
 
     debug "配置加载完成: master=${master}, worker=${worker}, db_type=${db_type}"
@@ -432,6 +454,8 @@ validate_config() {
         validate_master_config
     elif [[ "$DEPLOY_MODE" == "worker" ]]; then
         validate_worker_config
+    elif [[ "$DEPLOY_MODE" == "relay" ]]; then
+        validate_relay_config
     fi
 }
 
@@ -493,6 +517,38 @@ validate_worker_config() {
     fi
 
     success "从节点配置校验通过"
+}
+
+validate_relay_config() {
+    info "校验中继节点配置..."
+
+    if [[ -z "$relay_entry_domain" ]]; then
+        error "relay_entry_domain 不能为空（入口节点域名） (错误码: 4)"
+        exit 4
+    fi
+
+    if [[ -z "$relay_exit_domain" ]]; then
+        error "relay_exit_domain 不能为空（出口节点域名） (错误码: 4)"
+        exit 4
+    fi
+
+    if [[ -z "$relay_exit_ip" ]]; then
+        error "relay_exit_ip 不能为空（出口节点 IP） (错误码: 4)"
+        exit 4
+    fi
+
+    if [[ -z "$relay_node_name" ]]; then
+        relay_node_name="relay"
+        info "relay_node_name 未设置，使用默认值: relay"
+    fi
+
+    # 确保已部署的 gateway 存在
+    if ! systemctl is-active --quiet trojan-go-gateway.service 2>/dev/null; then
+        error "trojan-go-gateway.service 未运行 — 请先在当前节点部署 trojan-go"
+        exit 4
+    fi
+
+    success "中继节点配置校验通过"
 }
 
 # ==============================================================================
@@ -1233,6 +1289,18 @@ gateway:
   admin_disabled: ${admin_disabled}
   control_service: ${CONTROL_ADDR}
   trojan_service: ${DATA_PLANE_ADDR}
+EOF
+
+    # 中继路由表：SNI=出口域名 → 转发到出口 IP:443
+    if [[ -n "$relay_exit_domain" && -n "$relay_exit_ip" ]]; then
+        cat >> "${CONFIG_DIR}/gateway.yaml" << INNEREOF
+  relay:
+    ${relay_exit_domain}: ${relay_exit_ip}:443
+INNEREOF
+        info "Gateway 中继路由: SNI=${relay_exit_domain} -> ${relay_exit_ip}:443"
+    fi
+
+    cat >> "${CONFIG_DIR}/gateway.yaml" << EOF
 
 routes:
   admin_prefix: ${ADMIN_PREFIX}
@@ -1974,6 +2042,75 @@ show_secret() {
 }
 
 # ==============================================================================
+# 14a2. 配置 TCP 中继节点（Gateway 内置 SNI 路由）
+# --relay 模式：Gateway 在 TLS 握手前窥探 ClientHello SNI，
+# 匹配 relay_exit_domain 的流量直接 TCP 转发到 relay_exit_ip。
+# 无需 HAProxy，无需改端口，Gateway 内部完成所有路由。
+# ==============================================================================
+setup_relay_node() {
+    header "配置 TCP 中继节点 / Setup TCP Relay Node"
+
+    local entry_domain="${relay_entry_domain:-$master}"
+    local exit_domain="${relay_exit_domain}"
+    local exit_ip="${relay_exit_ip}"
+    local node_name="${relay_node_name:-relay}"
+
+    if [[ -z "$exit_domain" || -z "$exit_ip" ]]; then
+        error "relay_exit_domain, relay_exit_ip 为必填项 (错误码: 4)"
+        exit 4
+    fi
+
+    info "中继路由: SNI=${exit_domain} -> ${exit_ip}:443"
+    info "入口节点: ${entry_domain}"
+    info "订阅节点名: ${node_name}"
+
+    # 1. 确保 gateway.yaml ���含 relay 路由表（deploy_master 已生成，此处幂等检查）
+    if ! grep -q "relay:" "${CONFIG_DIR}/gateway.yaml" 2>/dev/null; then
+        sed -i "/trojan_service:/a\  relay:\n    ${exit_domain}: ${exit_ip}:443" "${CONFIG_DIR}/gateway.yaml"
+    fi
+    success "Gateway relay 路由已配置"
+
+    # 2. 重启 gateway 加载 relay 路由表
+    info "重启 gateway 加载 relay 路由表..."
+    systemctl restart trojan-go-gateway.service 2>/dev/null
+    sleep 2
+    if systemctl is-active --quiet trojan-go-gateway.service; then
+        success "Gateway 已重启，SNI relay 路由生效"
+    else
+        error "Gateway 重启失败: journalctl -u trojan-go-gateway -n 20"
+        exit 11
+    fi
+
+    # 3. 插入中继虚拟节点到 MySQL（名称含 "(转)" 触发订阅 relay-only 行为）
+    local db_name="${node_name}"
+    if ! echo "${node_name}" | grep -q '(转)'; then
+        db_name="${node_name}(转)"
+    fi
+
+    local mysql_cmd
+    if [[ "$mysql_deploy" == "docker" ]]; then
+        mysql_cmd="docker exec ${mysql_docker_name} mysql -u root -p${mysql_docker_root_password} ${mysql_dbname}"
+    else
+        mysql_cmd="mysql -h ${mysql_host} -P ${mysql_port} -u ${mysql_user} -p${mysql_password} ${mysql_dbname}"
+    fi
+
+    $mysql_cmd -e "DELETE FROM nodes WHERE name='${db_name}';" 2>/dev/null || true
+    $mysql_cmd -e "INSERT INTO nodes (name, address, port, sni, secret, status, ws_enabled, ws_path, traffic_rate, created_at, updated_at) VALUES ('${db_name}', '${entry_domain}', 443, '${exit_domain}', '', 1, false, '/trojan-go', 1.0, NOW(), NOW());" 2>/dev/null &&         success "节点已注册: ${db_name}" ||         warn "节点注册失败，请手动 INSERT INTO nodes"
+
+    echo ""
+    echo -e "  ${BOLD}中继架构（Gateway 内置 SNI 路由）:${NC}"
+    echo -e "    客户端 ──TLS(:443)──→ Gateway"
+    echo -e "      ├─ SNI=${entry_domain}  → 本地 TLS/Trojan"
+    echo -e "      └─ SNI=${exit_domain}   → TCP 转发 ${exit_ip}:443"
+    echo -e ""
+    echo -e "  ${BOLD}订阅节点:${NC} ${db_name}"
+    echo -e "  ${BOLD}Address:${NC}   ${entry_domain}"
+    echo -e "  ${BOLD}SNI:${NC}       ${exit_domain}"
+    echo -e "  ${BOLD}协议:${NC}       TCP/Trojan (无 Hysteria2)"
+}
+
+
+# ==============================================================================
 # 14b. 自动创建管理员用户
 # ==============================================================================
 create_admin_user() {
@@ -2221,6 +2358,13 @@ main() {
         exit 0
     fi
 
+    # 5c. 如果是 --relay 模式，仅配置中继节点
+    if [[ "$DEPLOY_MODE" == "relay" ]]; then
+        header "中继节点配置 / Relay Node Setup"
+        setup_relay_node
+        exit 0
+    fi
+
     # 6. 清理已有服务与残留进程（避免端口占用、二进制文件被占用）
     cleanup_existing_services
 
@@ -2237,7 +2381,7 @@ main() {
         deploy_worker
     fi
 
-    # 9b. 自动创建管理员用户
+    # 9b. 自动创建管理员用户 (master 模式)
     if [[ "$DEPLOY_MODE" == "master" ]]; then
         create_admin_user
     fi
