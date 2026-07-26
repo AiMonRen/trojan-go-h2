@@ -16,12 +16,13 @@ import (
 
 type standaloneConfig struct {
 	Admin struct {
-		Enabled  bool   `yaml:"enabled"`
-		Username string `yaml:"username"`
-		Password string `yaml:"password"`
-		DBPath   string `yaml:"db"`
-		Path     string `yaml:"path"`
-		SubPath  string `yaml:"sub_path"`
+		Enabled     bool   `yaml:"enabled"`
+		Username    string `yaml:"username"`
+		Password    string `yaml:"password"`
+		DBPath      string `yaml:"db"`
+		Path        string `yaml:"path"`
+		SubPath     string `yaml:"sub_path"`
+		ServerDomain string `yaml:"server_domain"`
 	} `yaml:"admin"`
 	Node struct {
 		Enabled bool `yaml:"enabled"`
@@ -93,7 +94,7 @@ func RunAdminService(configPath, listenAddress string) error {
 	if err != nil {
 		return fmt.Errorf("初始化数据库失败: %w", err)
 	}
-	srv := newAdminServer(db, cfg.Admin.Username, cfg.Admin.Password, cfg.Admin.Path, 0, false, "", false, cfg.Node.Enabled, "", cfg.Admin.SubPath, "", true)
+	srv := newAdminServer(db, cfg.Admin.Username, cfg.Admin.Password, cfg.Admin.Path, 0, false, "", false, cfg.Node.Enabled, "", cfg.Admin.SubPath, cfg.Admin.ServerDomain, true)
 	gin.SetMode(gin.ReleaseMode)
 	r := newTrustedGinEngine()
 	srv.registerRoutesForMode(r, cfg.Admin.Path, RouteModeAdmin)

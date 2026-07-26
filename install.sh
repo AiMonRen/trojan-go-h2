@@ -350,7 +350,8 @@ load_config() {
             relay_entry_domain) relay_entry_domain="$value" ;;
             relay_exit_domain) relay_exit_domain="$value" ;;
             relay_exit_ip) relay_exit_ip="$value" ;;
-            relay_node_name) relay_node_name="$value" ;; 
+            relay_node_name) relay_node_name="$value" ;;
+        esac
     done < "$CONFIG_FILE"
 
     debug "配置加载完成: master=${master}, worker=${worker}, db_type=${db_type}"
@@ -1334,7 +1335,12 @@ generate_admin_config() {
     local db_dsn
     db_dsn=$(build_db_dsn)
 
-    # schema 对应 internal/webserver.standaloneConfig，6 个字段均为必填
+    # schema 对应 internal/webserver.standaloneConfig
+    # node.enabled=true 表示当前节点运行 control（Worker 模式），否则运行 admin（Master 模式）
+    local node_enabled="false"
+    if [[ "$DEPLOY_MODE" == "worker" ]]; then
+        node_enabled="true"
+    fi
     cat > "${CONFIG_DIR}/admin.yaml" << EOF
 admin:
   enabled: true
@@ -1343,8 +1349,9 @@ admin:
   password: "${admin_password}"
   path: ${ADMIN_PREFIX}
   sub_path: ${SUB_PATH}
+  server_domain: "${master}"
 node:
-  enabled: false
+  enabled: ${node_enabled}
 EOF
     # 含 MySQL 明文口令
     chmod 600 "${CONFIG_DIR}/admin.yaml"
@@ -1384,6 +1391,7 @@ admin:
   password: "${admin_password}"
   path: ${ADMIN_PREFIX}
   sub_path: ${SUB_PATH}
+  server_domain: "${worker}"
 node:
   enabled: true
   master_url: https://${master}/control/v1/nodes/sync
@@ -2145,28 +2153,38 @@ create_admin_user() {
         return 0
     fi
 
-    # 检查是否已有用户（避免重复创建）
-    local user_count
-    user_count=$(curl -s -H "Authorization: Bearer ${token}" "http://${ADMIN_ADDR}${ADMIN_PREFIX}api/users" 2>/dev/null | grep -c '"username"' || echo "0")
-    if [[ "$user_count" -gt 0 ]]; then
-        info "数据库中已有 ${user_count} 个用户，跳过管理员创建"
-        return 0
+    # 同时通过内部 API 设置 web 管理面板凭据（configs 表中的 admin_username/admin_password）
+    # handleUpdateAdmin 会自动 bcrypt 哈希密码并保存
+    if [[ -n "$admin_username" && -n "$admin_password" ]]; then
+        local admin_http_code
+        admin_http_code=$(curl -s -w '%{http_code}' -o /dev/null \
+            -X PUT "http://127.0.0.1:8081/internal/control/v1/settings/admin" \
+            -H "Content-Type: application/json" \
+            -H "X-Internal-Token: ${token}" \
+            -d "{\"username\":\"${admin_username}\",\"password\":\"${admin_password}\"}" \
+            2>/dev/null)
+        if [[ "$admin_http_code" == "200" ]]; then
+            success "Web 管理面板凭据已保存 (用户名: ${admin_username})"
+        else
+            warn "Web 管理面板凭据设置返回 HTTP ${admin_http_code}"
+        fi
     fi
 
-    # 通过内部 API 创建管理员用户
+    # 通过内部 API 创建管理员用户（/internal/control/v1/users 走 X-Internal-Token 认证，用于代理认证）
     local http_code
     http_code=$(curl -s -w '%{http_code}' -o /dev/null \
-        -X POST "http://${ADMIN_ADDR}${ADMIN_PREFIX}api/users" \
+        -X POST "http://127.0.0.1:8081/internal/control/v1/users" \
         -H "Content-Type: application/json" \
-        -H "Authorization: Bearer ${token}" \
+        -H "X-Internal-Token: ${token}" \
         -d "{\"username\":\"${admin_username}\",\"password\":\"${admin_password}\",\"quota\":-1,\"expiry_time\":-1}" \
         2>/dev/null)
 
     if [[ "$http_code" == "200" || "$http_code" == "201" ]]; then
-        success "管理员账户已创建: ${admin_username}"
+        success "管理员代理账户已创建: ${admin_username}"
+    elif [[ "$http_code" == "409" || "$http_code" == "400" ]]; then
+        info "管理员代理账户已存在或参数冲突 (HTTP ${http_code})"
     else
-        warn "管理员 API 返回 HTTP ${http_code}，可能用户已存在"
-        warn "若无法登录请手动创建: docker exec trojan-mysql mysql -u trojan -p\"${mysql_password}\" -e \"INSERT INTO users (username, password_hash, quota, expiry_time) VALUES ('\''${admin_username}'\'', '\''<hash>'\'', -1, -1)\""
+        warn "管理员 API 返回 HTTP ${http_code}"
     fi
 }
 

@@ -390,12 +390,13 @@ func RunStandalone(configPath string) error {
 
 	var cfg struct {
 		Admin struct {
-			Enabled  bool   `yaml:"enabled"`
-			Port     int    `yaml:"port"`
-			Username string `yaml:"username"`
-			Password string `yaml:"password"`
-			DBPath   string `yaml:"db"`
-			Path     string `yaml:"path"`
+			Enabled      bool   `yaml:"enabled"`
+			Port         int    `yaml:"port"`
+			Username     string `yaml:"username"`
+			Password     string `yaml:"password"`
+			DBPath       string `yaml:"db"`
+			Path         string `yaml:"path"`
+			ServerDomain string `yaml:"server_domain"`
 		} `yaml:"admin"`
 		Node struct {
 			Enabled bool `yaml:"enabled"`
@@ -417,7 +418,7 @@ func RunStandalone(configPath string) error {
 	}
 
 	log.Infof("启动独立 Web 管理后台, 监听端口: %d", cfg.Admin.Port)
-	srv := New(db, cfg.Admin.Username, cfg.Admin.Password, cfg.Admin.Path, cfg.Admin.Port, false, "", false, cfg.Node.Enabled, "", "", "")
+	srv := New(db, cfg.Admin.Username, cfg.Admin.Password, cfg.Admin.Path, cfg.Admin.Port, false, "", false, cfg.Node.Enabled, "", "", cfg.Admin.ServerDomain)
 
 	// 这里我们需要一个不会自动退出的方式运行
 	// New 内部已经启动了 http.Server (如果 port > 0)

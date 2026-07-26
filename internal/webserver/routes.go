@@ -185,6 +185,8 @@ func (s *AdminServer) registerInternalControlRoutes(r *gin.Engine) {
 	internal.POST("/nodes/heartbeat", s.handleNodeHeartbeat)
 	internal.POST("/hysteria/auth", s.handleHysteriaAuth)
 	internal.POST("/data-plane/traffic", s.handleDataPlaneTraffic)
+	internal.POST("/users", s.handleAddUser)
+	internal.PUT("/settings/admin", s.handleUpdateAdmin)
 }
 
 // requireInternalControl verifies that the request originates from a

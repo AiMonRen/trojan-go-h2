@@ -366,32 +366,33 @@ func (g *Gateway) Serve() error {
 
 // tryRelayRoute peeks at the TLS ClientHello on rawConn. If the SNI matches a
 // key in g.relayTable, the raw TCP stream is forwarded to the configured exit
-// address without local TLS termination. Returns true if relayed.
-func (g *Gateway) tryRelayRoute(rawConn net.Conn) bool {
+// address without local TLS termination. Returns (true, nil) if relayed,
+// (false, conn) to continue with normal handling using the returned conn
+// (which prefixes any bytes already read).
+func (g *Gateway) tryRelayRoute(rawConn net.Conn) (bool, net.Conn) {
 	_ = rawConn.SetDeadline(time.Now().Add(gatewayHandshakeTimeout))
 
 	// Read TLS record header (5 bytes) to determine the full record length.
 	var header [5]byte
 	if _, err := io.ReadFull(rawConn, header[:]); err != nil {
 		_ = rawConn.Close()
-		return true
+		return true, nil
 	}
 	if header[0] != 0x16 { // not TLS Handshake
 		p := &prefixConn{Conn: rawConn, prefix: header[:]}
-		rawConn = p
-		return false
+		return false, p
 	}
 	recordLen := int(header[3])<<8 | int(header[4])
 	if recordLen < 38 || recordLen > 16384 { // implausible ClientHello
 		_ = rawConn.Close()
-		return true
+		return true, nil
 	}
 
 	// Read the exact record body.
 	buf := make([]byte, recordLen)
 	if _, err := io.ReadFull(rawConn, buf); err != nil {
 		_ = rawConn.Close()
-		return true
+		return true, nil
 	}
 	_ = rawConn.SetDeadline(time.Time{})
 
@@ -400,8 +401,7 @@ func (g *Gateway) tryRelayRoute(rawConn net.Conn) bool {
 
 	if sni == "" {
 		p := &prefixConn{Conn: rawConn, prefix: fullPayload}
-		rawConn = p
-		return false
+		return false, p
 	}
 	// SNI parsed, continue with relay routing.
 
@@ -415,8 +415,7 @@ func (g *Gateway) tryRelayRoute(rawConn net.Conn) bool {
 	}
 	if exitAddr == "" {
 		p := &prefixConn{Conn: rawConn, prefix: fullPayload}
-		rawConn = p
-		return false
+		return false, p
 	}
 
 	log.Infof("gateway relay: SNI=%s -> %s", sni, exitAddr)
@@ -424,17 +423,17 @@ func (g *Gateway) tryRelayRoute(rawConn net.Conn) bool {
 	if err != nil {
 		log.Warnf("gateway relay: dial exit %s: %v", exitAddr, err)
 		_ = rawConn.Close()
-		return true
+		return true, nil
 	}
 
 	// Forward the full TLS record payload (header + body) to the exit.
 	if _, err := exitConn.Write(fullPayload); err != nil {
 		_ = exitConn.Close()
 		_ = rawConn.Close()
-		return true
+		return true, nil
 	}
 	relayGatewayConnections(rawConn, exitConn)
-	return true
+	return true, nil
 }
 
 // extractSNI parses a TLS ClientHello byte stream and returns the SNI
@@ -518,9 +517,11 @@ func (g *Gateway) handleConn(rawConn net.Conn) {
 	// handshake. Matching traffic is forwarded directly to the exit node
 	// without local TLS termination.
 	if len(g.relayTable) > 0 {
-		if g.tryRelayRoute(rawConn) {
+		relayed, conn := g.tryRelayRoute(rawConn)
+		if relayed {
 			return
 		}
+		rawConn = conn
 	}
 
 	_ = rawConn.SetDeadline(time.Now().Add(gatewayHandshakeTimeout))
