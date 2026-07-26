@@ -20,6 +20,11 @@ import (
 )
 
 func (s *AdminServer) getMainNodeInfo() (string, int, bool, string) {
+	// 优先使用 admin 配置中的 server_domain（由 install.sh 写入 admin.yaml），
+	// 避免从证书路径反向猜测域名（会产生 "certs" 等错误值）
+	if s.serverDomain != "" {
+		return s.serverDomain, 443, false, ""
+	}
 	// Unified Gateway deployments publish the Gateway port, never the private
 	// Trojan data-plane port. WebSocket output is disabled until the Gateway has
 	// an explicit Trojan-over-WebSocket adapter.
@@ -503,7 +508,9 @@ func renderClashConfigMultiNode(db *gorm.DB, u database.User, nodes []database.N
 		if nodeName == "" {
 			nodeName = node.Address
 		}
-		isRelay := strings.Contains(nodeName, "(港转)") || strings.Contains(nodeName, "(转)")
+		// 同时支持中英文 relay 节点名匹配：(港转)/(转) 是历史命名约定，
+		// -relay 后缀是英文版，避免 MySQL 字符集双编码导致中文匹配失败。
+		isRelay := strings.Contains(nodeName, "(港转)") || strings.Contains(nodeName, "(转)") || strings.HasSuffix(nodeName, "-relay")
 
 		tjSlaveName := "tcp-" + nodeName
 		sb.WriteString(fmt.Sprintf("  - name: %s\n    type: trojan\n    server: %s\n    port: %d\n    password: %s\n    udp: true\n    sni: %s\n    skip-cert-verify: false\n",
