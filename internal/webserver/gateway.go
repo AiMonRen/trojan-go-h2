@@ -379,7 +379,8 @@ func (g *Gateway) tryRelayRoute(rawConn net.Conn) (bool, net.Conn) {
 		return true, nil
 	}
 	if header[0] != 0x16 { // not TLS Handshake
-		p := &prefixConn{Conn: rawConn, prefix: header[:]}
+		// Copy out of the stack array so the slice stays valid after return.
+		p := &prefixConn{Conn: rawConn, prefix: append([]byte(nil), header[:]...)}
 		return false, p
 	}
 	recordLen := int(header[3])<<8 | int(header[4])
@@ -396,8 +397,13 @@ func (g *Gateway) tryRelayRoute(rawConn net.Conn) (bool, net.Conn) {
 	}
 	_ = rawConn.SetDeadline(time.Time{})
 
-	sni := extractSNI(buf)
-	fullPayload := append(header[:], buf...)
+	// extractSNI expects the complete TLS record including the 5-byte header,
+	// so build fullPayload first and parse from it.
+	fullPayload := make([]byte, 0, len(header)+len(buf))
+	fullPayload = append(fullPayload, header[:]...)
+	fullPayload = append(fullPayload, buf...)
+
+	sni := extractSNI(fullPayload)
 
 	if sni == "" {
 		p := &prefixConn{Conn: rawConn, prefix: fullPayload}
