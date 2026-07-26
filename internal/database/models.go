@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/glebarez/sqlite"
+	mysqldriver "github.com/go-sql-driver/mysql"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -210,8 +211,16 @@ func InitDb(dbPath string) (*gorm.DB, error) {
 		db.Exec("PRAGMA journal_mode=WAL;")
 	}
 
-	// 自动迁移模型
+	// 自动迁移模型。MySQL 上 control-service 和 data-plane 可能同时启动并
+	// 并发调用 AutoMigrate，第一个完成的已添加列，第二个再添加同名列会触发
+	// MySQL Error 1060 (Duplicate column name)。捕获该错误后重试一次：此时
+	// 第一个调用已完成全部迁移，第二次 AutoMigrate 应是纯幂等 no-op。
 	err = db.AutoMigrate(&User{}, &Config{}, &Node{}, &NodeSyncReceipt{}, &DataPlaneSyncReceipt{})
+	if err != nil && isMySQL {
+		if mysqlErr, ok := err.(*mysqldriver.MySQLError); ok && mysqlErr.Number == 1060 {
+			err = db.AutoMigrate(&User{}, &Config{}, &Node{}, &NodeSyncReceipt{}, &DataPlaneSyncReceipt{})
+		}
+	}
 	if err != nil {
 		return nil, err
 	}

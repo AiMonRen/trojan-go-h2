@@ -341,6 +341,7 @@ func registeredMigrations() []Migration {
 		{Version: 4, Name: "remove_unused_rule_providers", Revision: "2026-07-23", Up: removeUnusedRuleProviders},
 		{Version: 5, Name: "encrypt_recoverable_credentials", Revision: "2026-07-23", Up: encryptRecoverableCredentials},
 		{Version: 6, Name: "purge_sync_placeholder_passwords", Revision: "2026-07-25", Up: purgeSyncPlaceholderPasswords},
+		{Version: 7, Name: "make_password_hash_nullable", Revision: "2026-07-26", Up: makePasswordHashNullable},
 	}
 }
 
@@ -393,6 +394,20 @@ func purgeSyncPlaceholderPasswords(tx *gorm.DB) error {
 		}
 	}
 	return nil
+}
+
+// makePasswordHashNullable relaxes the legacy password_hash column so
+// that GORM INSERTs from worker node sync don't fail with "Field
+// 'password_hash' doesn't have a default value". The current User model
+// no longer uses this column; it is a pre-encryption-era artifact.
+func makePasswordHashNullable(tx *gorm.DB) error {
+	if !tx.Migrator().HasTable(&User{}) {
+		return nil
+	}
+	if !tx.Migrator().HasColumn(&User{}, "password_hash") {
+		return nil
+	}
+	return tx.Exec("ALTER TABLE users MODIFY COLUMN password_hash VARCHAR(255) NULL DEFAULT NULL").Error
 }
 
 func readConfigValue(tx *gorm.DB, key string) (Config, bool, error) {

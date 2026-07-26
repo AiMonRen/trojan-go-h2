@@ -854,7 +854,8 @@ provision_internal_token() {
     fi
 
     # 64 字符十六进制，满足 >=16 字符的长度校验
-    ( umask 077 && openssl rand -hex 32 > "$INTERNAL_TOKEN_FILE" )
+    # tr -d '\n' 去除 openssl 输出的尾部换行，避免 Go net/http 拒绝 header value
+    ( umask 077 && openssl rand -hex 32 | tr -d '\n' > "$INTERNAL_TOKEN_FILE" )
     chmod 0600 "$INTERNAL_TOKEN_FILE"
     chown root:root "$INTERNAL_TOKEN_FILE"
 

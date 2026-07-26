@@ -10,10 +10,11 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
+
 	"github.com/voidluo/trojan-go/common"
 	"github.com/voidluo/trojan-go/internal/database"
 	"github.com/voidluo/trojan-go/log"
-	"gorm.io/gorm"
 )
 
 // ─── 节点管理 API 处理器 ──────────────────────────────
@@ -331,13 +332,45 @@ func (s *AdminServer) handleDeleteNode(c *gin.Context) {
 
 // ─── 从节点心跳与数据同步接口 ───────────────────────────
 
+// autoRegisterNode attempts to auto-register a worker node when its secret
+// is not found in the database. Returns the node or an error if registration
+// fails or if the lookup error is not ErrRecordNotFound.
+func (s *AdminServer) autoRegisterNode(c *gin.Context, secret string) (database.Node, error) {
+	node, err := database.NodeBySecret(s.db, secret)
+	if err == nil {
+		return node, nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return node, err
+	}
+	now := time.Now()
+	ip := c.ClientIP()
+	node = database.Node{
+		Name:        ip,
+		Address:     ip,
+		Port:        443,
+		Secret:      secret,
+		Status:      1,
+		TrafficRate: 1.0,
+	}
+	node.LastHeartbeat = &now
+	if ip != "" && ip != "::1" && ip != "127.0.0.1" {
+		node.DetectedIP = ip
+	}
+	if createErr := s.db.Create(&node).Error; createErr != nil {
+		return node, createErr
+	}
+	log.Infof("auto-registered worker node id=%d ip=%s", node.ID, ip)
+	return node, nil
+}
+
 func (s *AdminServer) handleNodeSync(c *gin.Context) {
 	secret := c.GetHeader("X-Node-Secret")
 	if secret == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "缺少通信密钥"})
 		return
 	}
-	node, err := database.NodeBySecret(s.db, secret)
+	node, err := s.autoRegisterNode(c, secret)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "无效的通信密钥"})
 		return
@@ -442,7 +475,7 @@ func (s *AdminServer) handleNodeHeartbeat(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "缺少通信密钥"})
 		return
 	}
-	node, err := database.NodeBySecret(s.db, secret)
+	node, err := s.autoRegisterNode(c, secret)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "无效的通信密钥"})
 		return
