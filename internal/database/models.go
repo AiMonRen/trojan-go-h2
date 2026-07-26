@@ -212,12 +212,16 @@ func InitDb(dbPath string) (*gorm.DB, error) {
 	}
 
 	// 自动迁移模型。MySQL 上 control-service 和 data-plane 可能同时启动并
-	// 并发调用 AutoMigrate，第一个完成的已添加列，第二个再添加同名列会触发
-	// MySQL Error 1060 (Duplicate column name)。捕获该错误后重试一次：此时
-	// 第一个调用已完成全部迁移，第二次 AutoMigrate 应是纯幂等 no-op。
+	// 并发调用 AutoMigrate，先完成的已添加列，后启动的会发现列已存在触发
+	// MySQL Error 1060 (Duplicate column name)。捕获后重试最多 5 次，每次
+	// 暂停 1 秒等待另一方完成所有列迁移。
 	err = db.AutoMigrate(&User{}, &Config{}, &Node{}, &NodeSyncReceipt{}, &DataPlaneSyncReceipt{})
 	if err != nil && isMySQL {
-		if mysqlErr, ok := err.(*mysqldriver.MySQLError); ok && mysqlErr.Number == 1060 {
+		for retries := 0; retries < 5; retries++ {
+			if mysqlErr, ok := err.(*mysqldriver.MySQLError); !ok || mysqlErr.Number != 1060 {
+				break
+			}
+			time.Sleep(time.Second)
 			err = db.AutoMigrate(&User{}, &Config{}, &Node{}, &NodeSyncReceipt{}, &DataPlaneSyncReceipt{})
 		}
 	}
