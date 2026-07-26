@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/voidluo/trojan-go/internal/certmonitor"
 )
 
 func testCertificatePEM(t *testing.T, notAfter time.Time) []byte {
@@ -44,7 +46,7 @@ func TestCertificateNeedsRenewal(t *testing.T) {
 	if err := os.WriteFile(certificatePath, testCertificatePEM(t, now.Add(90*24*time.Hour)), 0644); err != nil {
 		t.Fatalf("write long-lived certificate: %v", err)
 	}
-	needsRenewal, err := certificateNeedsRenewal(certificatePath, 30*24*time.Hour, now)
+	needsRenewal, err := certmonitor.CertificateNeedsRenewal(certificatePath, 30*24*time.Hour, now)
 	if err != nil {
 		t.Fatalf("inspect long-lived certificate: %v", err)
 	}
@@ -55,7 +57,7 @@ func TestCertificateNeedsRenewal(t *testing.T) {
 	if err := os.WriteFile(certificatePath, testCertificatePEM(t, now.Add(7*24*time.Hour)), 0644); err != nil {
 		t.Fatalf("write soon-expiring certificate: %v", err)
 	}
-	needsRenewal, err = certificateNeedsRenewal(certificatePath, 30*24*time.Hour, now)
+	needsRenewal, err = certmonitor.CertificateNeedsRenewal(certificatePath, 30*24*time.Hour, now)
 	if err != nil {
 		t.Fatalf("inspect soon-expiring certificate: %v", err)
 	}
@@ -66,7 +68,7 @@ func TestCertificateNeedsRenewal(t *testing.T) {
 
 func TestCertificateRenewalConfigRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "acme-renewal.conf")
-	want := certificateRenewalConfig{
+	want := certmonitor.CertificateRenewalConfig{
 		Domain:          "example.com",
 		Email:           "ops@example.com",
 		CAURL:           "https://acme.example/directory",
@@ -74,10 +76,10 @@ func TestCertificateRenewalConfigRoundTrip(t *testing.T) {
 		PrivateKeyPath:  "/etc/trojan-go/tls/example.com/example.com.key",
 		ReloadHysteria:  true,
 	}
-	if err := writeCertificateRenewalConfig(path, want); err != nil {
+	if err := certmonitor.WriteCertificateRenewalConfig(path, want); err != nil {
 		t.Fatalf("write renewal config: %v", err)
 	}
-	got, err := readCertificateRenewalConfig(path)
+	got, err := certmonitor.ReadCertificateRenewalConfig(path)
 	if err != nil {
 		t.Fatalf("read renewal config: %v", err)
 	}
@@ -135,7 +137,7 @@ func TestWriteCertificateFilesAtomicSwitch(t *testing.T) {
 	keyPath := filepath.Join(dir, "example.com.key")
 
 	cert1, key1 := testCertKeyPair(t, "example.com")
-	if err := writeCertificateFiles(certPath, keyPath, cert1, key1); err != nil {
+	if err := certmonitor.WriteCertificateFiles(certPath, keyPath, cert1, key1); err != nil {
 		t.Fatalf("initial install: %v", err)
 	}
 
@@ -146,7 +148,7 @@ func TestWriteCertificateFilesAtomicSwitch(t *testing.T) {
 	// A renewal writes a new pair; after the switch the paths must reflect the
 	// new material and still be a matching pair (no mixed old/new).
 	cert2, key2 := testCertKeyPair(t, "example.com")
-	if err := writeCertificateFiles(certPath, keyPath, cert2, key2); err != nil {
+	if err := certmonitor.WriteCertificateFiles(certPath, keyPath, cert2, key2); err != nil {
 		t.Fatalf("renewal install: %v", err)
 	}
 	assertCertPairMatches(t, certPath, keyPath, cert2, key2)

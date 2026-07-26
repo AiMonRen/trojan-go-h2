@@ -10,11 +10,14 @@
 #   sudo bash install.sh --config=<配置文件路径> --master [--local-binaries]
 #   sudo bash install.sh --config=<配置文件路径> --worker [--local-binaries]
 #   sudo bash install.sh --config=<配置文件路径> --secret
+#   sudo bash install.sh --config=<配置文件路径> --ssl [--force]
 #
 # 示例:
 #   sudo bash install.sh --config=/mnt/trojan-go/config.conf --master
 #   sudo bash install.sh --config=/mnt/trojan-go/config.conf --worker
 #   sudo bash install.sh --config=/mnt/trojan-go/config.conf --secret
+#   sudo bash install.sh --config=/mnt/trojan-go/config.conf --ssl
+#   sudo bash install.sh --config=/mnt/trojan-go/config.conf --ssl --force
 #
 
 set -euo pipefail
@@ -73,6 +76,7 @@ readonly HYSTERIA_BIN="/usr/local/bin/hysteria"
 DEPLOY_MODE=""
 CONFIG_FILE=""
 USE_LOCAL_BINARIES=false
+SSL_FORCE=false
 
 # 配置变量（默认值）
 master=""
@@ -120,6 +124,8 @@ _log() {
     shift
     local timestamp
     timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    # 确保日志目录存在（首次调用时可能还未 create_deploy_directory）
+    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
     echo "[${timestamp}] [${level}] $*" >> "$LOG_FILE" 2>/dev/null || true
 }
 
@@ -174,7 +180,7 @@ parse_args() {
                 shift 2
                 ;;
             --master)
-                if [[ -n "$DEPLOY_MODE" && "$DEPLOY_MODE" != "secret" ]]; then
+                if [[ -n "$DEPLOY_MODE" && "$DEPLOY_MODE" != "secret" && "$DEPLOY_MODE" != "ssl" ]]; then
                     error "不能同时指定 --master 和 --worker (错误码: 3)"
                     exit 3
                 fi
@@ -182,7 +188,7 @@ parse_args() {
                 shift
                 ;;
             --worker)
-                if [[ -n "$DEPLOY_MODE" && "$DEPLOY_MODE" != "secret" ]]; then
+                if [[ -n "$DEPLOY_MODE" && "$DEPLOY_MODE" != "secret" && "$DEPLOY_MODE" != "ssl" ]]; then
                     error "不能同时指定 --master 和 --worker (错误码: 3)"
                     exit 3
                 fi
@@ -191,6 +197,14 @@ parse_args() {
                 ;;
             --secret)
                 DEPLOY_MODE="secret"
+                shift
+                ;;
+            --ssl)
+                DEPLOY_MODE="ssl"
+                shift
+                ;;
+            --force|-f)
+                SSL_FORCE=true
                 shift
                 ;;
             --local-binaries|--local)
@@ -216,7 +230,7 @@ parse_args() {
         exit 1
     fi
 
-    if [[ "$DEPLOY_MODE" != "secret" && -z "$DEPLOY_MODE" ]]; then
+    if [[ "$DEPLOY_MODE" != "secret" && "$DEPLOY_MODE" != "ssl" && -z "$DEPLOY_MODE" ]]; then
         error "请指定部署模式 --master 或 --worker (错误码: 2)"
         show_usage
         exit 2
@@ -231,12 +245,16 @@ ${BOLD}用法:${NC}
   sudo bash install.sh --config=<配置文件路径> --master [--local-binaries]
   sudo bash install.sh --config=<配置文件路径> --worker [--local-binaries]
   sudo bash install.sh --config=<配置文件路径> --secret
+  sudo bash install.sh --config=<配置文件路径> --ssl [--force]
 
 ${BOLD}参数:${NC}
   --config=<path>     配置文件路径（必填）
   --master            主节点模式
   --worker            从节点模式
   --secret            显示主节点 Secret
+  --ssl               手动 SSL 证书续期模式
+  --force             强制续期（忽略到期时间检查，与 --ssl 配合使用）
+  --local-binaries    使用本地预编译二进制（跳过编译）
   --local-binaries    使用当前目录已有的 trojan-go / trojan（跳过源码编译）
                       别名: --local
   --help, -h          显示帮助
@@ -674,8 +692,8 @@ build_binaries_from_source() {
         export GOMODCACHE="${SOURCE_DIR}/.cache/go-mod"
         local ldflags="-s -w -buildid= -X ${GO_PACKAGE_NAME}/version.Version=${SOURCE_BRANCH}-${commit} -X ${GO_PACKAGE_NAME}/version.Commit=${commit}"
         mkdir -p "build/linux-${ARCH}"
-        go build -tags "full" -trimpath -ldflags="$ldflags" -o "build/linux-${ARCH}/trojan-go" ./cmd/trojan-go
-        go build -tags "full" -trimpath -ldflags="$ldflags" -o "build/linux-${ARCH}/trojan" ./cmd/trojan
+        go build -a -tags "full" -trimpath -ldflags="$ldflags" -o "build/linux-${ARCH}/trojan-go" ./cmd/trojan-go
+        go build -a -tags "full" -trimpath -ldflags="$ldflags" -o "build/linux-${ARCH}/trojan" ./cmd/trojan
     ) || {
         error "源码编译失败，请检查上方 go build 输出 (错误码: 7)"
         exit 7
@@ -937,6 +955,19 @@ deploy_mysql_docker() {
     # 检查 Docker 是否安装
     if ! command -v docker &>/dev/null; then
         info "Docker 未安装，正在安装..."
+
+        # 等待 apt lock 释放（可能有 unattended-upgrades 在运行）
+        local lock_wait=0
+        while fuser /var/lib/apt/lists/lock /var/lib/dpkg/lock-frontend &>/dev/null; do
+            if (( lock_wait >= 120 )); then
+                warn "等待 apt lock 超时 (${lock_wait}s)，强制继续"
+                break
+            fi
+            info "等待 apt lock 释放... (${lock_wait}s)"
+            sleep 10
+            (( lock_wait += 10 ))
+        done
+
         curl -fsSL https://get.docker.com | sh
         systemctl enable docker
         systemctl start docker
@@ -1942,6 +1973,157 @@ show_secret() {
 }
 
 # ==============================================================================
+# 14b. 自动创建管理员用户
+# ==============================================================================
+create_admin_user() {
+    info "创建管理员账户..."
+
+    local admin_token="${DEPLOY_DIR}/internal-token"
+    local max_wait=30 waited=0
+
+    # 等待 admin API 就绪
+    while (( waited < max_wait )); do
+        if curl -s -o /dev/null -w '%{http_code}' "http://${ADMIN_ADDR}${ADMIN_PREFIX}api/ping" 2>/dev/null | grep -q '200'; then
+            break
+        fi
+        sleep 1
+        (( waited++ ))
+    done
+
+    if (( waited >= max_wait )); then
+        warn "Admin API 未在 ${max_wait}s 内就绪，跳过高可用账户创建"
+        warn "请稍后手动创建: mysql -e \"INSERT INTO users (username, password_hash, quota, expiry_time) VALUES ('${admin_username}', '<bcrypt_hash>', -1, -1)\""
+        return 0
+    fi
+
+    # 读取内部 Token 用于 API 认证
+    local token=""
+    if [[ -f "$admin_token" ]]; then
+        token=$(head -c 64 "$admin_token" 2>/dev/null || true)
+    fi
+
+    if [[ -z "$token" ]]; then
+        warn "无法读取内部 Token，跳过自动创建管理员"
+        return 0
+    fi
+
+    # 检查是否已有用户（避免重复创建）
+    local user_count
+    user_count=$(curl -s -H "Authorization: Bearer ${token}" "http://${ADMIN_ADDR}${ADMIN_PREFIX}api/users" 2>/dev/null | grep -c '"username"' || echo "0")
+    if [[ "$user_count" -gt 0 ]]; then
+        info "数据库中已有 ${user_count} 个用户，跳过管理员创建"
+        return 0
+    fi
+
+    # 通过内部 API 创建管理员用户
+    local http_code
+    http_code=$(curl -s -w '%{http_code}' -o /dev/null \
+        -X POST "http://${ADMIN_ADDR}${ADMIN_PREFIX}api/users" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer ${token}" \
+        -d "{\"username\":\"${admin_username}\",\"password\":\"${admin_password}\",\"quota\":-1,\"expiry_time\":-1}" \
+        2>/dev/null)
+
+    if [[ "$http_code" == "200" || "$http_code" == "201" ]]; then
+        success "管理员账户已创建: ${admin_username}"
+    else
+        warn "管理员 API 返回 HTTP ${http_code}，可能用户已存在"
+        warn "若无法登录请手动创建: docker exec trojan-mysql mysql -u trojan -p\"${mysql_password}\" -e \"INSERT INTO users (username, password_hash, quota, expiry_time) VALUES ('\''${admin_username}'\'', '\''<hash>'\'', -1, -1)\""
+    fi
+}
+
+# ==============================================================================
+# 14c. SSL 证书手动续期
+# ==============================================================================
+ssl_renew_certificate() {
+    header "SSL 证书续期 / SSL Certificate Renewal"
+
+    local domain="${master}"
+    if [[ -z "$domain" ]]; then
+        error "无法确定域名，请检查配置文件中 master 字段"
+        exit 4
+    fi
+
+    local le_dir="/etc/letsencrypt/live/${domain}"
+    local cert_path="${CERTS_DIR}/fullchain.crt"
+    local key_path="${CERTS_DIR}/private.key"
+    local certbot_hook="/etc/letsencrypt/renewal-hooks/deploy/trojan-go-sync-certs.sh"
+
+    info "域名: ${domain}"
+
+    # 证书存在性检查
+    if [[ ! -f "${cert_path}" ]]; then
+        warn "部署目录中未找到证书文件 (${cert_path})"
+        warn "如果首次部署，请在 /mnt/trojan-go/config/ 下手动放置证书"
+        warn "或使用 certbot 申请: certbot certonly --standalone -d ${domain}"
+    fi
+
+    # 检查是否需要续期
+    if [[ "$SSL_FORCE" != "true" ]]; then
+        if [[ -f "${cert_path}" ]]; then
+            local expiry_ts now_ts remaining_days expiry_str
+            expiry_str=$(openssl x509 -in "${cert_path}" -noout -enddate 2>/dev/null | cut -d= -f2)
+            if [[ -n "$expiry_str" ]]; then
+                expiry_ts=$(date -d "$expiry_str" +%s 2>/dev/null || date -j -f "%b %d %T %Y %Z" "$expiry_str" +%s 2>/dev/null)
+                now_ts=$(date +%s)
+                if [[ -n "$expiry_ts" ]]; then
+                    remaining_days=$(( (expiry_ts - now_ts) / 86400 ))
+                    if (( remaining_days > 30 )); then
+                        info "证书还有 ${remaining_days} 天到期 (> 30 天)，无需续期"
+                        info "如需强制续期，请使用 --ssl --force"
+                        exit 0
+                    fi
+                    info "证书将在 ${remaining_days} 天后到期，开始续期..."
+                fi
+            fi
+        fi
+    else
+        info "强制执行证书续期..."
+    fi
+
+    # 执行 certbot 续期
+    if command -v certbot &>/dev/null; then
+        info "使用 certbot 续期..."
+        if ! certbot renew --cert-name "$domain" --force-renewal --non-interactive --deploy-hook "${certbot_hook}" 2>&1 | tee -a "$LOG_FILE"; then
+            error "certbot 续期失败"
+            exit 8
+        fi
+        success "certbot 续期完成"
+    else
+        error "未找到 certbot，无法执行续期"
+        exit 8
+    fi
+
+    # 同步证书到部署目录
+    if [[ -f "${le_dir}/fullchain.pem" ]]; then
+        install -m 0644 "${le_dir}/fullchain.pem" "${cert_path}"
+        install -m 0600 "${le_dir}/privkey.pem" "${key_path}"
+        success "证书已同步到 ${cert_path}"
+    fi
+
+    # 重启服务加载新证书
+    info "重启 Gateway 服务加载新证书..."
+    systemctl restart trojan-go-gateway.service 2>/dev/null || true
+    if systemctl is-enabled trojan-go-hysteria.service &>/dev/null; then
+        systemctl restart trojan-go-hysteria.service 2>/dev/null || true
+    fi
+    sleep 2
+
+    # 验证
+    if systemctl is-active --quiet trojan-go-gateway.service; then
+        success "Gateway 服务已正常运行"
+    else
+        warn "Gateway 服务重启后未 active，请检查: journalctl -u trojan-go-gateway -n 20"
+    fi
+
+    local new_expiry
+    if [[ -f "${cert_path}" ]]; then
+        new_expiry=$(openssl x509 -in "${cert_path}" -noout -enddate 2>/dev/null | sed 's/^notAfter=//')
+        success "证书续期完成，新证书到期: ${new_expiry}"
+    fi
+}
+
+# ==============================================================================
 # 15. 部署结果输出
 # ==============================================================================
 print_result() {
@@ -1984,6 +2166,22 @@ print_result() {
         echo -e "  ${BOLD}节点 Secret:${NC}"
         echo ""
         show_secret
+        echo ""
+        echo -e "  ${BOLD}══════════════════════════════════════════════════════════${NC}"
+        echo -e "  ${BOLD}  🔑 管理员凭据 / Admin Credentials${NC}"
+        echo -e "  ${BOLD}══════════════════════════════════════════════════════════${NC}"
+        echo ""
+        if [[ -f "${CONFIG_DIR}/.admin_credentials" ]]; then
+            source "${CONFIG_DIR}/.admin_credentials" 2>/dev/null || true
+        fi
+        echo -e "  ${BOLD}面板地址:${NC}   https://${master}${ADMIN_PREFIX}"
+        echo -e "  ${BOLD}用户名:${NC}     ${GREEN:-}${admin_username}${NC}"
+        echo -e "  ${BOLD}密码:${NC}       ${GREEN:-}${admin_password}${NC}"
+        echo ""
+        echo -e "  凭据已保存至: ${CONFIG_DIR}/.admin_credentials"
+        echo ""
+        echo -e "${CYAN}  ⚠️  首次登录后请立即修改密码${NC}"
+        echo ""
     fi
 
     echo ""
@@ -2016,6 +2214,12 @@ main() {
         exit 0
     fi
 
+    # 5b. 如果是 --ssl 模式，执行证书续期
+    if [[ "$DEPLOY_MODE" == "ssl" ]]; then
+        ssl_renew_certificate
+        exit 0
+    fi
+
     # 6. 清理已有服务与残留进程（避免端口占用、二进制文件被占用）
     cleanup_existing_services
 
@@ -2030,6 +2234,11 @@ main() {
         deploy_master
     else
         deploy_worker
+    fi
+
+    # 9b. 自动创建管理员用户
+    if [[ "$DEPLOY_MODE" == "master" ]]; then
+        create_admin_user
     fi
 
     # 10. 输出结果

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/voidluo/trojan-go/internal/certmonitor"
 	"github.com/voidluo/trojan-go/internal/webserver"
 )
 
@@ -294,7 +295,7 @@ func installDeploymentBinaries(deployPath, tlsDir, certificatePath, privateKeyPa
 	return nil
 }
 
-func configureAndStartDeployment(role deploymentRole, deployPath string, hysteriaEnabled bool, renewalConfig certificateRenewalConfig) error {
+func configureAndStartDeployment(role deploymentRole, deployPath string, hysteriaEnabled bool, renewalConfig certmonitor.CertificateRenewalConfig) error {
 	// Pre-create the shared internal service token before any service unit is
 	// started. All same-host services (admin/control/data-plane) authenticate
 	// loopback calls with this token; since every service now fails closed when

@@ -5,6 +5,7 @@ import (
 	"os"
 
 	"github.com/voidluo/trojan-go/cmd/trojan/menu"
+	"github.com/voidluo/trojan-go/internal/certmonitor"
 )
 
 // ApplyCert 交互式申请 SSL 证书
@@ -55,14 +56,14 @@ func ApplyCert() {
 	fmt.Println(progress)
 	fmt.Printf("\033[33m%s\033[0m\n\n", note)
 
-	certs, err := obtainCert(domain, email, caURL)
+	certs, err := certmonitor.ObtainCert(domain, email, caURL)
 	if err != nil {
 		fmt.Printf("\033[31m申请失败: %v\033[0m\n", err)
 		return
 	}
 
 	// 保存证书；任何目录或文件写入失败都必须显式返回，避免误报申请成功。
-	if err := writeCertificateFiles("/etc/trojan-go/cert.pem", "/etc/trojan-go/key.pem", certs.Certificate, certs.PrivateKey); err != nil {
+	if err := certmonitor.WriteCertificateFiles("/etc/trojan-go/cert.pem", "/etc/trojan-go/key.pem", certs.Certificate, certs.PrivateKey); err != nil {
 		fmt.Printf("\033[31m保存证书失败: %v\033[0m\n", err)
 		return
 	}

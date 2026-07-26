@@ -14,7 +14,7 @@ import (
 type User struct {
 	ID        uint      `gorm:"primaryKey" json:"id"` // ID 必须显式标记为 id 供前端调用
 	CreatedAt time.Time `json:"created_at"`
-	Username  string    `gorm:"size:255" json:"username"`                 // 用户名/备注，方便管理区别人
+	Username  string    `gorm:"size:255" json:"username"`                  // 用户名/备注，方便管理区别人
 	Hash      string    `gorm:"uniqueIndex;not null;size:255" json:"hash"` // Trojan 密码的 SHA224 哈希值
 	// Password accepts legacy restore/create payloads only. Ordinary management
 	// responses must use publicUser, which never includes this field.

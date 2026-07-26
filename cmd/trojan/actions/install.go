@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/voidluo/trojan-go/cmd/trojan/menu"
+	"github.com/voidluo/trojan-go/internal/certmonitor"
 )
 
 const nginxWelcome = `<!DOCTYPE html>
@@ -258,7 +259,7 @@ func InitDeployMaster() {
 
 	// ─── 步骤 1: 申请 SSL 证书 ────────────────────────────
 	fmt.Printf("\n[1/5] 正在为 %s 申请 SSL 证书 (%s)...\n", domain, caName)
-	certs, err := obtainCert(domain, email, caURL)
+	certs, err := certmonitor.ObtainCert(domain, email, caURL)
 	if err != nil {
 		fmt.Printf("\033[31m❌ 证书申请失败: %v\033[0m\n", err)
 		return
@@ -267,7 +268,7 @@ func InitDeployMaster() {
 	tlsDir := filepath.Join(deployPath, "tls", domain)
 	crtPath := filepath.Join(tlsDir, domain+".crt")
 	keyPath := filepath.Join(tlsDir, domain+".key")
-	if err := writeCertificateFiles(crtPath, keyPath, certs.Certificate, certs.PrivateKey); err != nil {
+	if err := certmonitor.WriteCertificateFiles(crtPath, keyPath, certs.Certificate, certs.PrivateKey); err != nil {
 		fmt.Printf("\033[31m❌ 写入证书或私钥失败: %v\033[0m\n", err)
 		return
 	}
@@ -425,7 +426,7 @@ Commercial support is available at
 
 	// ─── 步骤 4-5: 写入服务、续期与启动验证 ──────────────────
 	fmt.Println("\n[4/5] 正在配置 Systemd 服务与证书自动续期...")
-	if err := configureAndStartDeployment(deploymentMaster, deployPath, h2Enabled, certificateRenewalConfig{
+	if err := configureAndStartDeployment(deploymentMaster, deployPath, h2Enabled, certmonitor.CertificateRenewalConfig{
 		Domain: domain, Email: email, CAURL: caURL, CertificatePath: crtPath, PrivateKeyPath: keyPath, ReloadHysteria: h2Enabled,
 	}); err != nil {
 		fmt.Printf("\033[31m❌ 配置或启动服务失败: %v\033[0m\n", err)
@@ -581,7 +582,7 @@ func InitDeployWorker() {
 
 	// ─── 步骤 1: 申请 SSL 证书 ────────────────────────────
 	fmt.Printf("\n[1/5] 正在为从节点 %s 申请 SSL 证书...\n", domain)
-	certs, err := obtainCert(domain, email, "https://acme-v02.api.letsencrypt.org/directory")
+	certs, err := certmonitor.ObtainCert(domain, email, "https://acme-v02.api.letsencrypt.org/directory")
 	if err != nil {
 		fmt.Printf("\033[31m❌ 证书申请失败: %v\033[0m\n", err)
 		return
@@ -590,7 +591,7 @@ func InitDeployWorker() {
 	tlsDir := filepath.Join(deployPath, "tls", domain)
 	crtPath := filepath.Join(tlsDir, domain+".crt")
 	keyPath := filepath.Join(tlsDir, domain+".key")
-	if err := writeCertificateFiles(crtPath, keyPath, certs.Certificate, certs.PrivateKey); err != nil {
+	if err := certmonitor.WriteCertificateFiles(crtPath, keyPath, certs.Certificate, certs.PrivateKey); err != nil {
 		fmt.Printf("\033[31m❌ 证书写入失败: %v\033[0m\n", err)
 		return
 	}
@@ -680,7 +681,7 @@ func InitDeployWorker() {
 
 	// ─── 步骤 4-5: 写入服务、续期与启动验证 ──────────────────
 	fmt.Println("\n[4/5] 正在配置 Systemd 服务与证书自动续期...")
-	if err := configureAndStartDeployment(deploymentWorker, deployPath, wh2Enabled, certificateRenewalConfig{
+	if err := configureAndStartDeployment(deploymentWorker, deployPath, wh2Enabled, certmonitor.CertificateRenewalConfig{
 		Domain: domain, Email: email, CAURL: "https://acme-v02.api.letsencrypt.org/directory", CertificatePath: crtPath, PrivateKeyPath: keyPath, ReloadHysteria: wh2Enabled,
 	}); err != nil {
 		fmt.Printf("\033[31m❌ 配置或启动服务失败: %v\033[0m\n", err)
