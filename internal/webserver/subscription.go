@@ -508,9 +508,9 @@ func renderClashConfigMultiNode(db *gorm.DB, u database.User, nodes []database.N
 		if nodeName == "" {
 			nodeName = node.Address
 		}
-		// 同时支持中英文 relay 节点名匹配：(港转)/(转) 是历史命名约定，
-		// -relay 后缀是英文版，避免 MySQL 字符集双编码导致中文匹配失败。
-		isRelay := strings.Contains(nodeName, "(港转)") || strings.Contains(nodeName, "(转)") || strings.HasSuffix(nodeName, "-relay")
+		// 中继节点检测：包含 "(港转)"、"(转)"、"-relay" 后缀，或含 "转" 字
+		// （如 "日本转新加坡"）均视为中继节点，仅生成 TCP/Trojan 条目
+		isRelay := strings.Contains(nodeName, "转") || strings.HasSuffix(nodeName, "-relay")
 
 		tjSlaveName := "tcp-" + nodeName
 		sb.WriteString(fmt.Sprintf("  - name: %s\n    type: trojan\n    server: %s\n    port: %d\n    password: %s\n    udp: true\n    sni: %s\n    skip-cert-verify: false\n",

@@ -1117,6 +1117,7 @@ EOF
         if sudo docker logs "${mysql_docker_name}" 2>&1 | grep -q "MySQL init process done"; then
             if sudo docker exec "${mysql_docker_name}" \
                 mysql -u"${mysql_user}" -p"${mysql_password}" \
+                --default-character-set=utf8mb4 \
                 -e "SELECT 1" "${mysql_dbname}" >/dev/null 2>&1; then
                 break
             fi
@@ -1221,6 +1222,7 @@ verify_mysql_deployment() {
     local attempt
     for attempt in 1 2 3 4 5; do
         if sudo docker exec "${mysql_docker_name}" mysql -u"${mysql_user}" -p"${mysql_password}" \
+            --default-character-set=utf8mb4 \
             -e "SELECT 1" "${mysql_dbname}" >/dev/null 2>&1; then
             success "MySQL 连接测试通过"
             return 0
@@ -1231,6 +1233,7 @@ verify_mysql_deployment() {
     error "MySQL 连接测试失败"
     warn "诊断信息如下："
     sudo docker exec "${mysql_docker_name}" mysql -u"${mysql_user}" -p"${mysql_password}" \
+        --default-character-set=utf8mb4 \
         -e "SELECT 1" "${mysql_dbname}" 2>&1 | sed 's/^/    /' || true
     warn "可执行以下命令查看容器日志: sudo docker logs ${mysql_docker_name}"
     return 1
@@ -2089,17 +2092,17 @@ setup_relay_node() {
         exit 11
     fi
 
-    # 3. 插入中继虚拟节点到 MySQL（名称含 "(转)" 触发订阅 relay-only 行为）
+    # 3. 插入中继虚拟节点到 MySQL（名称含 "转" 触发订阅 relay-only 行为）
     local db_name="${node_name}"
-    if ! echo "${node_name}" | grep -q '(转)'; then
+    if ! echo "${node_name}" | grep -q '转'; then
         db_name="${node_name}(转)"
     fi
 
     local mysql_cmd
     if [[ "$mysql_deploy" == "docker" ]]; then
-        mysql_cmd="docker exec ${mysql_docker_name} mysql -u root -p${mysql_docker_root_password} ${mysql_dbname}"
+        mysql_cmd="docker exec ${mysql_docker_name} mysql -u root -p${mysql_docker_root_password} --default-character-set=utf8mb4 ${mysql_dbname}"
     else
-        mysql_cmd="mysql -h ${mysql_host} -P ${mysql_port} -u ${mysql_user} -p${mysql_password} ${mysql_dbname}"
+        mysql_cmd="mysql -h ${mysql_host} -P ${mysql_port} -u ${mysql_user} -p${mysql_password} --default-character-set=utf8mb4 ${mysql_dbname}"
     fi
 
     $mysql_cmd -e "DELETE FROM nodes WHERE name='${db_name}';" 2>/dev/null || true
